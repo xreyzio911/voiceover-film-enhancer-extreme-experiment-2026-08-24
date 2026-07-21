@@ -1,4 +1,8 @@
-const ALLOWED_EMAILS = ["shortsprojektt@gmail.com", "reyhanputraph@gmail.com"] as const;
+const ALLOWED_EMAILS = [
+  "shortsprojektt@gmail.com",
+  "reyhanputraph@gmail.com",
+  "xreyzio911@gmail.com",
+] as const;
 
 const allowedEmailSet = new Set(ALLOWED_EMAILS.map((email) => email.toLowerCase()));
 

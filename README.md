@@ -8,6 +8,7 @@ Google SSO is enabled and access is restricted to:
 
 - `shortsprojektt@gmail.com`
 - `reyhanputraph@gmail.com`
+- `xreyzio911@gmail.com`
 
 The allowlist is defined in `src/lib/authAllowlist.ts`.
 

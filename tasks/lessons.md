@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-07-22 - Verify The Experiment Owner Before Authenticated QA
+
+- What went wrong: The isolated deployment was created and its anonymous auth boundary was verified, but the intended experiment owner's email was not present in the code allowlist, blocking authenticated browser QA.
+- Rule to prevent it: Before declaring a newly isolated deployment ready for experiments, confirm the intended owner is authorized by the deployed allowlist without copying credentials or access policy from another project implicitly.
+- How to verify next time: Add a focused allowlist regression test for the named owner, then complete a live sign-in check on the new domain after deployment.
+
 ## 2026-07-03 - Delivered Audio Must Be The Review Artifact
 
 - What went wrong: QC Lab review bundles were built at the per-file review point, but scene blend, loudness export, and batch alignment can still change the delivered WAV bytes afterward.

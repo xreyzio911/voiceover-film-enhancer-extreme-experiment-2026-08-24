@@ -1,3 +1,22 @@
+# Authorize Experimental Project Owner
+
+## Checklist
+
+- [x] Trace the live access denial to the shared code allowlist.
+- [x] Add a failing regression test for `xreyzio911@gmail.com`.
+- [x] Add the email to the shared allowlist and pass focused/full verification.
+- [ ] Review, commit, push `main`, and verify the resulting Vercel deployment.
+
+## Assumptions
+
+- This change applies only to the isolated experimental repository and deployment.
+- Existing approved accounts must remain authorized.
+
+## Review Notes
+
+- The focused test failed before implementation and passed after adding the owner email.
+- Full verification passed with 158 tests plus 1 intentional splitter smoke skip, clean lint, a production build, and zero dependency vulnerabilities.
+
 # Temporarily Remove Manual AI Review UI
 
 ## Checklist
