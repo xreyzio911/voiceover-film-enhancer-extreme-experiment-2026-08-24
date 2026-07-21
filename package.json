@@ -17,8 +17,8 @@
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "jszip": "^3.10.1",
-    "next": "16.1.6",
-    "next-auth": "^4.24.13",
+    "next": "16.2.11",
+    "next-auth": "4.24.15",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },
@@ -27,7 +27,10 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.1.6",
+    "eslint-config-next": "16.2.11",
     "typescript": "^5"
+  },
+  "overrides": {
+    "postcss": "8.5.10"
   }
 }
