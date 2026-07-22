@@ -196,3 +196,31 @@
 - Cleaner Splitter upgrade: local dev server is running at `http://localhost:3000`; HTTP GET `/` returned 200.
 - Local audio engine setup: `.venv-audio-splitter` installed with Python 3.11, CUDA Torch 2.11.0+cu128, `audio-separator`, and `imageio-ffmpeg`.
 - Local audio engine setup: RoFormer worker smoke test passed with CUDA and the downloaded model.
+
+# Stable Advanced Options And SRT Theme
+
+## Checklist
+
+- [x] Inspect the collapsed/expanded screenshots and trace the layout-shift cause.
+- [x] Audit the live SRT Sync theme tokens, bootstrap, persistence, and toggle behavior.
+- [x] Add failing contracts for a non-reflowing advanced disclosure and dark-default dual theme.
+- [x] Implement the stable advanced-options layer with Escape, outside-click, and focus return.
+- [x] Implement the SRT-derived dark theme, persisted light theme, and pre-paint bootstrap.
+- [x] Run focused tests, full tests, lint, build, and `git diff --check`.
+- [x] Verify desktop and mobile behavior in-browser, including zero surrounding layout movement.
+- [x] Complete independent code/accessibility review and record evidence.
+
+## Browser QA Inventory
+
+- Theme: first visit is dark even with a light OS preference; the header toggle changes to light, updates `data-theme`, `color-scheme`, and `theme-color`, persists through reload, and toggles back to dark.
+- Disclosure: Advanced opens without moving Source audio, Processing profile, Batch queue, Deliverables, or Activity log; Escape closes and restores trigger focus; an outside click closes it.
+- Responsive visual states: inspect dark/collapsed, dark/open, and light/collapsed at 1440px plus the open layer at 920px, 560px, and 390px.
+- Fit and resilience: no horizontal overflow, clipped controls, console errors, or awkward layering; rapidly toggle the disclosure and verify an invalid saved theme still falls back to dark.
+
+## Review Notes
+
+- The final design contract passes 9/9; the complete audio-QC suite passes 167 tests with one optional splitter smoke skipped. ESLint, the production Next.js build, and `git diff --check` pass. The build retains the pre-existing Turbopack NFT tracing warning in the audio-splitter route.
+- Browser measurement at 1440px, 920px, 560px, and 390px recorded 0 px movement for Source audio, Processing profile, Batch queue, Deliverables, and Activity log when Advanced opened. The layer stayed inside each viewport with no horizontal overflow.
+- Escape closes and restores trigger focus, outside click closes, the scroll-contained panel reaches the review controls, and rapid toggling leaves document geometry unchanged.
+- A fresh light-OS context still boots dark. Light mode updates `data-theme`, `color-scheme`, and `theme-color`, persists through reload, and invalid storage falls back to dark. Light secondary surfaces use semantic error/warning/log tokens.
+- Independent correctness and design/accessibility reviews found no blocking issues. The light faint-text token was darkened to `#647474`, clearing 4.5:1 contrast on the tinted light surfaces.

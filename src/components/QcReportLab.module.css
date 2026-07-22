@@ -339,14 +339,14 @@
 }
 
 .errorText {
-  color: #ff9a9a;
+  color: var(--danger);
   font-size: 0.85rem;
 }
 
 .warningBanner {
-  border: 1px solid rgba(245, 199, 90, 0.45);
+  border: 1px solid var(--warning-border);
   border-radius: 12px;
-  background: rgba(245, 199, 90, 0.1);
+  background: var(--warning-surface);
   padding: 10px 12px;
   font-size: 0.86rem;
   transition: opacity 160ms var(--ease-out), transform 160ms var(--ease-out);

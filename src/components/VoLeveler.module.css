@@ -257,6 +257,34 @@
   opacity: 0.48;
 }
 
+.advancedDisclosure {
+  position: relative;
+  z-index: 20;
+  width: 100%;
+  max-width: 100%;
+}
+
+.advancedPanel {
+  position: absolute;
+  inset-inline: 0;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  max-width: 100%;
+  max-height: min(22rem, calc(100dvh - 48px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-surface);
+  padding: 4px 14px 14px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-raised);
+}
+
+.advancedPanel .toggleRow:first-child {
+  border-top: 0;
+}
+
 .reviewModelPanel {
   margin-top: 14px;
   border: 1px solid var(--border);
@@ -658,8 +686,8 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
   padding: 12px;
-  color: #c3c9d2;
-  background: #0d0f13;
+  color: var(--text-subtle);
+  background: var(--surface-muted);
   font-family: var(--font-mono), ui-monospace, monospace;
   font-size: 0.69rem;
   line-height: 1.55;
@@ -870,6 +898,11 @@
 
   .toggleRow {
     align-items: flex-start;
+  }
+
+  .advancedPanel {
+    max-height: min(22rem, calc(100dvh - 32px));
+    padding-inline: 12px;
   }
 
   .outputItem,

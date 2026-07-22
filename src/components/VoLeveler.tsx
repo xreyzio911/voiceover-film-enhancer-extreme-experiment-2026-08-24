@@ -647,6 +647,8 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
   const sourceFirstPlansByBaseRef = useRef<Map<string, SourceFirstAudioReviewPlan>>(new Map());
   const failureDismissButtonRef = useRef<HTMLButtonElement | null>(null);
   const runBatchButtonRef = useRef<HTMLButtonElement | null>(null);
+  const advancedDisclosureRef = useRef<HTMLDivElement | null>(null);
+  const advancedTriggerRef = useRef<HTMLButtonElement | null>(null);
   const failureWarningTimerRef = useRef<number | null>(null);
 
   const [files, setFiles] = useState<File[]>([]);
@@ -746,6 +748,29 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
     });
     return () => window.cancelAnimationFrame(frame);
   }, [failureWarningClosing, showFailureWarning]);
+
+  useEffect(() => {
+    if (!advancedOpen) return;
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || advancedDisclosureRef.current?.contains(target)) return;
+      setAdvancedOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setAdvancedOpen(false);
+      advancedTriggerRef.current?.focus();
+    };
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [advancedOpen]);
 
   const resetFailureWarning = () => {
     if (failureWarningTimerRef.current !== null) {
@@ -8389,17 +8414,27 @@ const summarizeFailureReason = (error: unknown) => {
               onChange={(event) => setCinematicColor(event.target.checked)}
             />
           </label>
-          <button
-            type="button"
-            className={`${styles.button} ${styles.buttonGhost} ${styles.sectionTop}`}
-            onClick={() => setAdvancedOpen((open) => !open)}
-            aria-expanded={advancedOpen}
-            aria-controls="advanced-processing-options"
+          <div
+            ref={advancedDisclosureRef}
+            className={`${styles.advancedDisclosure} ${styles.sectionTop}`}
           >
-            {advancedOpen ? "Hide advanced options" : "Show advanced options"}
-          </button>
-          {advancedOpen && (
-            <div id="advanced-processing-options" role="group" aria-label="Advanced processing options">
+            <button
+              ref={advancedTriggerRef}
+              type="button"
+              className={`${styles.button} ${styles.buttonGhost}`}
+              onClick={() => setAdvancedOpen((open) => !open)}
+              aria-expanded={advancedOpen}
+              aria-controls="advanced-processing-options"
+            >
+              {advancedOpen ? "Hide advanced options" : "Show advanced options"}
+            </button>
+            {advancedOpen && (
+              <div
+                id="advanced-processing-options"
+                className={styles.advancedPanel}
+                role="group"
+                aria-label="Advanced processing options"
+              >
               <label className={styles.toggleRow}>
                 <div>
                   <strong>EQ cleanup</strong>
@@ -8521,8 +8556,9 @@ const summarizeFailureReason = (error: unknown) => {
                   </button>
                 </div>
               </div>
-            </div>
-          )}
+              </div>
+            )}
+          </div>
 
           <div className={`${styles.controls} ${styles.sectionTop}`}>
             <button

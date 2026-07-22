@@ -112,11 +112,11 @@
 }
 
 .error {
-  border: 1px solid color-mix(in srgb, var(--danger) 42%, var(--border));
+  border: 1px solid var(--danger-border);
   border-radius: var(--radius-control);
   padding: 10px 12px;
-  color: #f5b5b5;
-  background: color-mix(in srgb, var(--danger) 8%, var(--surface-muted));
+  color: var(--danger);
+  background: var(--danger-surface);
   font-size: 0.8rem;
   line-height: 1.4;
 }

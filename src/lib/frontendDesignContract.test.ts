@@ -7,30 +7,60 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const readProjectFile = (path: string) => readFileSync(resolve(ROOT, path), "utf8");
 
-const palette = {
-  canvas: "#0b0c0f",
-  surface: "#111318",
-  "surface-raised": "#171a20",
-  "surface-muted": "#0e1014",
-  border: "#272b33",
-  "border-strong": "#3a404b",
-  text: "#f3f4f2",
-  "text-subtle": "#a9b0bc",
-  "text-faint": "#747d8d",
-  accent: "#e6bd63",
-  "accent-hover": "#f0ca77",
-  "accent-contrast": "#17130b",
-  success: "#70d2ae",
-  danger: "#ef7c7c",
-  focus: "#f0ca77",
+const darkPalette = {
+  canvas: "#0d1418",
+  surface: "#151f24",
+  "surface-raised": "#1b292f",
+  "surface-muted": "#10243b",
+  border: "#2b383e",
+  "border-strong": "#43535a",
+  text: "#edf4f4",
+  "text-subtle": "#a6b5b5",
+  "text-faint": "#849595",
+  accent: "#72a8ff",
+  "accent-hover": "#94bcff",
+  "accent-contrast": "#07111d",
+  success: "#5bd6aa",
+  danger: "#ff9b90",
+  "danger-surface": "#321d1d",
+  "danger-border": "#8f4f49",
+  "warning-surface": "#292710",
+  "warning-border": "#8b7e2c",
+  focus: "#94bcff",
 } as const;
 
-test("the upgrade preserves the established palette and responsive shell", () => {
+const lightPalette = {
+  canvas: "#ffffff",
+  surface: "#f6f8f8",
+  "surface-raised": "#ffffff",
+  "surface-muted": "#f2f7ff",
+  border: "#d7dede",
+  "border-strong": "#b9c4c4",
+  text: "#091717",
+  "text-subtle": "#586767",
+  "text-faint": "#647474",
+  accent: "#006cff",
+  "accent-hover": "#0058d6",
+  "accent-contrast": "#ffffff",
+  success: "#087a55",
+  danger: "#b42318",
+  "danger-surface": "#fff4f2",
+  "danger-border": "#d48a82",
+  "warning-surface": "#fffde3",
+  "warning-border": "#e3d226",
+  focus: "#006cff",
+} as const;
+
+test("the SRT-derived theme defaults dark, supports light, and preserves the responsive shell", () => {
   const globals = readProjectFile("src/app/globals.css");
   const appTools = readProjectFile("src/components/AppTools.module.css");
   const voStyles = readProjectFile("src/components/VoLeveler.module.css");
 
-  for (const [token, value] of Object.entries(palette)) {
+  for (const [token, value] of Object.entries(darkPalette)) {
+    assert.match(globals, new RegExp(`--${token}:\\s*${value.replace("#", "\\#")}`));
+  }
+  assert.match(globals, /:root\[data-theme=["']light["']\]\s*\{/);
+  for (const [token, value] of Object.entries(lightPalette)) {
     assert.match(globals, new RegExp(`--${token}:\\s*${value.replace("#", "\\#")}`));
   }
 
@@ -41,6 +71,51 @@ test("the upgrade preserves the established palette and responsive shell", () =>
   assert.match(voStyles, /@media \(max-width: 1120px\)/);
   assert.match(voStyles, /@media \(max-width: 720px\)/);
   assert.match(voStyles, /@media \(max-width: 480px\)/);
+});
+
+test("theme selection is pre-painted, accessible, and persisted", () => {
+  const layout = readProjectFile("src/app/layout.tsx");
+  const page = readProjectFile("src/app/page.tsx");
+  const toggle = readProjectFile("src/components/ThemeToggle.tsx");
+
+  assert.match(layout, /data-theme="dark"/);
+  assert.match(layout, /suppressHydrationWarning/);
+  assert.match(layout, /voiceover-film-enhancer-theme/);
+  assert.match(layout, /meta\[name=["']theme-color["']\]/);
+  assert.match(page, /<ThemeToggle\s*\/>/);
+  assert.match(toggle, /Use light theme/);
+  assert.match(toggle, /Use dark theme/);
+  assert.match(toggle, /localStorage\.setItem\(THEME_STORAGE_KEY, nextTheme\)/);
+  assert.match(toggle, /document\.documentElement\.dataset\.theme = nextTheme/);
+  assert.match(toggle, /meta\?\.setAttribute\("content", themeColor\)/);
+});
+
+test("secondary feedback surfaces inherit both themes", () => {
+  const voStyles = readProjectFile("src/components/VoLeveler.module.css");
+  const loginStyles = readProjectFile("src/components/LoginCard.module.css");
+  const splitterStyles = readProjectFile("src/components/AudioTrackSplitter.module.css");
+  const qcStyles = readProjectFile("src/components/QcReportLab.module.css");
+
+  assert.match(voStyles, /\.log\s*\{[\s\S]*?color:\s*var\(--text-subtle\)[\s\S]*?background:\s*var\(--surface-muted\)/);
+  assert.match(loginStyles, /\.error\s*\{[\s\S]*?color:\s*var\(--danger\)[\s\S]*?background:\s*var\(--danger-surface\)/);
+  assert.match(splitterStyles, /\.errorBox\s*\{[\s\S]*?color:\s*var\(--danger\)[\s\S]*?background:\s*var\(--danger-surface\)/);
+  assert.match(qcStyles, /\.errorText\s*\{[\s\S]*?color:\s*var\(--danger\)/);
+  assert.match(qcStyles, /\.warningBanner\s*\{[\s\S]*?border:\s*1px solid var\(--warning-border\)[\s\S]*?background:\s*var\(--warning-surface\)/);
+});
+
+test("advanced processing opens in a stable non-reflowing layer", () => {
+  const source = readProjectFile("src/components/VoLeveler.tsx");
+  const styles = readProjectFile("src/components/VoLeveler.module.css");
+
+  assert.match(styles, /\.advancedDisclosure\s*\{[\s\S]*?position:\s*relative/);
+  assert.match(styles, /\.advancedPanel\s*\{[\s\S]*?position:\s*absolute/);
+  assert.match(styles, /\.advancedPanel\s*\{[\s\S]*?max-height:/);
+  assert.match(styles, /\.advancedPanel\s*\{[\s\S]*?overflow-y:\s*auto/);
+  assert.match(source, /ref=\{advancedDisclosureRef\}/);
+  assert.match(source, /ref=\{advancedTriggerRef\}/);
+  assert.match(source, /className=\{styles\.advancedPanel\}/);
+  assert.match(source, /event\.key === "Escape"/);
+  assert.match(source, /advancedTriggerRef\.current\?\.focus\(\)/);
 });
 
 test("core VO controls have names, keyboard access, and disclosure semantics", () => {
@@ -120,7 +195,8 @@ test("motion is purposeful, short, and preference-aware", () => {
   const voStyles = readProjectFile("src/components/VoLeveler.module.css");
   const qcStyles = readProjectFile("src/components/QcReportLab.module.css");
   const loginStyles = readProjectFile("src/components/LoginCard.module.css");
-  const styles = [appTools, globals, voStyles, qcStyles, loginStyles].join("\n");
+  const themeStyles = readProjectFile("src/components/ThemeToggle.module.css");
+  const styles = [appTools, globals, voStyles, qcStyles, loginStyles, themeStyles].join("\n");
 
   assert.match(appTools, /\.tab\s*\{[\s\S]*?transition:\s*transform 150ms var\(--ease-out\)/);
   assert.match(globals, /@media \(prefers-reduced-motion: reduce\)/);
@@ -136,6 +212,7 @@ test("motion is purposeful, short, and preference-aware", () => {
   );
   assert.match(qcStyles, /\.dropzone\s*\{[\s\S]*?transition:\s*border-color 160ms var\(--ease-out\), background 160ms var\(--ease-out\)/);
   assert.match(loginStyles, /\.buttonLabel/);
+  assert.match(themeStyles, /@media \(hover: hover\) and \(pointer: fine\)[\s\S]*?\.toggle:hover/);
   assert.doesNotMatch(styles, /transition:\s*all\b/);
   assert.doesNotMatch(styles, /\bease-in\b/);
   assert.doesNotMatch(styles, /scale\(0\)/);

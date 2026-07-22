@@ -2,6 +2,7 @@ import Link from "next/link";
 import { headers } from "next/headers";
 import AppTools from "@/components/AppTools";
 import SignOutButton from "@/components/SignOutButton";
+import ThemeToggle from "@/components/ThemeToggle";
 import { getServerAuthSession } from "@/auth";
 import { isAllowedEmail } from "@/lib/authAllowlist";
 import { isAiAutoPilotEnabled } from "@/lib/aiAutoPilotPolicy";
@@ -37,6 +38,7 @@ export default async function Home() {
                 QC Lab
               </Link>
             )}
+            <ThemeToggle />
             <div className={styles.accountBlock}>
               <span className={styles.accountLabel}>{localMode ? "Local session" : "Signed in"}</span>
               <span className={styles.account}>{email}</span>
