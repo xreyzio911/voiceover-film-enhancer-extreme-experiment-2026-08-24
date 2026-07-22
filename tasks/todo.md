@@ -224,3 +224,23 @@
 - Escape closes and restores trigger focus, outside click closes, the scroll-contained panel reaches the review controls, and rapid toggling leaves document geometry unchanged.
 - A fresh light-OS context still boots dark. Light mode updates `data-theme`, `color-scheme`, and `theme-color`, persists through reload, and invalid storage falls back to dark. Light secondary surfaces use semantic error/warning/log tokens.
 - Independent correctness and design/accessibility reviews found no blocking issues. The light faint-text token was darkened to `#647474`, clearing 4.5:1 contrast on the tinted light surfaces.
+
+# Below-Trigger Liquid Glass Advanced Options
+
+## Checklist
+
+- [x] Inspect the supplied screenshot, current disclosure placement, theme tokens, and Aave glass reference.
+- [x] Add failing contracts for below-trigger placement, liquid-glass material, theme-specific readability, and transparency fallbacks.
+- [x] Implement the out-of-flow panel below its trigger without changing the surrounding layout or color scheme.
+- [x] Verify focused tests, the complete suite, lint, build, and `git diff --check`.
+- [x] Verify dark and light popovers in-browser at desktop and narrow widths, including placement, contrast, scrolling, Escape, outside click, and zero layout movement.
+- [x] Complete an independent correctness/accessibility review and record final evidence.
+
+## Review Notes
+
+- The Aave reference informed a practical cross-browser glass treatment: restrained translucent fill, static blur/saturation, rim and specular highlights, and solid fallbacks instead of a large SVG/WebGL refraction engine.
+- The focused contract went red against the above-trigger opaque panel, then passed 10/10 after implementation. The complete suite passed 168 tests with one optional splitter smoke skipped; ESLint, the production build, and `git diff --check` passed. The build retains the existing Turbopack NFT tracing warning in the audio-splitter route.
+- Browser QA at 1440 x 1100 and 390 x 844 measured an exact 8 px trigger-to-panel gap, zero movement in Source audio, Processing profile, Batch queue, Deliverables, and Activity log, and no horizontal overflow. The 352 px panel scrolled through all 576 px of overflow to the review controls.
+- Dark and light subtle text measured 4.78:1 and 5.29:1 in the brightest plausible glass regions; dense review metadata measured 5.10:1 and 4.59:1. Reduced transparency rendered a solid theme surface with no backdrop filter.
+- Escape closed the panel and restored trigger focus, outside click closed it, and six rapid toggles settled closed without console or dev-server errors. Reduced motion removed transform movement while retaining a 150 ms opacity cue.
+- Independent reviewers confirmed the theme treatment, accessibility wiring, cross-browser fallback, and desktop visual quality. The layer intentionally covers the lower action/cards while open because that is the user-annotated below-button target region; those controls return immediately on close, and live geometry supplements the static source contract.

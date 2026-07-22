@@ -118,6 +118,44 @@ test("advanced processing opens in a stable non-reflowing layer", () => {
   assert.match(source, /advancedTriggerRef\.current\?\.focus\(\)/);
 });
 
+test("advanced processing opens below its trigger as readable liquid glass", () => {
+  const globals = readProjectFile("src/app/globals.css");
+  const styles = readProjectFile("src/components/VoLeveler.module.css");
+  const darkTheme = globals.match(/:root\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
+  const lightTheme = globals.match(/:root\[data-theme=["']light["']\]\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
+  const advancedPanel = styles.match(/\.advancedPanel\s*\{[\s\S]*?\}/)?.[0] ?? "";
+
+  assert.notEqual(darkTheme, "");
+  assert.notEqual(lightTheme, "");
+  assert.notEqual(advancedPanel, "");
+
+  for (const token of [
+    "glass-panel",
+    "glass-border",
+    "glass-highlight",
+    "glass-sheen",
+    "glass-divider",
+    "glass-shadow",
+  ]) {
+    assert.match(darkTheme, new RegExp(`--${token}:`));
+    assert.match(lightTheme, new RegExp(`--${token}:`));
+  }
+
+  assert.match(advancedPanel, /top:\s*calc\(100% \+ 8px\)/);
+  assert.match(advancedPanel, /bottom:\s*auto/);
+  assert.doesNotMatch(advancedPanel, /bottom:\s*calc\(100%/);
+  assert.match(advancedPanel, /color:\s*var\(--text\)/);
+  assert.match(advancedPanel, /border:\s*1px solid var\(--glass-border\)/);
+  assert.match(advancedPanel, /background:[\s\S]*?var\(--glass-highlight\)[\s\S]*?var\(--glass-sheen\)[\s\S]*?var\(--glass-panel\)/);
+  assert.match(advancedPanel, /-webkit-backdrop-filter:\s*blur\(18px\) saturate\(140%\)/);
+  assert.match(advancedPanel, /backdrop-filter:\s*blur\(18px\) saturate\(140%\)/);
+  assert.match(advancedPanel, /box-shadow:\s*var\(--glass-shadow\),\s*inset 0 1px 0 var\(--glass-highlight\)/);
+  assert.match(advancedPanel, /transform-origin:\s*top center/);
+  assert.match(styles, /\.advancedPanel \.toggleRow\s*\{[\s\S]*?border-color:\s*var\(--glass-divider\)/);
+  assert.match(styles, /@supports not \(\(backdrop-filter:\s*blur\(1px\)\) or \(-webkit-backdrop-filter:\s*blur\(1px\)\)\)[\s\S]*?\.advancedPanel\s*\{[\s\S]*?background:\s*var\(--surface-raised\)/);
+  assert.match(styles, /@media \(prefers-reduced-transparency:\s*reduce\)[\s\S]*?\.advancedPanel\s*\{[\s\S]*?background:\s*var\(--surface-raised\)[\s\S]*?backdrop-filter:\s*none/);
+});
+
 test("core VO controls have names, keyboard access, and disclosure semantics", () => {
   const source = readProjectFile("src/components/VoLeveler.tsx");
   const styles = readProjectFile("src/components/VoLeveler.module.css");

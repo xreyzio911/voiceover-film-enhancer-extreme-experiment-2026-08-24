@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-07-22 - Verify Popover Direction, Not Only Layout Stability
+
+- What went wrong: The Advanced options layer was made non-reflowing, but it was anchored above its trigger and covered the upper profile selectors instead of opening into the annotated space below.
+- Rule to prevent it: Treat overlay direction as an explicit spatial contract alongside no-layout-shift behavior; do not infer that any non-reflowing placement is acceptable.
+- How to verify next time: Measure that the open panel's top edge is below the trigger's bottom edge, while the surrounding card and downstream section rectangles remain unchanged at desktop and mobile widths.
+
 ## 2026-07-22 - Verify The Experiment Owner Before Authenticated QA
 
 - What went wrong: The isolated deployment was created and its anonymous auth boundary was verified, but the intended experiment owner's email was not present in the code allowlist, blocking authenticated browser QA.
