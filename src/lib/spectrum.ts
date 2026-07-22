@@ -242,6 +242,34 @@ export const computeSibilanceScore = (bandDb: number[]): number => {
   return clamp((ratio + 1) / 9, 0, 1); // 0 at ratio=-1dB, 1 at ratio=+8dB
 };
 
+export type SpectrumTiltsDb = {
+  lowTiltDb: number;
+  highTiltDb: number;
+};
+
+const powerMeanDb = (values: readonly number[]) => {
+  if (values.length === 0 || values.some((value) => !Number.isFinite(value))) return null;
+  const meanPower = values.reduce((sum, value) => sum + Math.pow(10, value / 10), 0) / values.length;
+  return 10 * Math.log10(meanPower + 1e-30);
+};
+
+/**
+ * Derive broad low/body/high tilts from the analyzer's eight-band spectrum.
+ * The output is relative, so absolute recording level cancels out. Callers
+ * must compare values produced in the same measurement domain.
+ */
+export const deriveSpectrumTiltsDb = (bandDb: readonly number[]): SpectrumTiltsDb | null => {
+  if (bandDb.length < 8) return null;
+  const lowDb = powerMeanDb(bandDb.slice(0, 3));
+  const midDb = powerMeanDb(bandDb.slice(3, 6));
+  const highDb = powerMeanDb(bandDb.slice(6, 8));
+  if (lowDb === null || midDb === null || highDb === null) return null;
+  return {
+    lowTiltDb: lowDb - midDb,
+    highTiltDb: highDb - midDb,
+  };
+};
+
 export const resolveDeEsserBands = (bandDb: number[]) => {
   if (bandDb.length < 8) return DE_ESSER_PLACEMENTS.balanced;
   const body = (bandDb[4] + bandDb[5]) / 2;

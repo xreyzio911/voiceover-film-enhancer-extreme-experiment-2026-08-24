@@ -178,6 +178,18 @@ test("core VO controls have names, keyboard access, and disclosure semantics", (
   assert.match(source, /id="advanced-processing-options"/);
 });
 
+test("VO file pickers preserve the selected FileList until ingestion completes", () => {
+  const source = readProjectFile("src/components/VoLeveler.tsx");
+
+  assert.match(source, /const resetFileInputBeforeSelection = /);
+  assert.equal(source.match(/onClick=\{resetFileInputBeforeSelection\}/g)?.length, 2);
+  assert.equal(source.match(/onChange=\{handleFileInputChange\}/g)?.length, 2);
+  assert.doesNotMatch(
+    source,
+    /onChange=\{\(event\) => \{[\s\S]{0,160}?event\.currentTarget\.value = "";/,
+  );
+});
+
 test("queue progress is named, compositor-friendly, and linear", () => {
   const source = readProjectFile("src/components/VoLeveler.tsx");
   const styles = readProjectFile("src/components/VoLeveler.module.css");

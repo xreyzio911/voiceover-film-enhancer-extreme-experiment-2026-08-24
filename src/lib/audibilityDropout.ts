@@ -31,7 +31,25 @@ export type AudibilityDropoutInput = {
   severeClusterSeconds?: number;
 };
 
+export type AlignedAudibilityDropoutInput = AudibilityDropoutInput & {
+  /** Maximum global render latency considered before comparing speech frames. */
+  maxAlignmentMs?: number;
+  /** Minimum correlation evidence required before a non-zero offset is used. */
+  minAlignmentConfidence?: number;
+};
+
+export type AlignedAudibilityDropoutResult = {
+  rawReport: AudibilityDropoutReport;
+  alignedReport: AudibilityDropoutReport;
+  finalReport: AudibilityDropoutReport;
+  /** Positive means the rendered envelope arrives later than the source. */
+  alignmentOffsetMs: number;
+  alignmentConfidence: number;
+};
+
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const normalizeFrameMs = (value: number | undefined, fallback = 20) =>
+  typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 const LOCAL_SPEECH_CONTEXT_MS = 200;
 
 const median = (values: number[]) => {
@@ -151,7 +169,7 @@ export const frameDbFromFloatSamples = (samples: Float32Array, sampleRate: numbe
 };
 
 export const detectAudibilityDropouts = (input: AudibilityDropoutInput): AudibilityDropoutReport => {
-  const frameMs = input.frameMs ?? 20;
+  const frameMs = normalizeFrameMs(input.frameMs);
   const frameCount = input.sourceFrameDb.length;
   const renderedFrameCount = input.renderedFrameDb.length;
   const missingTailToleranceFrames = Math.max(0, Math.round((input.missingTailToleranceMs ?? 60) / frameMs));
@@ -211,5 +229,121 @@ export const detectAudibilityDropouts = (input: AudibilityDropoutInput): Audibil
     clusterCount: clusters.length,
     worstDropDb,
     clusters,
+  };
+};
+
+const audibilityAlignmentActivity = (db: number) => {
+  if (!Number.isFinite(db) || db <= -90) return 0;
+  return Math.pow(10, clamp(db, -90, 0) / 20);
+};
+
+const estimateAudibilityAlignment = (
+  sourceFrameDb: number[],
+  renderedFrameDb: number[],
+  maxLagFrames: number,
+) => {
+  if (maxLagFrames <= 0 || sourceFrameDb.length === 0 || renderedFrameDb.length === 0) {
+    return { lagFrames: 0, confidence: 0 };
+  }
+
+  let bestLagFrames = 0;
+  let bestCorrelation = Number.NEGATIVE_INFINITY;
+  let secondBestCorrelation = Number.NEGATIVE_INFINITY;
+  let zeroLagCorrelation = Number.NEGATIVE_INFINITY;
+
+  for (let lagFrames = -maxLagFrames; lagFrames <= maxLagFrames; lagFrames += 1) {
+    let dot = 0;
+    let sourceEnergy = 0;
+    let renderedEnergy = 0;
+    let activePairs = 0;
+    for (let sourceFrame = 0; sourceFrame < sourceFrameDb.length; sourceFrame += 1) {
+      const renderedFrame = sourceFrame + lagFrames;
+      if (renderedFrame < 0 || renderedFrame >= renderedFrameDb.length) continue;
+      const sourceActivity = audibilityAlignmentActivity(sourceFrameDb[sourceFrame] ?? -240);
+      const renderedActivity = audibilityAlignmentActivity(renderedFrameDb[renderedFrame] ?? -240);
+      if (sourceActivity <= 0 && renderedActivity <= 0) continue;
+      dot += sourceActivity * renderedActivity;
+      sourceEnergy += sourceActivity * sourceActivity;
+      renderedEnergy += renderedActivity * renderedActivity;
+      activePairs += 1;
+    }
+
+    const correlation =
+      activePairs > 0 && sourceEnergy > 1e-12 && renderedEnergy > 1e-12
+        ? dot / Math.sqrt(sourceEnergy * renderedEnergy)
+        : 0;
+    if (lagFrames === 0) zeroLagCorrelation = correlation;
+
+    // A tiny zero-lag prior prevents flat or repetitive envelopes from
+    // inventing movement, while clear speech-edge evidence still wins.
+    const adjustedCorrelation = correlation - Math.abs(lagFrames) * 0.002;
+    const bestAdjustedCorrelation =
+      bestCorrelation - Math.abs(bestLagFrames) * 0.002;
+    if (
+      adjustedCorrelation > bestAdjustedCorrelation + 1e-9 ||
+      (Math.abs(adjustedCorrelation - bestAdjustedCorrelation) <= 1e-9 &&
+        Math.abs(lagFrames) < Math.abs(bestLagFrames))
+    ) {
+      secondBestCorrelation = bestCorrelation;
+      bestCorrelation = correlation;
+      bestLagFrames = lagFrames;
+    } else if (correlation > secondBestCorrelation) {
+      secondBestCorrelation = correlation;
+    }
+  }
+
+  const improvementOverZero = Math.max(0, bestCorrelation - Math.max(0, zeroLagCorrelation));
+  const separation = Math.max(0, bestCorrelation - Math.max(0, secondBestCorrelation));
+  const confidence = clamp(bestCorrelation * 0.35 + improvementOverZero * 3 + separation * 4, 0, 1);
+  return { lagFrames: bestLagFrames, confidence };
+};
+
+const alignRenderedAudibilityFrames = (renderedFrameDb: number[], lagFrames: number) => {
+  if (lagFrames > 0) return renderedFrameDb.slice(lagFrames);
+  if (lagFrames < 0) {
+    return [...new Array<number>(-lagFrames).fill(-240), ...renderedFrameDb];
+  }
+  return renderedFrameDb.slice();
+};
+
+/**
+ * Compensates for small, measured DSP latency before running the existing
+ * speech-loss detector. This changes no quality threshold: it prevents normal
+ * filter delay from masquerading as missing consonants, while real deletion or
+ * truncation remains subject to the same audibility fallback policy.
+ */
+export const detectAlignedAudibilityDropouts = (
+  input: AlignedAudibilityDropoutInput,
+): AlignedAudibilityDropoutResult => {
+  const frameMs = normalizeFrameMs(input.frameMs);
+  const normalizedInput = { ...input, frameMs };
+  const rawReport = detectAudibilityDropouts(normalizedInput);
+  const requestedMaxAlignmentMs =
+    typeof input.maxAlignmentMs === "number" && Number.isFinite(input.maxAlignmentMs)
+      ? input.maxAlignmentMs
+      : 60;
+  const maxAlignmentMs = clamp(requestedMaxAlignmentMs, 0, 120);
+  const maxLagFrames = Math.max(0, Math.round(maxAlignmentMs / frameMs));
+  const estimated = estimateAudibilityAlignment(input.sourceFrameDb, input.renderedFrameDb, maxLagFrames);
+  const requestedMinAlignmentConfidence =
+    typeof input.minAlignmentConfidence === "number" && Number.isFinite(input.minAlignmentConfidence)
+      ? input.minAlignmentConfidence
+      : 0.5;
+  const minAlignmentConfidence = clamp(requestedMinAlignmentConfidence, 0, 1);
+  const useAlignment = estimated.lagFrames !== 0 && estimated.confidence >= minAlignmentConfidence;
+  const alignmentOffsetMs = useAlignment ? estimated.lagFrames * frameMs : 0;
+  const alignedReport = useAlignment
+    ? detectAudibilityDropouts({
+        ...normalizedInput,
+        renderedFrameDb: alignRenderedAudibilityFrames(input.renderedFrameDb, estimated.lagFrames),
+      })
+    : rawReport;
+
+  return {
+    rawReport,
+    alignedReport,
+    finalReport: alignedReport,
+    alignmentOffsetMs,
+    alignmentConfidence: estimated.confidence,
   };
 };

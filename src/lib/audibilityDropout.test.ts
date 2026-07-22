@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectAudibilityDropouts } from "./audibilityDropout.ts";
+import { detectAlignedAudibilityDropouts, detectAudibilityDropouts } from "./audibilityDropout.ts";
 
 const makeFrames = (length: number, db: number) => new Array<number>(length).fill(db);
 
@@ -234,4 +234,107 @@ test("detects all-soft speech when the adaptive threshold would otherwise rise t
   assert.equal(report.clusterCount, 1);
   assert.ok(report.sourceSpeechThresholdDb >= -31);
   assert.ok(report.badSeconds >= 1, `expected all-soft speech collapse to trip, got ${report.badSeconds}s`);
+});
+
+const makeShiftedSpeechPair = (offsetFrames = 2) => {
+  const sourceFrameDb = makeFrames(360, -94);
+  const renderedFrameDb = makeFrames(360, -110);
+  const speechRegions = [
+    { start: 24, end: 88, db: -31 },
+    { start: 108, end: 176, db: -38 },
+    { start: 202, end: 278, db: -27 },
+    { start: 300, end: 342, db: -35 },
+  ];
+  for (const region of speechRegions) {
+    for (let frame = region.start; frame < region.end; frame += 1) {
+      const contourDb = region.db + ((frame - region.start) % 11 === 0 ? 4 : 0);
+      sourceFrameDb[frame] = contourDb;
+      const renderedFrame = frame + offsetFrames;
+      if (renderedFrame < renderedFrameDb.length) renderedFrameDb[renderedFrame] = contourDb + 6;
+    }
+  }
+  return { sourceFrameDb, renderedFrameDb };
+};
+
+test("aligns normal 20-40 ms render latency before judging quiet-speech loss", () => {
+  const { sourceFrameDb, renderedFrameDb } = makeShiftedSpeechPair(2);
+  const result = detectAlignedAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb,
+    frameMs: 20,
+    maxAlignmentMs: 60,
+    minClusterMs: 20,
+    severeBadSeconds: 0.04,
+    severeClusterSeconds: 0.04,
+  });
+
+  assert.equal(result.rawReport.severe, true, "the unaligned comparison should reproduce the false alarm");
+  assert.equal(result.alignmentOffsetMs, 40);
+  assert.ok(result.alignmentConfidence >= 0.5, `expected usable alignment confidence, got ${result.alignmentConfidence}`);
+  assert.equal(result.alignedReport.severe, false);
+  assert.equal(result.finalReport.severe, false);
+});
+
+test("keeps a real deleted phrase severe after compensating for render latency", () => {
+  const { sourceFrameDb, renderedFrameDb } = makeShiftedSpeechPair(2);
+  for (let sourceFrame = 132; sourceFrame < 148; sourceFrame += 1) {
+    renderedFrameDb[sourceFrame + 2] = -140;
+  }
+
+  const result = detectAlignedAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb,
+    frameMs: 20,
+    maxAlignmentMs: 60,
+  });
+
+  assert.equal(result.alignmentOffsetMs, 40);
+  assert.equal(result.alignedReport.severe, true);
+  assert.equal(result.finalReport.severe, true);
+  assert.ok(result.finalReport.badSeconds >= 0.3);
+});
+
+test("does not let bounded alignment hide a genuinely missing speech tail", () => {
+  const { sourceFrameDb, renderedFrameDb } = makeShiftedSpeechPair(2);
+  const truncatedRenderedFrameDb = renderedFrameDb.slice(0, 330);
+
+  const result = detectAlignedAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb: truncatedRenderedFrameDb,
+    frameMs: 20,
+    maxAlignmentMs: 60,
+  });
+
+  assert.equal(result.finalReport.severe, true);
+  assert.ok(result.finalReport.clusters.some((cluster) => cluster.startFrame >= 330));
+});
+
+test("keeps zero-latency intact speech at zero alignment offset", () => {
+  const { sourceFrameDb } = makeShiftedSpeechPair(0);
+  const renderedFrameDb = sourceFrameDb.map((db) => (db > -90 ? db + 6 : -110));
+  const result = detectAlignedAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb,
+    frameMs: 20,
+    maxAlignmentMs: 60,
+  });
+
+  assert.equal(result.alignmentOffsetMs, 0);
+  assert.equal(result.finalReport.severe, false);
+});
+
+test("invalid frame duration fails safe without entering an unbounded alignment loop", () => {
+  const { sourceFrameDb, renderedFrameDb } = makeShiftedSpeechPair(2);
+
+  for (const frameMs of [0, -10, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const result = detectAlignedAudibilityDropouts({
+      sourceFrameDb,
+      renderedFrameDb,
+      frameMs,
+      maxAlignmentMs: 60,
+    });
+
+    assert.equal(result.alignmentOffsetMs, 40, `invalid frameMs ${String(frameMs)} should use the safe 20 ms default`);
+    assert.equal(result.finalReport.severe, false);
+  }
 });

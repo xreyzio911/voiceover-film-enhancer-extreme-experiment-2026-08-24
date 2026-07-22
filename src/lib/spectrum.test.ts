@@ -3,7 +3,9 @@ import test from "node:test";
 import {
   CINEMATIC_VO_REFERENCE_DB,
   computeLogBandSpectrumDb,
+  computeSibilanceScore,
   computeToneMatchDeltaDb,
+  deriveSpectrumTiltsDb,
   resolveDeEsserBands,
   resolveSpectrumFrameBudget,
 } from "./spectrum.ts";
@@ -63,6 +65,40 @@ test("adaptive de-esser placement follows measured sibilance center", () => {
     mainHz: 6500,
     secondaryHz: 9000,
   });
+});
+
+test("speech-spectrum tilts are level-invariant and follow the measured tonal region", () => {
+  const neutral = deriveSpectrumTiltsDb(new Array<number>(8).fill(-40));
+  const lowHeavy = deriveSpectrumTiltsDb([-20, -20, -22, -40, -40, -40, -40, -40]);
+  const highHeavy = deriveSpectrumTiltsDb([-40, -40, -40, -40, -40, -40, -20, -20]);
+  const shiftedLowHeavy = deriveSpectrumTiltsDb([-8, -8, -10, -28, -28, -28, -28, -28]);
+
+  assert.deepEqual(neutral, { lowTiltDb: 0, highTiltDb: 0 });
+  assert.ok((lowHeavy?.lowTiltDb ?? 0) > 14, `low-heavy spectrum should report positive low tilt: ${JSON.stringify(lowHeavy)}`);
+  assert.ok((highHeavy?.highTiltDb ?? 0) > 16, `high-heavy spectrum should report positive high tilt: ${JSON.stringify(highHeavy)}`);
+  assert.ok(Math.abs((shiftedLowHeavy?.lowTiltDb ?? 0) - (lowHeavy?.lowTiltDb ?? 0)) < 1e-9);
+  assert.equal(deriveSpectrumTiltsDb([-40, -40, -40]), null);
+});
+
+test("activity-selected spectrum keeps de-esser placement tied to speech instead of room tone", () => {
+  const sampleRate = 24000;
+  const samples = buildTone(sampleRate, 1, [
+    { startSec: 0, endSec: 0.8, hz: 1000, amplitude: 0.2 },
+    { startSec: 0, endSec: 0.8, hz: 7250, amplitude: 0.3 },
+    { startSec: 0.8, endSec: 1, hz: 1000, amplitude: 0.2 },
+    { startSec: 0.8, endSec: 1, hz: 4120, amplitude: 0.3 },
+    { startSec: 0.8, endSec: 1, hz: 7250, amplitude: 0.02 },
+  ]);
+  const activityMask = Array.from({ length: 100 }, (_, index) => index >= 80);
+  const wholeSignal = computeLogBandSpectrumDb(samples, sampleRate);
+  const speechOnly = computeLogBandSpectrumDb(samples, sampleRate, {
+    activityMask,
+    activityFrameMs: 10,
+  });
+
+  assert.equal(resolveDeEsserBands(wholeSignal).mainHz, 7200);
+  assert.equal(resolveDeEsserBands(speechOnly).mainHz, 5800);
+  assert.ok(computeSibilanceScore(speechOnly) >= 0.4, "synthetic sibilant speech should retain actionable evidence");
 });
 
 test("spectrum analysis caps long-file frame visits", () => {

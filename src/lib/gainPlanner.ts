@@ -152,6 +152,7 @@ const COLD_OPEN_ATTACK_LEAD_MS = 40;
 const FRICATIVE_BAND_LOW_HZ = 3500;
 const FRICATIVE_BAND_HIGH_HZ = 7400;
 const FRICATIVE_EVIDENCE_MARGIN_DB = 10;
+const FRICATIVE_TAIL_RESCUE_MAX_MS = 240;
 const SOFT_TAIL_RESCUE_MAX_MS = 500;
 const SOFT_TAIL_RESCUE_NOISY_MAX_MS = 240;
 const SOFT_TAIL_RESCUE_NOISY_RISK = 0.55;
@@ -170,12 +171,22 @@ const QUIET_BODY_FLOOR_EXTREME_CREST_DB = 24;
 const BODY_SPIKE_MAX_RUN_LOSS_DB = 10;
 const BODY_SPIKE_RUN_FLOOR_OFFSET_DB = 9;
 const RENDERED_CONSONANT_FRAME_MS = 10;
+/** Evidence resolution required to separate adjacent source-relative consonant events. */
+export const RENDERED_CONSONANT_SOURCE_FRAME_MS = 2;
 const RENDERED_CONSONANT_LOCAL_WINDOW_MS = 280;
 const RENDERED_CONSONANT_ALLOWED_PEAK_OVER_BODY_DB = 15.5;
 const RENDERED_CONSONANT_ABSOLUTE_PEAK_DB = -6.5;
 const RENDERED_CONSONANT_MIN_TARGET_PEAK_DB = -12.5;
 const RENDERED_CONSONANT_MAX_REDUCTION_DB = 7.5;
 const RENDERED_CONSONANT_DIP_RADIUS_MS = 14;
+const RENDERED_CONSONANT_SOURCE_ALLOWED_GROWTH_DB = 1.5;
+const RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB = 2.5;
+const RENDERED_CONSONANT_REFERENCE_MATCH_WINDOW_MS = 20;
+const RENDERED_CONSONANT_REFERENCE_ALIGNMENT_MAX_MS = 120;
+const RENDERED_CONSONANT_REFERENCE_MIN_CONFIDENCE = 0.5;
+const RENDERED_CONSONANT_WEAK_SOURCE_CONTRAST_DB = 8;
+const RENDERED_CONSONANT_WEAK_SOURCE_CREST_DB = 12;
+const RENDERED_CONSONANT_WEAK_SOURCE_MAX_REDUCTION_DB = 1.25;
 const PLANNER_ENVELOPE_FLOOR_PERCENTILE = 25;
 const PLANNER_ANALYSIS_FLOOR_HEADROOM_DB = 20;
 const K_WEIGHT_STAGE1_HIGH_SHELF_HZ = 1681.974450955533;
@@ -871,6 +882,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   );
   const softTailRescueMinActiveFrames = Math.max(1, Math.round(SOFT_TAIL_RESCUE_MIN_ACTIVE_MS / frameMs));
   const softTailRescueBridgeFrames = Math.max(0, Math.round(SOFT_TAIL_RESCUE_BRIDGE_MS / frameMs));
+  const fricativeTailRescueMaxFrames = Math.max(1, Math.round(FRICATIVE_TAIL_RESCUE_MAX_MS / frameMs));
   let tailRescueRunCount = 0;
   let tailRescueFrameCount = 0;
   let tailRescueMaxFrames = 0;
@@ -895,7 +907,11 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
 
     for (let f = meta.endFrame; f < scanEnd; f += 1) {
       const frameDb = input.frameDb[f] ?? -120;
-      if (frameDb >= tailFloorDb) {
+      const attachedFricativeTailEvidence =
+        f - meta.endFrame < fricativeTailRescueMaxFrames &&
+        frameDb >= hardNoiseFloorDb &&
+        hasFricativeEvidence(f);
+      if (frameDb >= tailFloorDb || attachedFricativeTailEvidence) {
         activeFrames += 1;
         quietBridgeFrames = 0;
         rescueEndFrame = f + 1;
@@ -1353,21 +1369,67 @@ export const applyGainCurveToSamples = (
 export type RenderedConsonantTamerStats = {
   tamedFrameCount: number;
   maxReductionDb: number;
+  referenceLagMs: number;
+  /** True only when source alignment was trustworthy enough to authorize the optional tamer. */
+  referenceUsed: boolean;
+  /** Alignment confidence in [0, 1]; low or ambiguous evidence always fails open. */
+  referenceConfidence: number;
 };
+
+export type RenderedConsonantReference = Readonly<{
+  /** Sample rate of the source evidence used to build this compact envelope. */
+  sampleRate: number;
+  frameMs: number;
+  durationSec: number;
+  rmsDb: Float32Array;
+  peakDb: Float32Array;
+}>;
+
+export type RenderedConsonantTamerOptions = Readonly<{
+  /** Time-aligned source samples used to distinguish native articulation from render-created contrast. */
+  referenceSamples?: Float32Array;
+  referenceSampleRate?: number;
+  /** Compact source envelope for reuse across final delivery transforms. */
+  reference?: RenderedConsonantReference;
+  /** Small timing tolerance for filter or resample latency; defaults to 20 ms. */
+  referenceMatchWindowMs?: number;
+  /** Optional cap for residual passes after a later delivery transform. */
+  maxReductionDb?: number;
+  /** Absolute analysis-frame offset used by bounded chunk processing. */
+  analysisFrameOffset?: number;
+}>;
 
 const measureFrameRmsAndPeak = (
   samples: Float32Array,
   sampleRate: number,
   frameMs: number,
+  frameOffset = 0,
 ) => {
-  const samplesPerFrame = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
-  const frameCount = Math.ceil(samples.length / samplesPerFrame);
+  const samplesPerFrame = Math.max(1, (sampleRate * frameMs) / 1000);
+  const baseSample = Math.round(frameOffset * samplesPerFrame);
+  const frameBoundary = (frame: number) => (
+    Math.round((frameOffset + frame) * samplesPerFrame) - baseSample
+  );
+  let frameCount = Math.max(1, Math.ceil(samples.length / samplesPerFrame));
+  while (frameCount > 1 && frameBoundary(frameCount - 1) >= samples.length) {
+    frameCount -= 1;
+  }
+  while (frameBoundary(frameCount) < samples.length) {
+    frameCount += 1;
+  }
   const rmsDb = new Array<number>(frameCount);
   const peakDb = new Array<number>(frameCount);
 
   for (let frame = 0; frame < frameCount; frame += 1) {
-    const start = frame * samplesPerFrame;
-    const end = Math.min(samples.length, start + samplesPerFrame);
+    // Derive every boundary from absolute time. Rounding 88.2 samples to a
+    // fixed 88-sample stride at 44.1 kHz would drift by more than 120 ms in a
+    // minute; absolute boundaries distribute the fractional samples without
+    // accumulating timing error.
+    const start = Math.min(samples.length, frameBoundary(frame));
+    const end = Math.min(
+      samples.length,
+      Math.max(start + 1, frameBoundary(frame + 1)),
+    );
     let sum = 0;
     let peak = 0;
     for (let index = start; index < end; index += 1) {
@@ -1385,7 +1447,7 @@ const measureFrameRmsAndPeak = (
 };
 
 const renderedLocalBodyDb = (
-  frameDb: number[],
+  frameDb: ArrayLike<number>,
   centerFrame: number,
   windowFrames: number,
 ) => {
@@ -1405,6 +1467,135 @@ const renderedLocalBodyDb = (
   return trimmed[Math.floor(trimmed.length * 0.6)] ?? values[Math.floor(values.length / 2)] ?? frameDb[centerFrame] ?? -120;
 };
 
+export const buildRenderedConsonantReference = (
+  samples: Float32Array,
+  sampleRate: number,
+  frameMs = RENDERED_CONSONANT_SOURCE_FRAME_MS,
+): RenderedConsonantReference | null => {
+  if (
+    samples.length === 0 ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    !Number.isFinite(frameMs) ||
+    frameMs <= 0
+  ) {
+    return null;
+  }
+  const measured = measureFrameRmsAndPeak(samples, sampleRate, frameMs);
+  return {
+    sampleRate,
+    frameMs,
+    durationSec: samples.length / sampleRate,
+    rmsDb: Float32Array.from(measured.rmsDb),
+    peakDb: Float32Array.from(measured.peakDb),
+  };
+};
+
+const estimateRenderedReferenceLagFrames = (
+  renderedRmsDb: ArrayLike<number>,
+  renderedPeakDb: ArrayLike<number>,
+  referenceRmsDb: ArrayLike<number>,
+  referencePeakDb: ArrayLike<number>,
+  frameMs: number,
+): { lagFrames: number; confidence: number; ambiguous: boolean } => {
+  const maxLagFrames = Math.min(
+    Math.max(0, Math.round(RENDERED_CONSONANT_REFERENCE_ALIGNMENT_MAX_MS / frameMs)),
+    Math.max(0, Math.floor(Math.min(renderedRmsDb.length, referenceRmsDb.length) / 4)),
+  );
+  if (maxLagFrames <= 0) return { lagFrames: 0, confidence: 0, ambiguous: true };
+
+  // Remove the stable voice body's crest baseline before correlation. This
+  // retains the timing fingerprint of short consonants without allowing two
+  // unrelated tonal beds to look confidently aligned.
+  const renderedActivity = new Float32Array(renderedRmsDb.length);
+  const referenceActivity = new Float32Array(referenceRmsDb.length);
+  const localWindowFrames = Math.max(1, Math.round(RENDERED_CONSONANT_LOCAL_WINDOW_MS / frameMs));
+  let renderedEnergy = 0;
+  let referenceEnergy = 0;
+  for (let frame = 0; frame < renderedActivity.length; frame += 1) {
+    const peak = renderedPeakDb[frame] ?? -120;
+    const rms = renderedRmsDb[frame] ?? -120;
+    const contrastDb = peak - renderedLocalBodyDb(renderedRmsDb, frame, localWindowFrames);
+    const crestDb = peak - rms;
+    const activity = clamp(
+      Math.max(0, contrastDb - 6) + Math.max(0, crestDb - 10) * 0.35,
+      0,
+      30,
+    );
+    renderedActivity[frame] = activity;
+    renderedEnergy += activity * activity;
+  }
+  for (let frame = 0; frame < referenceActivity.length; frame += 1) {
+    const peak = referencePeakDb[frame] ?? -120;
+    const rms = referenceRmsDb[frame] ?? -120;
+    const contrastDb = peak - renderedLocalBodyDb(referenceRmsDb, frame, localWindowFrames);
+    const crestDb = peak - rms;
+    const activity = clamp(
+      Math.max(0, contrastDb - 6) + Math.max(0, crestDb - 10) * 0.35,
+      0,
+      30,
+    );
+    referenceActivity[frame] = activity;
+    referenceEnergy += activity * activity;
+  }
+  if (renderedEnergy <= 1e-6 || referenceEnergy <= 1e-6) {
+    return { lagFrames: 0, confidence: 0, ambiguous: true };
+  }
+
+  const correlationByLag = new Map<number, number>();
+  let bestLag = 0;
+  let bestCorrelation = 0;
+  let bestAdjustedScore = Number.NEGATIVE_INFINITY;
+  for (let lag = -maxLagFrames; lag <= maxLagFrames; lag += 1) {
+    let dot = 0;
+    let leftEnergy = 0;
+    let rightEnergy = 0;
+    for (let referenceFrame = 0; referenceFrame < referenceActivity.length; referenceFrame += 1) {
+      const renderedFrame = referenceFrame + lag;
+      if (renderedFrame < 0 || renderedFrame >= renderedActivity.length) continue;
+      const left = referenceActivity[referenceFrame];
+      const right = renderedActivity[renderedFrame];
+      if (left <= 0 && right <= 0) continue;
+      dot += left * right;
+      leftEnergy += left * left;
+      rightEnergy += right * right;
+    }
+    const correlation = leftEnergy > 1e-9 && rightEnergy > 1e-9
+      ? dot / Math.sqrt(leftEnergy * rightEnergy)
+      : 0;
+    correlationByLag.set(lag, correlation);
+    // A light zero-lag prior avoids inventing timing movement when the crest
+    // pattern is flat or repetitive; strong matching evidence still wins.
+    const adjustedScore = correlation - (Math.abs(lag) / Math.max(maxLagFrames, 1)) * 0.025;
+    if (
+      adjustedScore > bestAdjustedScore + 1e-9 ||
+      (Math.abs(adjustedScore - bestAdjustedScore) <= 1e-9 && Math.abs(lag) < Math.abs(bestLag))
+    ) {
+      bestAdjustedScore = adjustedScore;
+      bestLag = lag;
+      bestCorrelation = correlation;
+    }
+  }
+
+  // Adjacent lag bins commonly describe the same 10-20 ms event. Compare the
+  // winner only with non-local alternatives so a broad consonant does not look
+  // ambiguous, while two distinct equally plausible alignments still do.
+  const sameEventRadiusFrames = Math.max(
+    1,
+    Math.round(RENDERED_CONSONANT_REFERENCE_MATCH_WINDOW_MS / frameMs),
+  );
+  let competingCorrelation = 0;
+  for (const [lag, correlation] of correlationByLag) {
+    if (Math.abs(lag - bestLag) <= sameEventRadiusFrames) continue;
+    competingCorrelation = Math.max(competingCorrelation, correlation);
+  }
+  const separation = bestCorrelation - competingCorrelation;
+  const separationConfidence = clamp((separation + 0.05) / 0.2, 0, 1);
+  const confidence = clamp(bestCorrelation * separationConfidence, 0, 1);
+  const ambiguous = bestCorrelation < 0.35 || separation < 0.03;
+  return { lagFrames: bestLag, confidence, ambiguous };
+};
+
 /**
  * Full-rate consonant peak polish for planner-leveled audio.
  *
@@ -1420,16 +1611,192 @@ export const tameRenderedConsonantPeaks = (
   samples: Float32Array,
   sampleRate: number,
   frameMs = RENDERED_CONSONANT_FRAME_MS,
+  options: RenderedConsonantTamerOptions = {},
 ): { samples: Float32Array; stats: RenderedConsonantTamerStats } => {
   const out = new Float32Array(samples);
-  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || samples.length === 0) {
-    return { samples: out, stats: { tamedFrameCount: 0, maxReductionDb: 0 } };
+  const noOpStats = (
+    referenceLagMs = 0,
+    referenceUsed = false,
+    referenceConfidence = 0,
+  ): RenderedConsonantTamerStats => ({
+    tamedFrameCount: 0,
+    maxReductionDb: 0,
+    referenceLagMs,
+    referenceUsed,
+    referenceConfidence,
+  });
+  if (
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    !Number.isFinite(frameMs) ||
+    frameMs <= 0 ||
+    samples.length === 0
+  ) {
+    return { samples: out, stats: noOpStats() };
   }
 
-  const { rmsDb, peakDb, samplesPerFrame, frameCount } = measureFrameRmsAndPeak(samples, sampleRate, frameMs);
-  const localWindowFrames = Math.max(1, Math.round(RENDERED_CONSONANT_LOCAL_WINDOW_MS / frameMs));
-  const dipRadiusFrames = Math.max(1, Math.round(RENDERED_CONSONANT_DIP_RADIUS_MS / frameMs));
+  const requestedMaxReductionDb = Number.isFinite(options.maxReductionDb)
+    ? clamp(options.maxReductionDb as number, 0, RENDERED_CONSONANT_MAX_REDUCTION_DB)
+    : RENDERED_CONSONANT_MAX_REDUCTION_DB;
+  const referenceRequested = options.reference !== undefined || options.referenceSamples !== undefined;
+  const referenceSampleRate = options.referenceSampleRate ?? sampleRate;
+  const inlineReference = options.referenceSamples
+    ? buildRenderedConsonantReference(
+        options.referenceSamples,
+        referenceSampleRate,
+        RENDERED_CONSONANT_SOURCE_FRAME_MS,
+      )
+    : null;
+  const suppliedReference = options.reference ?? inlineReference;
+  const referenceDurationSec = suppliedReference?.durationSec ?? 0;
+  const renderedDurationSec = samples.length / sampleRate;
+  const referenceDurationToleranceSec = Math.max(
+    0.05,
+    ((options.referenceMatchWindowMs ?? RENDERED_CONSONANT_REFERENCE_MATCH_WINDOW_MS) * 2) / 1000,
+  );
+  const referenceMetrics =
+    suppliedReference &&
+    Number.isFinite(suppliedReference.sampleRate) &&
+    suppliedReference.sampleRate > 0 &&
+    Number.isFinite(suppliedReference.frameMs) &&
+    suppliedReference.frameMs > 0 &&
+    suppliedReference.frameMs <= RENDERED_CONSONANT_SOURCE_FRAME_MS &&
+    Number.isFinite(referenceDurationSec) &&
+    referenceDurationSec > 0 &&
+    suppliedReference.rmsDb.length > 0 &&
+    suppliedReference.peakDb.length > 0 &&
+    suppliedReference.rmsDb.length === suppliedReference.peakDb.length &&
+    Math.abs(referenceDurationSec - renderedDurationSec) <= referenceDurationToleranceSec
+      ? suppliedReference
+      : null;
+  // A caller that supplied a source asked for source-relative behavior. If that
+  // source cannot be compared safely, preserve the render instead of silently
+  // falling back to the more aggressive source-blind legacy tamer.
+  if (referenceRequested && !referenceMetrics) {
+    return { samples: out, stats: noOpStats() };
+  }
+  // Keep the 10 ms legacy analysis for source-blind callers. Source-relative
+  // decisions use the compact reference's finer event resolution so adjacent
+  // consonants cannot share one attenuation decision.
+  const analysisFrameMs = referenceMetrics?.frameMs ?? frameMs;
+  const analysisFrameOffset = Number.isSafeInteger(options.analysisFrameOffset)
+    && (options.analysisFrameOffset ?? 0) >= 0
+    ? options.analysisFrameOffset ?? 0
+    : 0;
+  const { rmsDb, peakDb, samplesPerFrame, frameCount } = measureFrameRmsAndPeak(
+    samples,
+    sampleRate,
+    analysisFrameMs,
+    analysisFrameOffset,
+  );
+  const localWindowFrames = Math.max(
+    1,
+    Math.round(RENDERED_CONSONANT_LOCAL_WINDOW_MS / analysisFrameMs),
+  );
+  const dipRadiusFrames = Math.max(
+    1,
+    Math.round(RENDERED_CONSONANT_DIP_RADIUS_MS / analysisFrameMs),
+  );
+  const referenceFrameMs = referenceMetrics?.frameMs ?? frameMs;
+  const referenceAlignment = referenceMetrics
+    ? estimateRenderedReferenceLagFrames(
+        rmsDb,
+        peakDb,
+        referenceMetrics.rmsDb,
+        referenceMetrics.peakDb,
+        referenceFrameMs,
+      )
+    : { lagFrames: 0, confidence: 0, ambiguous: false };
+  const renderedReferenceLagFrames = referenceAlignment.lagFrames;
+  const referenceLagMs = renderedReferenceLagFrames * referenceFrameMs;
+  const referenceUsed = Boolean(
+    referenceMetrics &&
+    !referenceAlignment.ambiguous &&
+    referenceAlignment.confidence >= RENDERED_CONSONANT_REFERENCE_MIN_CONFIDENCE
+  );
+  if (referenceRequested && !referenceUsed) {
+    return {
+      samples: out,
+      stats: noOpStats(referenceLagMs, false, referenceAlignment.confidence),
+    };
+  }
+  const referenceMatchFrames = Math.max(
+    0,
+    Math.round(
+      (options.referenceMatchWindowMs ?? RENDERED_CONSONANT_REFERENCE_MATCH_WINDOW_MS) / referenceFrameMs,
+    ),
+  );
+  const resolveReferencePeakOverBodyDb = (renderedFrame: number) => {
+    if (!referenceMetrics || referenceMetrics.rmsDb.length <= 0 || referenceMetrics.peakDb.length <= 0) return null;
+    const centerTimeSec = ((renderedFrame + 0.5) * analysisFrameMs) / 1000;
+    const referenceCenterFrame = Math.round(
+      (centerTimeSec * 1000) / referenceFrameMs - 0.5 - renderedReferenceLagFrames,
+    );
+    const startFrame = Math.max(0, referenceCenterFrame - referenceMatchFrames);
+    const endFrame = Math.min(referenceMetrics.rmsDb.length - 1, referenceCenterFrame + referenceMatchFrames);
+    if (startFrame > endFrame) return null;
+    const referenceLocalWindowFrames = Math.max(
+      1,
+      Math.round(RENDERED_CONSONANT_LOCAL_WINDOW_MS / referenceFrameMs),
+    );
+    const contrastAtReferenceFrame = (referenceFrame: number) => {
+      const referencePeakDb = referenceMetrics.peakDb[referenceFrame] ?? -120;
+      const referenceRmsDb = referenceMetrics.rmsDb[referenceFrame] ?? -120;
+      const referenceBodyDb = renderedLocalBodyDb(
+        referenceMetrics.rmsDb,
+        referenceFrame,
+        referenceLocalWindowFrames,
+      );
+      return {
+        contrastDb: referencePeakDb - referenceBodyDb,
+        crestDb: referencePeakDb - referenceRmsDb,
+      };
+    };
+
+    // Match the nearest source-localized frame, with time as the primary
+    // key. This keeps adjacent /st/, /ts/, /sz/, and similar clusters from
+    // borrowing a stronger neighbor's contrast while retaining a small
+    // tolerance for resample/filter timing movement after global alignment.
+    let nearestDistanceFrames = Number.POSITIVE_INFINITY;
+    let nearestMatch: { contrastDb: number; maxReductionDb: number } | null = null;
+    let nearestMatchAmbiguous = false;
+    const canUseWeakFullBandwidthEvidence =
+      referenceMetrics.sampleRate >= sampleRate * 0.9;
+    for (let referenceFrame = startFrame; referenceFrame <= endFrame; referenceFrame += 1) {
+      const { contrastDb, crestDb } = contrastAtReferenceFrame(referenceFrame);
+      const hasStrongLocalizedSourceContrast = contrastDb >= 12 || crestDb >= 18;
+      const hasWeakFullBandwidthSourceContrast =
+        canUseWeakFullBandwidthEvidence &&
+        (contrastDb >= RENDERED_CONSONANT_WEAK_SOURCE_CONTRAST_DB ||
+          crestDb >= RENDERED_CONSONANT_WEAK_SOURCE_CREST_DB);
+      const hasLocalizedSourceContrast = hasStrongLocalizedSourceContrast || hasWeakFullBandwidthSourceContrast;
+      if (!hasLocalizedSourceContrast) continue;
+      const distanceFrames = Math.abs(referenceFrame - referenceCenterFrame);
+      if (distanceFrames < nearestDistanceFrames) {
+        nearestDistanceFrames = distanceFrames;
+        nearestMatch = {
+          contrastDb,
+          maxReductionDb: hasStrongLocalizedSourceContrast
+            ? RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB
+            : RENDERED_CONSONANT_WEAK_SOURCE_MAX_REDUCTION_DB,
+        };
+        nearestMatchAmbiguous = false;
+      } else if (distanceFrames === nearestDistanceFrames) {
+        // Two equidistant source events cannot be assigned confidently to one
+        // rendered frame. Fail open for that frame instead of choosing the
+        // louder event and risking damage to native articulation.
+        nearestMatchAmbiguous = true;
+      }
+    }
+    if (nearestMatchAmbiguous) return null;
+    if (nearestMatch && Number.isFinite(nearestMatch.contrastDb)) return nearestMatch;
+    // An optional final tamer needs positive, time-local source evidence. A
+    // missing event can be a bandwidth-limited reference rather than a defect,
+    // so preserve the render instead of inferring authorization from the body.
+    return null;
+  };
   const dipDbByFrame = new Float32Array(frameCount);
+  const sourceRelativeReductionDbByFrame = referenceMetrics ? new Float32Array(frameCount) : null;
   let tamedFrameCount = 0;
   let maxReductionDb = 0;
 
@@ -1443,16 +1810,36 @@ export const tameRenderedConsonantPeaks = (
     const crestDb = peak - rms;
     const strongVisiblePeak = peak >= RENDERED_CONSONANT_ABSOLUTE_PEAK_DB && peakOverBodyDb >= 12;
     const narrowConsonantPeak = peakOverBodyDb >= 17 || crestDb >= 18;
-    if (!strongVisiblePeak && !narrowConsonantPeak) continue;
-
-    const targetPeakDb = Math.min(
-      RENDERED_CONSONANT_ABSOLUTE_PEAK_DB,
-      Math.max(
-        RENDERED_CONSONANT_MIN_TARGET_PEAK_DB,
-        bodyDb + RENDERED_CONSONANT_ALLOWED_PEAK_OVER_BODY_DB,
-      ),
-    );
-    const reductionDb = clamp(peak - targetPeakDb, 0, RENDERED_CONSONANT_MAX_REDUCTION_DB);
+    const referenceMatch = resolveReferencePeakOverBodyDb(frame);
+    let reductionDb = 0;
+    if (referenceMetrics) {
+      // A source-relative request never falls through to the source-blind
+      // absolute tamer. Ambiguous local matches preserve the rendered frame.
+      if (referenceMatch === null) continue;
+      // Compare articulation shape instead of absolute level. A naturally strong
+      // /s/, /z/, /f/, or similar consonant is preserved when the source already
+      // contains it; only contrast added by processing receives a short soft dip.
+      const contrastGrowthDb = peakOverBodyDb - referenceMatch.contrastDb;
+      const sourceRelativeReductionDb = clamp(
+        contrastGrowthDb - RENDERED_CONSONANT_SOURCE_ALLOWED_GROWTH_DB,
+        0,
+        Math.min(requestedMaxReductionDb, referenceMatch.maxReductionDb),
+      );
+      const hasLocalizedRenderedContrast = peakOverBodyDb >= 12 || crestDb >= 18;
+      if (!hasLocalizedRenderedContrast) continue;
+      reductionDb = sourceRelativeReductionDb;
+      sourceRelativeReductionDbByFrame![frame] = reductionDb;
+    } else {
+      if (!strongVisiblePeak && !narrowConsonantPeak) continue;
+      const targetPeakDb = Math.min(
+        RENDERED_CONSONANT_ABSOLUTE_PEAK_DB,
+        Math.max(
+          RENDERED_CONSONANT_MIN_TARGET_PEAK_DB,
+          bodyDb + RENDERED_CONSONANT_ALLOWED_PEAK_OVER_BODY_DB,
+        ),
+      );
+      reductionDb = clamp(peak - targetPeakDb, 0, requestedMaxReductionDb);
+    }
     if (reductionDb < 0.4) continue;
 
     tamedFrameCount += 1;
@@ -1466,23 +1853,99 @@ export const tameRenderedConsonantPeaks = (
     }
   }
 
-  if (tamedFrameCount === 0) {
-    return { samples: out, stats: { tamedFrameCount: 0, maxReductionDb: 0 } };
+  if (sourceRelativeReductionDbByFrame) {
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      // Keep the cosine shoulder from spilling onto an adjacent source-native
+      // consonant. Interpolation between frame centers still gives the target
+      // event a smooth boundary, but a neighboring /s/, /t/, or /z/ whose
+      // source contrast did not grow receives no borrowed attenuation.
+      dipDbByFrame[frame] = Math.min(
+        dipDbByFrame[frame],
+        sourceRelativeReductionDbByFrame[frame],
+      );
+    }
   }
 
+  if (tamedFrameCount === 0) {
+    return {
+      samples: out,
+      stats: noOpStats(referenceLagMs, referenceUsed, referenceAlignment.confidence),
+    };
+  }
+
+  // Keep the centered envelope so a boundary-straddling fricative does not keep
+  // its peak while diagnostics report touched frames. Source-relative repair is
+  // additionally bounded by the frame that owns each sample: a weak or native
+  // lane cannot borrow a stronger neighbor's budget. Higher-cap lanes ease in
+  // from a lower previous cap and ease out toward a lower next cap within their
+  // own frame, keeping the transition smooth without crossing either boundary.
   const centerOffset = samplesPerFrame / 2;
+  const analysisSampleOffset = Math.round(analysisFrameOffset * samplesPerFrame);
   for (let sampleIndex = 0; sampleIndex < out.length; sampleIndex += 1) {
-    const framePos = (sampleIndex - centerOffset) / samplesPerFrame;
+    const absoluteSampleIndex = analysisSampleOffset + sampleIndex;
+    const framePos = (absoluteSampleIndex - centerOffset) / samplesPerFrame
+      - analysisFrameOffset;
     const frame0 = Math.max(0, Math.min(frameCount - 1, Math.floor(framePos)));
     const frame1 = Math.max(0, Math.min(frameCount - 1, frame0 + 1));
     const mix = clamp(framePos - frame0, 0, 1);
-    const dipDb = dipDbByFrame[frame0] * (1 - mix) + dipDbByFrame[frame1] * mix;
+    let dipDb: number;
+    if (sourceRelativeReductionDbByFrame) {
+      const centeredDipDb = Math.max(dipDbByFrame[frame0], dipDbByFrame[frame1]);
+      // Analysis owns integer samples through rounded absolute frame bounds:
+      // [round(f*S), round((f+1)*S)). Use the equivalent closed form here so
+      // fractional rates such as 44.1 kHz cannot disagree by one sample.
+      const absoluteOwnerFrame = Math.ceil(
+        (absoluteSampleIndex + 0.5) / samplesPerFrame,
+      ) - 1;
+      const ownerFrame = Math.max(
+        0,
+        Math.min(frameCount - 1, absoluteOwnerFrame - analysisFrameOffset),
+      );
+      const ownerStartSample = Math.round(
+        (analysisFrameOffset + ownerFrame) * samplesPerFrame,
+      ) - analysisSampleOffset;
+      const ownerEndSample = Math.round(
+        (analysisFrameOffset + ownerFrame + 1) * samplesPerFrame,
+      ) - analysisSampleOffset;
+      const ownerPhase = clamp(
+        (sampleIndex - ownerStartSample) / Math.max(1, ownerEndSample - ownerStartSample),
+        0,
+        1,
+      );
+      const ownerCapDb = sourceRelativeReductionDbByFrame[ownerFrame];
+      const previousCapDb = ownerFrame > 0
+        ? sourceRelativeReductionDbByFrame[ownerFrame - 1]
+        : ownerCapDb;
+      const nextCapDb = ownerFrame + 1 < frameCount
+        ? sourceRelativeReductionDbByFrame[ownerFrame + 1]
+        : ownerCapDb;
+      let smoothOwnerCapDb = ownerCapDb;
+      if (ownerPhase < 0.5 && previousCapDb < ownerCapDb) {
+        smoothOwnerCapDb = previousCapDb
+          + (ownerCapDb - previousCapDb) * (ownerPhase / 0.5);
+      } else if (ownerPhase >= 0.5 && nextCapDb < ownerCapDb) {
+        smoothOwnerCapDb = ownerCapDb
+          + (nextCapDb - ownerCapDb) * ((ownerPhase - 0.5) / 0.5);
+      }
+      dipDb = Math.min(centeredDipDb, smoothOwnerCapDb);
+    } else {
+      dipDb = dipDbByFrame[frame0] * (1 - mix) + dipDbByFrame[frame1] * mix;
+    }
     if (dipDb > 0) {
       out[sampleIndex] *= dbToLin(-dipDb);
     }
   }
 
-  return { samples: out, stats: { tamedFrameCount, maxReductionDb } };
+  return {
+    samples: out,
+    stats: {
+      tamedFrameCount,
+      maxReductionDb,
+      referenceLagMs,
+      referenceUsed,
+      referenceConfidence: referenceAlignment.confidence,
+    },
+  };
 };
 
 /**

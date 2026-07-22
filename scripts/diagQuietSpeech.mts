@@ -19,7 +19,7 @@ import path from "node:path";
 import { decodeWav } from "../src/lib/webAudioRender.ts";
 import { analyzeFloatSamples, buildSpeechMask } from "../src/lib/audioQc.ts";
 import { applyKWeighting, planGainCurve, speechRunsFromMask, type SpeechRun } from "../src/lib/gainPlanner.ts";
-import { detectAudibilityDropouts, frameDbFromFloatSamples } from "../src/lib/audibilityDropout.ts";
+import { detectAlignedAudibilityDropouts, frameDbFromFloatSamples } from "../src/lib/audibilityDropout.ts";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const DEFAULT_SRC = path.join(ROOT, "end spiked down", "Lucas Martin_batchvideo1-10.wav");
@@ -103,9 +103,21 @@ console.log(
 // ---------- 2) Collapse clusters (audibility guard on the pair) ----------
 const srcFrame20 = frameDbFromFloatSamples(src.mono, SR, GUARD_MS);
 const outFrame20 = frameDbFromFloatSamples(out.mono, SR, GUARD_MS);
-const report = detectAudibilityDropouts({ sourceFrameDb: srcFrame20, renderedFrameDb: outFrame20, frameMs: GUARD_MS });
+const alignedDropout = detectAlignedAudibilityDropouts({
+  sourceFrameDb: srcFrame20,
+  renderedFrameDb: outFrame20,
+  frameMs: GUARD_MS,
+  maxAlignmentMs: 60,
+});
+const report = alignedDropout.finalReport;
 console.log(
-  `[Collapse] severe=${report.severe} badSeconds=${report.badSeconds.toFixed(2)} clusters=${report.clusterCount} worstDrop=${report.worstDropDb.toFixed(1)}dB`,
+  `[CollapseRaw] severe=${alignedDropout.rawReport.severe} badSeconds=${alignedDropout.rawReport.badSeconds.toFixed(2)} ` +
+    `clusters=${alignedDropout.rawReport.clusterCount} worstDrop=${alignedDropout.rawReport.worstDropDb.toFixed(1)}dB`,
+);
+console.log(
+  `[Collapse] alignedOffset=${alignedDropout.alignmentOffsetMs >= 0 ? "+" : ""}${alignedDropout.alignmentOffsetMs.toFixed(0)}ms ` +
+    `confidence=${alignedDropout.alignmentConfidence.toFixed(2)} severe=${report.severe} ` +
+    `badSeconds=${report.badSeconds.toFixed(2)} clusters=${report.clusterCount} worstDrop=${report.worstDropDb.toFixed(1)}dB`,
 );
 for (const c of report.clusters
   .slice()
@@ -128,7 +140,14 @@ for (const c of report.clusters
 if (report.severe) failed = true;
 
 // ---------- 3) Per-run delta table ----------
-const outFrame10 = frameDbFromFloatSamples(out.mono, SR, FRAME_MS);
+const outFrame10Raw = frameDbFromFloatSamples(out.mono, SR, FRAME_MS);
+const alignmentFrames10 = Math.round(alignedDropout.alignmentOffsetMs / FRAME_MS);
+const outFrame10 =
+  alignmentFrames10 > 0
+    ? outFrame10Raw.slice(alignmentFrames10)
+    : alignmentFrames10 < 0
+      ? [...new Array<number>(-alignmentFrames10).fill(-240), ...outFrame10Raw]
+      : outFrame10Raw;
 let erased = 0;
 let crushed = 0;
 for (let i = 0; i < speechRuns.length; i += 1) {
@@ -167,14 +186,19 @@ quietDeltas.sort((a, b) => a - b);
 const median = (arr: number[]) => (arr.length > 0 ? arr[Math.floor(arr.length / 2)] : NaN);
 const medAll = median(deltas);
 const medQuiet = median(quietDeltas);
+const meanAbsRunDelta =
+  deltas.length > 0 ? deltas.reduce((sum, delta) => sum + Math.abs(delta), 0) / deltas.length : 0;
+const maxAbsRunDelta = deltas.length > 0 ? Math.max(...deltas.map(Math.abs)) : 0;
 // A leveling render must materially change the speech-body distribution. It
 // may lift quiet lines, pull hot lines down, or do both; a true passthrough
-// leaves both the raw-quiet subset and the full run set nearly unchanged.
+// leaves both the run median and the individual run deltas nearly unchanged.
 const quietChanged = Number.isFinite(medQuiet) && Math.abs(medQuiet) >= 1.5;
 const globalChanged = Number.isFinite(medAll) && Math.abs(medAll) >= 1.5;
-const passthrough = !quietChanged && !globalChanged;
+const perRunChanged = meanAbsRunDelta >= 0.75 || maxAbsRunDelta >= 1.5;
+const passthrough = !quietChanged && !globalChanged && !perRunChanged;
 console.log(
-  `[Leveling] run-delta median all=${medAll.toFixed(1)}dB quietRuns(<=-26dB src)=${medQuiet.toFixed(1)}dB -> ${
+  `[Leveling] run-delta median all=${medAll.toFixed(1)}dB quietRuns(<=-26dB src)=${medQuiet.toFixed(1)}dB ` +
+    `meanAbs=${meanAbsRunDelta.toFixed(1)}dB maxAbs=${maxAbsRunDelta.toFixed(1)}dB -> ${
     passthrough ? "PASSTHROUGH (no leveling!)" : "leveled"
   }`,
 );
@@ -219,7 +243,14 @@ const medShift = median(shiftProbes);
 console.log(
   `[Shift] median rendered-vs-source shift=${Number.isFinite(medShift) ? (medShift * 1000).toFixed(0) : "n/a"}ms over ${shiftProbes.length} probes`,
 );
-if (Number.isFinite(medShift) && Math.abs(medShift) > 0.03) failed = true;
+// Match the app's existing timing-integrity policy: >40 ms is review-worthy,
+// while only a confident >80 ms offset is a delivery failure. Normal bounded
+// filter latency must be aligned before judging speech loss, not mislabeled as
+// destructive audio.
+if (Number.isFinite(medShift) && Math.abs(medShift) > 0.04) {
+  console.log(`[Shift] WARN - review offset above 40 ms; hard failure remains 80 ms.`);
+}
+if (Number.isFinite(medShift) && Math.abs(medShift) > 0.08) failed = true;
 
 console.log(`\n[Verdict] ${failed ? "FAIL — render destroys or ignores quiet speech" : "PASS"}`);
 process.exit(failed ? 1 : 0);
