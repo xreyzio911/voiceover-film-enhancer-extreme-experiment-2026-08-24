@@ -55,6 +55,7 @@
   padding: 18px;
   display: grid;
   gap: 10px;
+  transition: border-color 160ms var(--ease-out), background 160ms var(--ease-out);
 }
 
 .dropActive {
@@ -92,9 +93,27 @@
 }
 
 .button {
+  position: relative;
   border: none;
   background: var(--accent);
   color: var(--accent-contrast);
+}
+
+.visuallyHiddenInput {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.button:has(.visuallyHiddenInput:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
 }
 
 .buttonSecondary {
@@ -330,6 +349,14 @@
   background: rgba(245, 199, 90, 0.1);
   padding: 10px 12px;
   font-size: 0.86rem;
+  transition: opacity 160ms var(--ease-out), transform 160ms var(--ease-out);
+}
+
+@starting-style {
+  .warningBanner {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
 }
 
 .reviewAudioGrid {
@@ -528,5 +555,24 @@
   .autoReviewHeader {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .reviewCandidateGrid,
+  .autoReviewGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warningBanner {
+    transform: none;
+    transition: opacity 160ms var(--ease-out);
+  }
+
+  @starting-style {
+    .warningBanner {
+      opacity: 0;
+      transform: none;
+    }
   }
 }

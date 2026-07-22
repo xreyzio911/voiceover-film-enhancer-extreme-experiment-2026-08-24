@@ -3,7 +3,14 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import JSZip from "jszip";
-import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { analyzeFloatSamples, buildSpeechMask, type AudioQcMetrics } from "../lib/audioQc";
 import {
   detectAudibilityDropouts,
@@ -638,6 +645,9 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
     SourceFirstAudioReviewPlan["selectedVariant"] | null
   >(null);
   const sourceFirstPlansByBaseRef = useRef<Map<string, SourceFirstAudioReviewPlan>>(new Map());
+  const failureDismissButtonRef = useRef<HTMLButtonElement | null>(null);
+  const runBatchButtonRef = useRef<HTMLButtonElement | null>(null);
+  const failureWarningTimerRef = useRef<number | null>(null);
 
   const [files, setFiles] = useState<File[]>([]);
   const [outputs, setOutputs] = useState<OutputEntry[]>([]);
@@ -653,6 +663,7 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
   const [dragActive, setDragActive] = useState(false);
   const [failedOptimizations, setFailedOptimizations] = useState<FailedOptimization[]>([]);
   const [showFailureWarning, setShowFailureWarning] = useState(false);
+  const [failureWarningClosing, setFailureWarningClosing] = useState(false);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [reviewBundles, setReviewBundles] = useState<ReviewBundleEntry[]>([]);
   const [aiReviewBusy, setAiReviewBusy] = useState(false);
@@ -712,6 +723,9 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
 
   useEffect(() => {
     return () => {
+      if (failureWarningTimerRef.current !== null) {
+        window.clearTimeout(failureWarningTimerRef.current);
+      }
       teardownFfmpeg();
       const assetUrls = ffmpegAssetUrlsRef.current;
       if (!assetUrls) return;
@@ -723,6 +737,47 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
       ffmpegAssetUrlsRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!showFailureWarning || failureWarningClosing) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      failureDismissButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [failureWarningClosing, showFailureWarning]);
+
+  const resetFailureWarning = () => {
+    if (failureWarningTimerRef.current !== null) {
+      window.clearTimeout(failureWarningTimerRef.current);
+      failureWarningTimerRef.current = null;
+    }
+    setShowFailureWarning(false);
+    setFailureWarningClosing(false);
+  };
+
+  const dismissFailureWarning = () => {
+    if (failureWarningClosing) return;
+    setFailureWarningClosing(true);
+    failureWarningTimerRef.current = window.setTimeout(() => {
+      setShowFailureWarning(false);
+      setFailureWarningClosing(false);
+      failureWarningTimerRef.current = null;
+      runBatchButtonRef.current?.focus();
+    }, 150);
+  };
+
+  const handleFailureWarningKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      dismissFailureWarning();
+      return;
+    }
+    if (event.key === "Tab") {
+      event.preventDefault();
+      failureDismissButtonRef.current?.focus();
+    }
+  };
 
   const appendLog = (message: string) => {
     setLogs((prev) => [...prev.slice(-300), message]);
@@ -7866,6 +7921,7 @@ const summarizeFailureReason = (error: unknown) => {
       setReviewBundles(nextReviewBundles);
       if (failedRuns.length > 0) {
         setFailedOptimizations(failedRuns);
+        setFailureWarningClosing(false);
         setShowFailureWarning(true);
         appendLog(
           `[Warning] ${failedRuns.length} file(s) failed to optimize. Re-submit only the failed files and run again.`
@@ -8195,7 +8251,7 @@ const summarizeFailureReason = (error: unknown) => {
                   type="file"
                   accept=".wav"
                   multiple
-                  hidden
+                  className={styles.visuallyHiddenInput}
                   onChange={(event) => {
                     handleFiles(event.target.files);
                     event.currentTarget.value = "";
@@ -8208,7 +8264,7 @@ const summarizeFailureReason = (error: unknown) => {
                   type="file"
                   accept=".wav"
                   multiple
-                  hidden
+                  className={styles.visuallyHiddenInput}
                   // @ts-expect-error webkitdirectory is supported in Chromium-based browsers.
                   webkitdirectory="true"
                   directory="true"
@@ -8240,8 +8296,9 @@ const summarizeFailureReason = (error: unknown) => {
           </div>
           <div className={styles.optionGrid}>
             <div className={styles.field}>
-              <label className={styles.label}>Loudness target</label>
+              <label className={styles.label} htmlFor="loudness-target">Loudness target</label>
               <select
+                id="loudness-target"
                 className={styles.select}
                 value={loudnessTarget}
                 onChange={(event) => setLoudnessTarget(event.target.value as keyof typeof LOUDNESS_PRESETS)}
@@ -8254,8 +8311,9 @@ const summarizeFailureReason = (error: unknown) => {
               </select>
             </div>
             <div className={styles.field}>
-              <label className={styles.label}>Smart voice match</label>
+              <label className={styles.label} htmlFor="smart-voice-match">Smart voice match</label>
               <select
+                id="smart-voice-match"
                 className={styles.select}
                 value={smartMatchMode}
                 onChange={(event) =>
@@ -8270,8 +8328,9 @@ const summarizeFailureReason = (error: unknown) => {
               </select>
             </div>
             <div className={styles.field}>
-              <label className={styles.label}>Leveling strength</label>
+              <label className={styles.label} htmlFor="leveler-mode">Leveling strength</label>
               <select
+                id="leveler-mode"
                 className={styles.select}
                 value={leveler}
                 onChange={(event) => setLeveler(event.target.value as keyof typeof LEVELER_PRESETS)}
@@ -8284,8 +8343,9 @@ const summarizeFailureReason = (error: unknown) => {
               </select>
             </div>
             <div className={styles.field}>
-              <label className={styles.label}>Breath control</label>
+              <label className={styles.label} htmlFor="breath-control">Breath control</label>
               <select
+                id="breath-control"
                 className={styles.select}
                 value={breathControl}
                 onChange={(event) => setBreathControl(event.target.value as keyof typeof BREATH_COMPAND)}
@@ -8299,7 +8359,7 @@ const summarizeFailureReason = (error: unknown) => {
             </div>
           </div>
 
-          <div className={styles.toggleRow}>
+          <label className={styles.toggleRow}>
             <div>
               <strong>Speech-aware leveler</strong>
               <div className={styles.label}>
@@ -8314,8 +8374,8 @@ const summarizeFailureReason = (error: unknown) => {
               checked={gainPlannerEnabled}
               onChange={(event) => setGainPlannerEnabled(event.target.checked)}
             />
-          </div>
-          <div className={styles.toggleRow}>
+          </label>
+          <label className={styles.toggleRow}>
             <div>
               <strong>Cinematic color</strong>
               <div className={styles.label}>
@@ -8328,18 +8388,19 @@ const summarizeFailureReason = (error: unknown) => {
               checked={cinematicColor}
               onChange={(event) => setCinematicColor(event.target.checked)}
             />
-          </div>
+          </label>
           <button
             type="button"
             className={`${styles.button} ${styles.buttonGhost} ${styles.sectionTop}`}
             onClick={() => setAdvancedOpen((open) => !open)}
             aria-expanded={advancedOpen}
+            aria-controls="advanced-processing-options"
           >
             {advancedOpen ? "Hide advanced options" : "Show advanced options"}
           </button>
           {advancedOpen && (
-            <>
-              <div className={styles.toggleRow}>
+            <div id="advanced-processing-options" role="group" aria-label="Advanced processing options">
+              <label className={styles.toggleRow}>
                 <div>
                   <strong>EQ cleanup</strong>
                   <div className={styles.label}>HPF + small low-mid shaping for consistency</div>
@@ -8349,8 +8410,8 @@ const summarizeFailureReason = (error: unknown) => {
                   checked={eqCleanup}
                   onChange={(event) => setEqCleanup(event.target.checked)}
                 />
-              </div>
-              <div className={styles.toggleRow}>
+              </label>
+              <label className={styles.toggleRow}>
                 <div>
                   <strong>Soften harshness</strong>
                   <div className={styles.label}>
@@ -8363,8 +8424,8 @@ const summarizeFailureReason = (error: unknown) => {
                   checked={softenHarshness}
                   onChange={(event) => setSoftenHarshness(event.target.checked)}
                 />
-              </div>
-              <div className={styles.toggleRow}>
+              </label>
+              <label className={styles.toggleRow}>
                 <div>
                   <strong>Room cleanup (auto detect)</strong>
                   <div className={styles.label}>
@@ -8376,8 +8437,8 @@ const summarizeFailureReason = (error: unknown) => {
                   checked={roomCleanup}
                   onChange={(event) => setRoomCleanup(event.target.checked)}
                 />
-              </div>
-              <div className={styles.toggleRow}>
+              </label>
+              <label className={styles.toggleRow}>
                 <div>
                   <strong>Scene blend (adaptive subtle)</strong>
                   <div className={styles.label}>
@@ -8390,8 +8451,8 @@ const summarizeFailureReason = (error: unknown) => {
                   checked={sceneBlend}
                   onChange={(event) => setSceneBlend(event.target.checked)}
                 />
-              </div>
-              <div className={styles.toggleRow}>
+              </label>
+              <label className={styles.toggleRow}>
                 <div>
                   <strong>Keep silences clean (expander + NR)</strong>
                   <div className={styles.label}>
@@ -8404,8 +8465,8 @@ const summarizeFailureReason = (error: unknown) => {
                   checked={noiseGuard}
                   onChange={(event) => setNoiseGuard(event.target.checked)}
                 />
-              </div>
-              <div className={styles.toggleRow}>
+              </label>
+              <label className={styles.toggleRow}>
                 <div>
                   <strong>Floor guard</strong>
                   <div className={styles.label}>
@@ -8418,7 +8479,7 @@ const summarizeFailureReason = (error: unknown) => {
                   checked={floorGuard}
                   onChange={(event) => setFloorGuard(event.target.checked)}
                 />
-              </div>
+              </label>
               <div className={styles.reviewModelPanel}>
                 <div className={styles.reviewModelHeader}>
                   <div>
@@ -8441,7 +8502,7 @@ const summarizeFailureReason = (error: unknown) => {
                     <input
                       type="file"
                       accept=".json,application/json"
-                      hidden
+                      className={styles.visuallyHiddenInput}
                       disabled
                       onChange={async (event) => {
                         const file = event.target.files?.[0] ?? null;
@@ -8460,11 +8521,16 @@ const summarizeFailureReason = (error: unknown) => {
                   </button>
                 </div>
               </div>
-            </>
+            </div>
           )}
 
           <div className={`${styles.controls} ${styles.sectionTop}`}>
-            <button className={styles.button} onClick={() => void processFiles()} disabled={loading || files.length === 0}>
+            <button
+              ref={runBatchButtonRef}
+              className={styles.button}
+              onClick={() => void processFiles()}
+              disabled={loading || files.length === 0}
+            >
               {loading ? "Processing..." : "Run Batch"}
             </button>
             <button
@@ -8477,7 +8543,7 @@ const summarizeFailureReason = (error: unknown) => {
                 setReviewZipProgress(0);
                 setLogs([]);
                 setFailedOptimizations([]);
-                setShowFailureWarning(false);
+                resetFailureWarning();
                 setQueueItems([]);
                 activeQueueBaseRef.current = null;
                 activeQueueStageRef.current = "Queued";
@@ -8586,10 +8652,18 @@ const summarizeFailureReason = (error: unknown) => {
                                 : "Queued"}
                         </span>
                       </div>
-                      <div className={styles.queueProgressTrack} aria-hidden="true">
+                      <div
+                        className={styles.queueProgressTrack}
+                        role="progressbar"
+                        aria-label={`${item.fileName} processing progress`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={progressPercent}
+                      >
                         <div
                           className={`${styles.queueProgressFill} ${statusClass}`}
-                          style={{ width: `${progressPercent}%` }}
+                          style={{ transform: `scaleX(${progressPercent / 100})` }}
+                          aria-hidden="true"
                         />
                       </div>
                     </div>
@@ -8610,7 +8684,7 @@ const summarizeFailureReason = (error: unknown) => {
             </div>
           </div>
           {(outputs.length > 0 || reviewBundles.length > 0) && (
-            <div className={`${styles.controls} ${styles.sectionTop}`}>
+            <div className={`${styles.controls} ${styles.sectionTop} ${styles.deliveryActions}`}>
               {outputs.length > 0 && (
                 <button
                   className={`${styles.button} ${styles.buttonSecondary}`}
@@ -8659,8 +8733,17 @@ const summarizeFailureReason = (error: unknown) => {
           )}
           <div className={`${styles.outputList} ${styles.sectionTop}`}>
             {outputs.length === 0 && <div className={styles.dropHint}>No output yet.</div>}
-            {outputs.map((output, index) => (
-              <div className={styles.outputItem} key={`${output.name}-${output.size}-${index}`}>
+            {outputs.map((output, index) => {
+              const outputHelpText = output.kind === "mixready"
+                ? output.variant === "blend"
+                  ? "Blend mix-ready: subtle scene glue applied; not loudness-normalized."
+                  : "Mix-ready: processed and leveled, but not loudness-normalized. Best for film mix stems."
+                : output.variant === "blend"
+                  ? "Broadcast loudness + blend: subtle scene glue plus ATSC A/85 or EBU R128 normalization."
+                  : "Broadcast loudness: normalized to ATSC A/85 or EBU R128. Use for delivery or QC.";
+
+              return (
+                <div className={styles.outputItem} key={`${output.name}-${output.size}-${index}`}>
                 <div>
                   <strong>{output.name}</strong>
                   <div className={styles.label}>{formatBytes(output.size)}</div>
@@ -8674,30 +8757,26 @@ const summarizeFailureReason = (error: unknown) => {
                     {output.kind === "mixready" ? (
                       <>
                         <span className={styles.outputBadge}>Mix-ready</span>
-                        <span
+                        <button
+                          type="button"
                           className={styles.outputHint}
-                          title={
-                            output.variant === "blend"
-                              ? "Blend mix-ready: subtle scene glue applied; not loudness-normalized."
-                              : "Mix-ready: processed and leveled, but not loudness-normalized. Best for film mix stems."
-                          }
+                          data-tooltip={outputHelpText}
+                          aria-label={`${output.name}: ${outputHelpText}`}
                         >
                           What&apos;s this?
-                        </span>
+                        </button>
                       </>
                     ) : (
                       <>
                         <span className={styles.outputBadge}>Broadcast loudness</span>
-                        <span
+                        <button
+                          type="button"
                           className={styles.outputHint}
-                          title={
-                            output.variant === "blend"
-                              ? "Broadcast loudness + blend: subtle scene glue plus ATSC A/85 or EBU R128 normalization."
-                              : "Broadcast loudness: normalized to ATSC A/85 or EBU R128. Use for delivery or QC."
-                          }
+                          data-tooltip={outputHelpText}
+                          aria-label={`${output.name}: ${outputHelpText}`}
                         >
                           What&apos;s this?
-                        </span>
+                        </button>
                       </>
                     )}
                   </div>
@@ -8705,13 +8784,15 @@ const summarizeFailureReason = (error: unknown) => {
                 <button
                   type="button"
                   className={styles.outputDownload}
+                  aria-label={`Download ${output.name}`}
                   onClick={() => downloadOutputFile(output)}
                   disabled={zipBusy || downloadQueueBusy}
                 >
                   Download
                 </button>
-              </div>
-            ))}
+                </div>
+              );
+            })}
           </div>
         </div>
         <div className={styles.card}>
@@ -8730,10 +8811,18 @@ const summarizeFailureReason = (error: unknown) => {
         </div>
       </div>
       {showFailureWarning && failedOptimizations.length > 0 && (
-        <div className={styles.warningOverlay} role="alertdialog" aria-modal="true" aria-labelledby="failed-title">
+        <div
+          className={styles.warningOverlay}
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="failed-title"
+          aria-describedby="failed-description"
+          data-closing={failureWarningClosing ? "true" : undefined}
+          onKeyDown={handleFailureWarningKeyDown}
+        >
           <div className={styles.warningCard}>
             <h3 id="failed-title">Some files need re-submission</h3>
-            <p className={styles.warningText}>
+            <p className={styles.warningText} id="failed-description">
               Some audio files failed to optimize on this run. Please re-submit only these files and run again.
             </p>
             <div className={styles.warningList}>
@@ -8745,7 +8834,7 @@ const summarizeFailureReason = (error: unknown) => {
               ))}
             </div>
             <div className={styles.warningActions}>
-              <button className={styles.button} onClick={() => setShowFailureWarning(false)}>
+              <button ref={failureDismissButtonRef} className={styles.button} onClick={dismissFailureWarning}>
                 Understood
               </button>
             </div>

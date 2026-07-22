@@ -78,6 +78,7 @@ export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: b
           className={styles.toolPanel}
           hidden={activeTool !== "vo-leveler"}
         >
+          <h2 className={styles.visuallyHiddenHeading}>VO Optimizer</h2>
           <VoLeveler aiAutoPilotEnabled={aiAutoPilotEnabled} />
         </div>
         <div
@@ -88,6 +89,7 @@ export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: b
           className={styles.toolPanel}
           hidden={activeTool !== "audio-splitter"}
         >
+          <h2 className={styles.visuallyHiddenHeading}>Audio Splitter</h2>
           <AudioTrackSplitter />
         </div>
       </div>

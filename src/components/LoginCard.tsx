@@ -31,6 +31,19 @@ export default function LoginCard() {
   const callbackUrl = searchParams.get("callbackUrl") ?? "/";
   const errorText = getErrorText(error);
 
+  const handleSignIn = async () => {
+    if (signingIn) {
+      return;
+    }
+
+    setSigningIn(true);
+    try {
+      await signIn("google", { callbackUrl });
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
   return (
     <div className={styles.card}>
       <div className={styles.brandLockup}>
@@ -51,12 +64,23 @@ export default function LoginCard() {
         type="button"
         className={styles.button}
         disabled={signingIn}
-        onClick={() => {
-          setSigningIn(true);
-          void signIn("google", { callbackUrl });
-        }}
+        aria-busy={signingIn}
+        aria-label="Continue with Google"
+        data-busy={signingIn ? "true" : "false"}
+        onClick={handleSignIn}
       >
-        {signingIn ? "Opening Google sign-in" : "Continue with Google"}
+        <span
+          className={`${styles.buttonLabel} ${styles.buttonLabelIdle}`}
+          aria-hidden="true"
+        >
+          Continue with Google
+        </span>
+        <span
+          className={`${styles.buttonLabel} ${styles.buttonLabelPending}`}
+          aria-hidden="true"
+        >
+          Opening Google sign-in
+        </span>
       </button>
       <p className={styles.hint}>Access is restricted to approved accounts.</p>
     </div>

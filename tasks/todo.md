@@ -1,3 +1,33 @@
+# Emil Design Engineering Frontend Upgrade
+
+## Checklist
+
+- [x] Read the project rules, current implementation plan, prior lessons, active frontend, Git state, and live desktop/mobile baseline.
+- [x] Apply all seven Emil Kowalski skills to audit existing motion, find high-conviction opportunities, reject decorative motion, and keep the current layout and palette identity.
+- [x] Add a failing frontend contract for layout/palette guardrails, accessible control names, keyboard-reachable uploads, selection semantics, GPU-only progress, and motion preferences.
+- [x] Upgrade the shared shell, VO Optimizer, login, and QC Lab semantics/interactions without editing Audio Splitter-owned files.
+- [x] Implement only the gated motion opportunities: failure/completion feedback, login loading feedback, QC drag feedback, keyboard-instant tabs, linear transform progress, and targeted reduced motion/transparency.
+- [x] Verify keyboard, focus, labels, progress semantics, desktop/mobile/zoom overflow, reduced motion/transparency, interactions, and console state in the rendered app.
+- [x] Run the focused contract, full test suite, lint, production build, dependency audit, diff checks, and independent code/design/security reviews.
+
+## Scope Boundaries
+
+- Preserve the existing page/tool layout, responsive breakpoints, dark neutral + gold color scheme, and all audio-processing behavior.
+- Do not edit `src/components/AudioTrackSplitter.tsx`, `src/components/AudioTrackSplitter.module.css`, or any Audio Splitter backend/runtime file.
+- Use CSS/native platform behavior; do not add a motion or component dependency for simple transitions and semantics.
+- Keep core keyboard navigation instant, keep UI motion under 300 ms, animate only compositor-friendly movement, and retain useful non-motion feedback under reduced motion.
+
+## Review Notes
+
+- The RED design contract initially passed 1/6 tests and failed the five intended upgrade areas; the completed contract passes 6/6 and is included in `test:audio-qc`.
+- The active home route has named selects/checkboxes, keyboard-focusable upload controls with visible focus, instant Arrow/Home/End tool navigation, and no horizontal overflow at 1440, 920, 560, 390, or 320 CSS pixels.
+- A real invalid-WAV forward test reached `Done with warnings`; the alert dialog focused `Understood`, closed with Escape, restored focus to `Run Batch`, and used opacity-only dismissal under reduced motion.
+- Desktop and mobile Lighthouse both score 100 for accessibility, best practices, SEO, and agentic browsing. Fresh browser console checks reported zero errors after the forward tests.
+- Final verification: 164 tests passed with 1 intentional worker smoke skip, lint passed, the production build passed, and `git diff --check` passed. The existing Audio Splitter NFT tracing warning remains unchanged.
+- Instrumented library coverage is 90.01% lines, 92.28% functions, and 76.12% branches. The repository still has no DOM coverage harness, so the TSX/CSS change is covered by the 6/6 source contract plus live interaction, responsive, Lighthouse, and reduced-motion checks rather than a misleading frontend coverage percentage.
+- `npm audit --omit=dev` still reports two pre-existing high-severity `sharp@0.34.5`/libvips advisories inherited through `next@16.2.11`; the suggested forced fix is a breaking Next downgrade, so it was not applied in this frontend-only change.
+- Independent correctness, design/accessibility, and security re-reviews reported no remaining actionable findings. The unrelated untracked `audio testing/` directory was preserved and is not part of this change set.
+
 # Authorize Experimental Project Owner
 
 ## Checklist

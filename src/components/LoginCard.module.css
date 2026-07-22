@@ -62,6 +62,8 @@
 .button {
   width: 100%;
   min-height: 44px;
+  display: grid;
+  place-items: center;
   border: 1px solid transparent;
   border-radius: var(--radius-control);
   padding: 0 16px;
@@ -71,6 +73,31 @@
   font-weight: 650;
   cursor: pointer;
   transition: transform 150ms var(--ease-out), background 150ms var(--ease-out);
+}
+
+.buttonLabel {
+  grid-area: 1 / 1;
+  transition: opacity 160ms var(--ease-out), filter 160ms var(--ease-out);
+}
+
+.buttonLabelIdle {
+  opacity: 1;
+  filter: blur(0);
+}
+
+.buttonLabelPending {
+  opacity: 0;
+  filter: blur(2px);
+}
+
+.button[data-busy="true"] .buttonLabelIdle {
+  opacity: 0;
+  filter: blur(2px);
+}
+
+.button[data-busy="true"] .buttonLabelPending {
+  opacity: 1;
+  filter: blur(0);
 }
 
 .button:active {
@@ -108,5 +135,25 @@
 @media (max-width: 520px) {
   .card {
     padding: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button {
+    transition: background 150ms var(--ease-out);
+  }
+
+  .button:active {
+    transform: none;
+  }
+
+  .buttonLabel {
+    filter: none;
+    transition: opacity 120ms var(--ease-out);
+  }
+
+  .button[data-busy="true"] .buttonLabelIdle,
+  .button[data-busy="true"] .buttonLabelPending {
+    filter: none;
   }
 }

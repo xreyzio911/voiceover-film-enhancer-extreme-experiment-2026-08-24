@@ -90,12 +90,16 @@ summary {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  html:focus-within {
     scroll-behavior: auto !important;
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+  }
+
+  button:active,
+  a:active,
+  label:active,
+  summary:active,
+  [role="button"]:active,
+  [role="tab"]:active {
+    transform: none !important;
   }
 }

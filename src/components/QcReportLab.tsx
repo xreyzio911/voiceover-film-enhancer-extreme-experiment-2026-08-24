@@ -919,10 +919,11 @@ export default function QcReportLab() {
   return (
     <div className={styles.layout}>
       <div className={styles.card}>
-        <div className={styles.modeSwitch}>
+        <div className={styles.modeSwitch} role="group" aria-label="QC Lab mode">
           <button
             type="button"
             className={`${styles.modeButton} ${mode === "analyze" ? styles.modeButtonActive : ""}`}
+            aria-pressed={mode === "analyze"}
             onClick={() => setMode("analyze")}
           >
             Analyze + QC
@@ -930,6 +931,7 @@ export default function QcReportLab() {
           <button
             type="button"
             className={`${styles.modeButton} ${mode === "review" ? styles.modeButtonActive : ""}`}
+            aria-pressed={mode === "review"}
             onClick={() => setMode("review")}
           >
             Review Mode
@@ -964,7 +966,7 @@ export default function QcReportLab() {
                       type="file"
                       accept=".wav"
                       multiple
-                      hidden
+                      className={styles.visuallyHiddenInput}
                       onChange={(event) => {
                         handleFiles(event.target.files);
                         event.currentTarget.value = "";
@@ -978,7 +980,9 @@ export default function QcReportLab() {
                     Download JSON
                   </button>
                 </div>
-                <div className={styles.progress}>{status}</div>
+                <div className={styles.progress} role="status" aria-live="polite" aria-atomic="true">
+                  {status}
+                </div>
                 <div className={styles.fileList}>
                   {files.length === 0 && <div className={styles.dropHint}>No files selected.</div>}
                   {files.map((file, index) => (
@@ -1252,7 +1256,7 @@ export default function QcReportLab() {
           </div>
 
           {hasWarnings && (
-            <div className={styles.warningBanner}>
+            <div className={styles.warningBanner} role="alert">
               QC warnings found. Review flagged files before production export.
             </div>
           )}
@@ -1273,7 +1277,7 @@ export default function QcReportLab() {
                       type="file"
                       accept=".zip,application/zip"
                       multiple
-                      hidden
+                      className={styles.visuallyHiddenInput}
                       onChange={async (event) => {
                         await importReviewBundles(event.target.files);
                         event.currentTarget.value = "";
@@ -1313,7 +1317,7 @@ export default function QcReportLab() {
                     Clear
                   </button>
                 </div>
-                <div className={styles.progress}>
+                <div className={styles.progress} role="status" aria-live="polite" aria-atomic="true">
                   {reviewLoading ? "Importing..." : reviewTrainingBusy ? "Training..." : reviewStatus}
                 </div>
               </div>
@@ -1355,11 +1359,17 @@ export default function QcReportLab() {
               </div>
             ) : (
               <div className={styles.reportList}>
-                {reviewBundles.map((bundle) => {
+                {reviewBundles.map((bundle, bundleIndex) => {
                   const decision = reviewDecisions[bundle.manifest.bundleId] ?? createEmptyReviewDraft();
                   const autoReview = autoReviewResults[bundle.manifest.bundleId] ?? null;
                   const winner = bundle.manifest.candidates.find((candidate) => candidate.role === "winner");
                   const challenger = bundle.manifest.candidates.find((candidate) => candidate.role === "challenger") ?? null;
+                  const fieldIdPrefix = `review-bundle-${bundleIndex}`;
+                  const verdictLabelId = `${fieldIdPrefix}-verdict-label`;
+                  const preferredLabelId = `${fieldIdPrefix}-preferred-label`;
+                  const confidenceId = `${fieldIdPrefix}-confidence`;
+                  const issueTagsLabelId = `${fieldIdPrefix}-issue-tags-label`;
+                  const reviewerNoteId = `${fieldIdPrefix}-reviewer-note`;
                   const verdictClass =
                     decision.finalVerdict === "fail"
                       ? styles.statusError
@@ -1405,16 +1415,34 @@ export default function QcReportLab() {
                       <div className={styles.reviewAudioGrid}>
                         <div className={styles.audioCard}>
                           <div className={styles.sectionTitle}>Source</div>
-                          <audio controls preload="metadata" src={bundle.sourceUrl} className={styles.audioPlayer} />
+                          <audio
+                            controls
+                            preload="metadata"
+                            src={bundle.sourceUrl}
+                            className={styles.audioPlayer}
+                            aria-label={`Source audio for ${bundle.manifest.source.fileName}`}
+                          />
                         </div>
                         <div className={styles.audioCard}>
                           <div className={styles.sectionTitle}>Winner</div>
-                          <audio controls preload="metadata" src={bundle.winnerUrl} className={styles.audioPlayer} />
+                          <audio
+                            controls
+                            preload="metadata"
+                            src={bundle.winnerUrl}
+                            className={styles.audioPlayer}
+                            aria-label={`Winner audio for ${bundle.manifest.source.fileName}`}
+                          />
                         </div>
                         {bundle.challengerUrl && challenger && (
                           <div className={styles.audioCard}>
                             <div className={styles.sectionTitle}>Challenger</div>
-                            <audio controls preload="metadata" src={bundle.challengerUrl} className={styles.audioPlayer} />
+                            <audio
+                              controls
+                              preload="metadata"
+                              src={bundle.challengerUrl}
+                              className={styles.audioPlayer}
+                              aria-label={`Challenger audio for ${bundle.manifest.source.fileName}`}
+                            />
                           </div>
                         )}
                       </div>
@@ -1577,13 +1605,14 @@ export default function QcReportLab() {
 
                       <div className={styles.reviewDecisionGrid}>
                         <div className={styles.field}>
-                          <label className={styles.label}>Final verdict</label>
-                          <div className={styles.choiceRow}>
+                          <div className={styles.label} id={verdictLabelId}>Final verdict</div>
+                          <div className={styles.choiceRow} role="group" aria-labelledby={verdictLabelId}>
                             <button
                               type="button"
                               className={`${styles.choiceButton} ${
                                 decision.finalVerdict === "pass" ? styles.choiceButtonActive : ""
                               }`}
+                              aria-pressed={decision.finalVerdict === "pass"}
                               onClick={() =>
                                 updateReviewDecision(bundle.manifest.bundleId, (draft) => ({
                                   ...draft,
@@ -1598,6 +1627,7 @@ export default function QcReportLab() {
                               className={`${styles.choiceButton} ${
                                 decision.finalVerdict === "fail" ? styles.choiceButtonActive : ""
                               }`}
+                              aria-pressed={decision.finalVerdict === "fail"}
                               onClick={() =>
                                 updateReviewDecision(bundle.manifest.bundleId, (draft) => ({
                                   ...draft,
@@ -1611,13 +1641,14 @@ export default function QcReportLab() {
                         </div>
 
                         <div className={styles.field}>
-                          <label className={styles.label}>Preferred A/B output</label>
-                          <div className={styles.choiceRow}>
+                          <div className={styles.label} id={preferredLabelId}>Preferred A/B output</div>
+                          <div className={styles.choiceRow} role="group" aria-labelledby={preferredLabelId}>
                             <button
                               type="button"
                               className={`${styles.choiceButton} ${
                                 decision.preferredRole === null ? styles.choiceButtonActive : ""
                               }`}
+                              aria-pressed={decision.preferredRole === null}
                               onClick={() =>
                                 updateReviewDecision(bundle.manifest.bundleId, (draft) => ({
                                   ...draft,
@@ -1632,6 +1663,7 @@ export default function QcReportLab() {
                               className={`${styles.choiceButton} ${
                                 decision.preferredRole === "winner" ? styles.choiceButtonActive : ""
                               }`}
+                              aria-pressed={decision.preferredRole === "winner"}
                               onClick={() =>
                                 updateReviewDecision(bundle.manifest.bundleId, (draft) => ({
                                   ...draft,
@@ -1647,6 +1679,7 @@ export default function QcReportLab() {
                                 className={`${styles.choiceButton} ${
                                   decision.preferredRole === "challenger" ? styles.choiceButtonActive : ""
                                 }`}
+                                aria-pressed={decision.preferredRole === "challenger"}
                                 onClick={() =>
                                   updateReviewDecision(bundle.manifest.bundleId, (draft) => ({
                                     ...draft,
@@ -1661,8 +1694,9 @@ export default function QcReportLab() {
                         </div>
 
                         <div className={styles.field}>
-                          <label className={styles.label}>Confidence</label>
+                          <label className={styles.label} htmlFor={confidenceId}>Confidence</label>
                           <select
+                            id={confidenceId}
                             className={styles.select}
                             value={decision.confidence === null ? "" : String(decision.confidence)}
                             onChange={(event) =>
@@ -1682,8 +1716,8 @@ export default function QcReportLab() {
                       </div>
 
                       <div className={styles.section}>
-                        <div className={styles.sectionTitle}>Issue tags</div>
-                        <div className={styles.tagGrid}>
+                        <div className={styles.sectionTitle} id={issueTagsLabelId}>Issue tags</div>
+                        <div className={styles.tagGrid} role="group" aria-labelledby={issueTagsLabelId}>
                           {REVIEW_ISSUE_TAGS.map((tag) => {
                             const active = decision.issueTags.includes(tag);
                             return (
@@ -1691,6 +1725,7 @@ export default function QcReportLab() {
                                 type="button"
                                 key={`${bundle.manifest.bundleId}-${tag}`}
                                 className={`${styles.tagButton} ${active ? styles.tagButtonActive : ""}`}
+                                aria-pressed={active}
                                 onClick={() =>
                                   updateReviewDecision(bundle.manifest.bundleId, (draft) => ({
                                     ...draft,
@@ -1708,8 +1743,9 @@ export default function QcReportLab() {
                       </div>
 
                       <div className={styles.field}>
-                        <label className={styles.label}>Reviewer note</label>
+                        <label className={styles.label} htmlFor={reviewerNoteId}>Reviewer note</label>
                         <textarea
+                          id={reviewerNoteId}
                           className={styles.textarea}
                           value={decision.note}
                           placeholder="Optional note about what you heard."
