@@ -4,6 +4,7 @@ import { analyzeFloatSamples, buildSpeechMask } from "./audioQc.ts";
 import {
   applyKWeighting,
   applyGainCurveToSamples,
+  computeFricativeFrameDb,
   emitSendcmdScript,
   planGainCurve,
   resolvePlannerCalibration,
@@ -85,6 +86,29 @@ const makeTone = (frequencyHz: number, gain: number, seconds = 2) => {
   }
   return samples;
 };
+
+describe("fricative-band envelope", () => {
+  it("responds to consonant-band energy without mistaking low formants for fricatives", () => {
+    const totalSamples = SAMPLE_RATE;
+    const lowFormant = new Float32Array(totalSamples);
+    const fricative = new Float32Array(totalSamples);
+    for (let index = 0; index < totalSamples; index += 1) {
+      lowFormant[index] = Math.sin((2 * Math.PI * 500 * index) / SAMPLE_RATE) * 0.2;
+      fricative[index] = Math.sin((2 * Math.PI * 6000 * index) / SAMPLE_RATE) * 0.2;
+    }
+
+    const lowEnvelope = computeFricativeFrameDb(lowFormant, SAMPLE_RATE, FRAME_MS);
+    const highEnvelope = computeFricativeFrameDb(fricative, SAMPLE_RATE, FRAME_MS);
+
+    assert.equal(highEnvelope.length, totalSamples / FRAME_SAMPLES);
+    assert.equal(lowEnvelope.length, highEnvelope.length);
+    const stableFrame = 20;
+    assert.ok(
+      highEnvelope[stableFrame] > lowEnvelope[stableFrame] + 24,
+      `expected HF-selective envelope, got low ${lowEnvelope[stableFrame].toFixed(2)} dB and high ${highEnvelope[stableFrame].toFixed(2)} dB`,
+    );
+  });
+});
 
 describe("gainPlanner", () => {
   it("caps hot adaptive noise floors against the decoded planner envelope", () => {
@@ -1265,6 +1289,154 @@ describe("localized peak guard", () => {
 });
 
 describe("ramp placement", () => {
+  it("uses bounded high-frequency evidence to preserve a later line onset", () => {
+    const frameDb = new Array<number>(300).fill(-82);
+    for (let frame = 20; frame < 80; frame += 1) frameDb[frame] = -28;
+    for (let frame = 150; frame < 230; frame += 1) frameDb[frame] = -28;
+
+    const fricativeFrameDb = new Array<number>(frameDb.length).fill(-82);
+    for (let frame = 144; frame < 150; frame += 1) fricativeFrameDb[frame] = -48;
+
+    const baseInput = {
+      frameDb,
+      speechRuns: [
+        { startFrame: 20, endFrame: 80 },
+        { startFrame: 150, endFrame: 230 },
+      ],
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.1,
+    };
+
+    const withoutEvidence = planGainCurve(baseInput);
+    const withEvidence = planGainCurve({
+      ...baseInput,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+    });
+
+    assert.equal(withoutEvidence.runs[1].startFrame, 150, "legacy path should keep a true-silence boundary");
+    assert.equal(withEvidence.runs[1].startFrame, 144, "contiguous fricative onset should join the later speech run");
+    assert.equal(withEvidence.runs.length, baseInput.speechRuns.length, "evidence must not create independent runs");
+
+    const preservedOnsetGainDb = gainDbAtFrame(withEvidence.gainCurve, 144);
+    const laterBodyGainDb = gainDbAtFrame(withEvidence.gainCurve, 180);
+    assert.ok(
+      Math.abs(preservedOnsetGainDb - laterBodyGainDb) < 1,
+      `fricative onset ${preservedOnsetGainDb.toFixed(2)} dB should receive body gain ${laterBodyGainDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("generalizes raw-envelope onset backtracking to later speech runs", () => {
+    const frameDb = new Array<number>(260).fill(-82);
+    for (let frame = 20; frame < 80; frame += 1) frameDb[frame] = -28;
+    for (let frame = 144; frame < 150; frame += 1) frameDb[frame] = -60;
+    for (let frame = 150; frame < 220; frame += 1) frameDb[frame] = -28;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [
+        { startFrame: 20, endFrame: 80 },
+        { startFrame: 150, endFrame: 220 },
+      ],
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.1,
+    });
+
+    assert.equal(plan.runs[1].startFrame, 144);
+  });
+
+  it("does not treat continuous high-frequency room hiss as a speech edge", () => {
+    const frameDb = new Array<number>(260).fill(-82);
+    for (let frame = 20; frame < 80; frame += 1) frameDb[frame] = -28;
+    for (let frame = 150; frame < 220; frame += 1) frameDb[frame] = -28;
+    const fricativeFrameDb = new Array<number>(frameDb.length).fill(-50);
+
+    const plan = planGainCurve({
+      frameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -50,
+      speechRuns: [
+        { startFrame: 20, endFrame: 80 },
+        { startFrame: 150, endFrame: 220 },
+      ],
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.1,
+    });
+
+    assert.equal(plan.runs.length, 2);
+    assert.equal(plan.runs[1].startFrame, 150, "steady energy at its own noise floor is not onset evidence");
+    assert.equal(plan.tailRescueRunCount, 0, "steady HF room tone must not become a rescued tail");
+  });
+
+  it("bounds close-gap onset evidence at the previous run boundary", () => {
+    const frameDb = new Array<number>(220).fill(-82);
+    for (let frame = 30; frame < 100; frame += 1) frameDb[frame] = -28;
+    for (let frame = 103; frame < 180; frame += 1) frameDb[frame] = -28;
+    const fricativeFrameDb = new Array<number>(frameDb.length).fill(-82);
+    for (let frame = 90; frame < 103; frame += 1) fricativeFrameDb[frame] = -42;
+
+    const plan = planGainCurve({
+      frameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+      speechRuns: [
+        { startFrame: 30, endFrame: 100 },
+        { startFrame: 103, endFrame: 180 },
+      ],
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.1,
+    });
+
+    assert.equal(plan.runs[0].endFrame, 100);
+    assert.equal(plan.runs[1].startFrame, 100);
+    assert.ok(plan.runs[1].startFrame >= plan.runs[0].endFrame, "backtracking must never overlap the previous run");
+  });
+
+  it("does not use high-frequency evidence alone to hold a speech tail at body gain", () => {
+    const frameDb = new Array<number>(240).fill(-82);
+    for (let frame = 20; frame < 100; frame += 1) frameDb[frame] = -28;
+    const fricativeFrameDb = new Array<number>(frameDb.length).fill(-82);
+    for (let frame = 100; frame < frameDb.length; frame += 1) fricativeFrameDb[frame] = -42;
+    const baseInput = {
+      frameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+      speechRuns: [{ startFrame: 20, endFrame: 100 }],
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.1,
+    };
+
+    const plan = planGainCurve({ ...baseInput, pauseNoiseRisk: 0.1 });
+
+    assert.equal(plan.tailRescueRunCount, 0);
+    assert.equal(plan.tailRescueFrameCount, 0);
+    assert.equal(plan.tailRescueMaxMs, 0);
+  });
+
   it("keeps the full body of a speech run at body gain, ramps only into surrounding silence", () => {
     // Simulate 3 s file: 0-1 s silence, 1-2.5 s speech, 2.5-3 s silence.
     const frameDb: number[] = [];

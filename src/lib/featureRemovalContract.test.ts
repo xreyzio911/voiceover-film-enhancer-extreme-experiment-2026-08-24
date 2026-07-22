@@ -46,7 +46,7 @@ test("AI review backend remains available while Auto Pilot defaults off", () => 
   assert.match(readProjectFile(".env.example"), /^VO_AI_AUTO_PILOT_ENABLED=off$/m);
 });
 
-test("manual AI Review UI is absent while the processing integration remains available", () => {
+test("manual AI Review UI is absent while the opt-in processing integration remains available", () => {
   const source = readProjectFile("src/components/VoLeveler.tsx");
 
   assert.doesNotMatch(source, />\s*AI Review\s*</);
@@ -55,6 +55,18 @@ test("manual AI Review UI is absent while the processing integration remains ava
   assert.match(source, /runAiAudioReview/);
   assert.match(source, /runAiAudioReview\(sourceReviewFiles,\s*\{[\s\S]*?source: "source-auto"/);
   assert.match(source, /runAiAudioReview\(\[postReviewFile\],\s*\{[\s\S]*?source: "post-render"/);
+});
+
+test("all automatic Gemini audio-review paths stay off until Auto Pilot is explicitly enabled", () => {
+  const source = readProjectFile("src/components/VoLeveler.tsx");
+  const route = readProjectFile("src/app/api/audio-review/route.ts");
+
+  assert.match(source, /if \(aiAutoPilotEnabled && sourceReviewFiles\.length > 0\)/);
+  assert.match(
+    source,
+    /if \(aiAutoPilotEnabled && postRenderReviewRequests < POST_RENDER_REVIEW_MAX_REQUESTS\)/,
+  );
+  assert.match(route, /!isAiAutoPilotEnabled\(process\.env\.VO_AI_AUTO_PILOT_ENABLED\)/);
 });
 
 test("AI Auto Pilot is optional and disabled unless explicitly enabled", () => {

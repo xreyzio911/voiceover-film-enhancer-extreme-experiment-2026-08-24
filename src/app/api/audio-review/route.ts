@@ -9,6 +9,7 @@ import {
   parseGeminiAudioReviewText,
   splitAudioReviewPayloadForGemini,
 } from "@/lib/aiAudioReview";
+import { isAiAutoPilotEnabled } from "@/lib/aiAutoPilotPolicy";
 import { isAllowedEmail } from "@/lib/authAllowlist";
 import { isLocalHost } from "@/lib/isLocalHost";
 
@@ -141,6 +142,9 @@ const requestGeminiAudioReviewChunk = async ({
 export async function POST(request: NextRequest) {
   if (!(await authorizeRequest(request))) {
     return jsonError("Unauthorized", 401, "auth");
+  }
+  if (!isAiAutoPilotEnabled(process.env.VO_AI_AUTO_PILOT_ENABLED)) {
+    return jsonError("AI audio review is disabled.", 503, "config");
   }
   if (!consumeRateLimit(clientKey(request))) {
     return jsonError("Too many AI review requests. Wait a few minutes and try again.", 429, "rate_limit");

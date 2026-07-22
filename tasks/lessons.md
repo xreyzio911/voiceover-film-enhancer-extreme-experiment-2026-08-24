@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-07-22 - Quality Metrics Must Not Become New Hard Gates
+
+- What went wrong: The implementation plan inherited language about preserving hard gates without making the user's current preference explicit, which could be read as permission to add stricter automatic rejection rules.
+- Rule to prevent it: For this experimental audio-quality upgrade, add zero new hard quality gates and do not tighten existing thresholds; use new measurements as diagnostics or advisory evidence only.
+- How to verify next time: Review every new metric and call site to confirm it cannot newly fail, reject, suppress, or block an output, while leaving pre-existing integrity safeguards unchanged unless removal is separately authorized.
+
 ## 2026-07-22 - Verify Popover Direction, Not Only Layout Stability
 
 - What went wrong: The Advanced options layer was made non-reflowing, but it was anchored above its trigger and covered the upper profile selectors instead of opening into the annotated space below.

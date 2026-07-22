@@ -2,10 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CINEMATIC_VO_REFERENCE_DB,
+  computeLogBandSpectrumDb,
   computeToneMatchDeltaDb,
   resolveDeEsserBands,
   resolveSpectrumFrameBudget,
 } from "./spectrum.ts";
+
+const buildTone = (
+  sampleRate: number,
+  durationSec: number,
+  sections: Array<{ startSec: number; endSec: number; hz: number; amplitude: number }>,
+) => {
+  const samples = new Float32Array(Math.round(sampleRate * durationSec));
+  for (const section of sections) {
+    const start = Math.max(0, Math.round(section.startSec * sampleRate));
+    const end = Math.min(samples.length, Math.round(section.endSec * sampleRate));
+    for (let index = start; index < end; index += 1) {
+      samples[index] += section.amplitude * Math.sin((2 * Math.PI * section.hz * index) / sampleRate);
+    }
+  }
+  return samples;
+};
 
 test("house-tone blend pulls an all-boomy batch toward cinematic VO shape", () => {
   const fileDb = [-14, -13, -14, -18, -24, -27, -31, -35];
@@ -56,4 +73,107 @@ test("spectrum analysis caps long-file frame visits", () => {
   assert.ok(budget.totalFrames > 80000, `fixture should represent a long file, got ${budget.totalFrames} frames`);
   assert.ok(budget.frameStride > 1, `long files should stride frames, got stride ${budget.frameStride}`);
   assert.ok(budget.framesToVisit <= 1600, `frame visits should stay capped, got ${budget.framesToVisit}`);
+});
+
+test("optional activity mask keeps speech tone from being dominated by inactive room tone", () => {
+  const sampleRate = 16000;
+  const samples = buildTone(sampleRate, 1, [
+    { startSec: 0, endSec: 0.8, hz: 120, amplitude: 0.35 },
+    { startSec: 0.8, endSec: 1, hz: 2000, amplitude: 0.25 },
+  ]);
+  const activityMask = Array.from({ length: 100 }, (_, index) => index >= 80);
+
+  const legacy = computeLogBandSpectrumDb(samples, sampleRate, {
+    bands: [120, 2000],
+    widthOct: 0.2,
+  });
+  const speechOnly = computeLogBandSpectrumDb(samples, sampleRate, {
+    bands: [120, 2000],
+    widthOct: 0.2,
+    activityMask,
+    activityFrameMs: 10,
+  });
+
+  assert.ok(legacy[0] > legacy[1], `room tone should dominate the legacy average: ${legacy.join(", ")}`);
+  assert.ok(
+    speechOnly[1] > speechOnly[0] + 12,
+    `active speech band should dominate the selected average: ${speechOnly.join(", ")}`,
+  );
+  assert.ok(
+    Math.abs(speechOnly[1] - computeLogBandSpectrumDb(samples.slice(Math.round(0.8 * sampleRate)), sampleRate, {
+      bands: [120, 2000],
+      widthOct: 0.2,
+    })[1]) < 0.25,
+    "activity selection should retain the speech-band measurement",
+  );
+});
+
+test("sparse activity islands are sampled before applying the long-file frame cap", () => {
+  const sampleRate = 16000;
+  const samples = buildTone(sampleRate, 10, [
+    { startSec: 0, endSec: 10, hz: 120, amplitude: 0.04 },
+    { startSec: 5, endSec: 5.2, hz: 2000, amplitude: 0.8 },
+  ]);
+  const activityMask = Array.from({ length: 1000 }, (_, index) => index >= 500 && index < 520);
+  const options = { bands: [120, 2000], widthOct: 0.2, maxFrames: 5 } as const;
+
+  const legacy = computeLogBandSpectrumDb(samples, sampleRate, options);
+  const speechOnly = computeLogBandSpectrumDb(samples, sampleRate, {
+    ...options,
+    activityMask,
+    activityFrameMs: 10,
+  });
+
+  assert.ok(legacy[0] > legacy[1] + 20, `legacy global stride should sample room tone: ${legacy.join(", ")}`);
+  assert.ok(
+    speechOnly[1] > speechOnly[0] + 6,
+    `activity-first sampling should retain the sparse speech island: ${speechOnly.join(", ")}`,
+  );
+});
+
+test("all-inactive activity mask falls back to the legacy spectrum", () => {
+  const sampleRate = 16000;
+  const samples = buildTone(sampleRate, 0.4, [
+    { startSec: 0, endSec: 0.4, hz: 500, amplitude: 0.2 },
+  ]);
+  const options = { bands: [120, 500, 2000], widthOct: 0.25, maxFrames: 7 } as const;
+  const legacy = computeLogBandSpectrumDb(samples, sampleRate, options);
+  const withInactiveMask = computeLogBandSpectrumDb(samples, sampleRate, {
+    ...options,
+    activityMask: new Array<boolean>(40).fill(false),
+    activityFrameMs: 10,
+  });
+
+  assert.deepEqual(withInactiveMask, legacy);
+  assert.equal(resolveSpectrumFrameBudget(samples.length, sampleRate, options).framesToVisit, 7);
+});
+
+test("long sparse activity masks sample active speech instead of strided room tone", () => {
+  const sampleRate = 16000;
+  const durationSec = 400;
+  const samples = buildTone(sampleRate, durationSec, [
+    { startSec: 0, endSec: durationSec, hz: 120, amplitude: 0.04 },
+    { startSec: 233.2, endSec: 233.28, hz: 2000, amplitude: 0.9 },
+  ]);
+  const activityMask = new Array<boolean>(durationSec * 100).fill(false);
+  for (let index = 23320; index < 23328; index += 1) activityMask[index] = true;
+
+  const legacy = computeLogBandSpectrumDb(samples, sampleRate, {
+    bands: [120, 2000],
+    widthOct: 0.2,
+    maxFrames: 100,
+  });
+  const speechOnly = computeLogBandSpectrumDb(samples, sampleRate, {
+    bands: [120, 2000],
+    widthOct: 0.2,
+    maxFrames: 100,
+    activityMask,
+    activityFrameMs: 10,
+  });
+
+  assert.ok(legacy[0] > legacy[1] + 20, `legacy long average should be room-tone dominated: ${legacy.join(", ")}`);
+  assert.ok(
+    speechOnly[1] > speechOnly[0] + 6,
+    `active sparse speech should drive tone measurement despite long-file caps: ${speechOnly.join(", ")}`,
+  );
 });

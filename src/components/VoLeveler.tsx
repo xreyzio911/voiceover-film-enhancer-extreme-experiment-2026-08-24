@@ -11,7 +11,7 @@ import {
   type DragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
-import { analyzeFloatSamples, buildSpeechMask, type AudioQcMetrics } from "../lib/audioQc";
+import { analyzeFloatSamples, buildSpeechMask, percentile, type AudioQcMetrics } from "../lib/audioQc";
 import {
   detectAudibilityDropouts,
   frameDbFromFloatSamples,
@@ -20,6 +20,8 @@ import {
 import {
   applyKWeighting,
   applyGainCurveToSamples,
+  computeFricativeFrameDb,
+  estimatePlannerEnvelopeNoiseFloorDb,
   planGainCurve,
   resolvePlannerCalibration,
   speechRunsFromMask,
@@ -68,6 +70,7 @@ import {
   resolveDeEsserBands,
   SPECTRUM_BANDS_HZ,
 } from "../lib/spectrum";
+import { buildFinalPolishFilter } from "../lib/finalPolishFilter";
 import { planBatchLoudnessAlignment } from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlob";
@@ -433,6 +436,8 @@ type FileAnalysis = {
   midRms: number | null;
   highRms: number | null;
   bandSpectrumDb: number[] | null;
+  /** Speech-selected spectrum used only for tone reference and matching. */
+  speechBandSpectrumDb: number[] | null;
   sibilanceScore: number | null;
   noiseFloorDb: number | null;
   pauseNoiseFloorDb: number | null;
@@ -592,6 +597,7 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   midRms: null,
   highRms: null,
   bandSpectrumDb: null,
+  speechBandSpectrumDb: null,
   sibilanceScore: null,
   noiseFloorDb: null,
   pauseNoiseFloorDb: null,
@@ -1726,6 +1732,15 @@ const summarizeFailureReason = (error: unknown) => {
       const loudnessFrameDb = PLANNER_K_WEIGHTING
         ? buildFrameDb(applyKWeighting(samples, GAIN_PLANNER_ANALYSIS_SAMPLE_RATE))
         : undefined;
+      const fricativeFrameDb = computeFricativeFrameDb(
+        samples,
+        GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
+        GAIN_PLANNER_FRAME_MS,
+      );
+      const fricativeNoiseFloorDb =
+        fricativeFrameDb.length === frameDb.length
+          ? estimatePlannerEnvelopeNoiseFloorDb(fricativeFrameDb)
+          : undefined;
 
       const analysisNoiseFloorDb =
         profile?.noiseFloorDb ?? analysis?.pauseNoiseFloorDb ?? analysis?.noiseFloorDb ?? -70;
@@ -1796,6 +1811,8 @@ const summarizeFailureReason = (error: unknown) => {
 
       const plan = planGainCurve({
         frameDb,
+        fricativeFrameDb,
+        fricativeNoiseFloorDb,
         loudnessFrameDb,
         speechRuns,
         noiseFloorDb,
@@ -2112,7 +2129,12 @@ const summarizeFailureReason = (error: unknown) => {
     const frameSize = Math.max(1, Math.round((ANALYSIS_SAMPLE_RATE * ENVELOPE_FRAME_MS) / 1000));
     const frameCount = Math.floor(samples.length / frameSize);
     if (frameCount < 20) {
-      return { ...emptyEnvelopeMetrics, bandSpectrumDb: null, sibilanceScore: null };
+      return {
+        ...emptyEnvelopeMetrics,
+        bandSpectrumDb: null,
+        speechBandSpectrumDb: null,
+        sibilanceScore: null,
+      };
     }
     const base = mapQcMetricsToEnvelopeMetrics(
       analyzeFloatSamples(samples, ANALYSIS_SAMPLE_RATE, ENVELOPE_FRAME_MS),
@@ -2121,6 +2143,7 @@ const summarizeFailureReason = (error: unknown) => {
     // This is new data (not present in `emptyEnvelopeMetrics`) so we widen
     // the return type locally.
     let bandSpectrumDb: number[] | null = null;
+    let speechBandSpectrumDb: number[] | null = null;
     let sibilanceScore: number | null = null;
     if (samples.length >= ANALYSIS_SAMPLE_RATE) {
       try {
@@ -2130,8 +2153,27 @@ const summarizeFailureReason = (error: unknown) => {
         bandSpectrumDb = null;
         sibilanceScore = null;
       }
+
+      try {
+        const frameDb = frameDbFromFloatSamples(samples, ANALYSIS_SAMPLE_RATE, ENVELOPE_FRAME_MS);
+        // Match analyzeFloatSamples' authoritative speech-mask floor exactly.
+        // Its exposed noiseFloorDb is intentionally raised later for cleanup
+        // decisions and would over-select only loud vowels here.
+        const activityNoiseFloorDb = percentile(frameDb, 25) ?? -72;
+        const activityMask = buildSpeechMask(frameDb, activityNoiseFloorDb, {
+          frameMs: ENVELOPE_FRAME_MS,
+        });
+        if (activityMask.some(Boolean)) {
+          speechBandSpectrumDb = computeLogBandSpectrumDb(samples, ANALYSIS_SAMPLE_RATE, {
+            activityMask,
+            activityFrameMs: ENVELOPE_FRAME_MS,
+          });
+        }
+      } catch {
+        speechBandSpectrumDb = null;
+      }
     }
-    return { ...base, bandSpectrumDb, sibilanceScore };
+    return { ...base, bandSpectrumDb, speechBandSpectrumDb, sibilanceScore };
   };
 
   const parseSilencedetectSpans = (text: string, durationSeconds: number | null): SilenceSpan[] => {
@@ -2558,6 +2600,7 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.endFadeRiskScore = envelope.endFadeRiskScore;
       analysis.endEdgeDipDb = envelope.endEdgeDipDb;
       analysis.bandSpectrumDb = envelope.bandSpectrumDb;
+      analysis.speechBandSpectrumDb = envelope.speechBandSpectrumDb;
       analysis.sibilanceScore = envelope.sibilanceScore;
     } finally {
       await safeDeleteFile(ffmpeg, analysisName);
@@ -2624,6 +2667,17 @@ const summarizeFailureReason = (error: unknown) => {
       speechMapStats?.longSilenceCount ?? weightedMetric(windowAnalyses, (a) => a.longSilenceCount, 50);
     aggregated.analysisWindowCount = windowAnalyses.length;
     aggregated.longSparseModeEligible = speechMapStats?.longSparseModeEligible ?? false;
+
+    const speechBandMedians = SPECTRUM_BANDS_HZ.map((_, bandIndex) =>
+      weightedMetric(
+        windowAnalyses,
+        (analysis) => analysis.speechBandSpectrumDb?.[bandIndex] ?? null,
+        50,
+      ),
+    );
+    if (speechBandMedians.every((value): value is number => value !== null)) {
+      aggregated.speechBandSpectrumDb = speechBandMedians;
+    }
 
     for (const key of Object.keys(baseAnalysis) as Array<keyof FileAnalysis>) {
       if (aggregated[key] !== null) continue;
@@ -2882,9 +2936,10 @@ const summarizeFailureReason = (error: unknown) => {
       if (analysis.inputLRA !== null) {
         for (let i = 0; i < repeats; i += 1) lras.push(analysis.inputLRA);
       }
-      if (analysis.bandSpectrumDb && analysis.bandSpectrumDb.length === SPECTRUM_BANDS_HZ.length) {
+      const toneSpectrumDb = analysis.speechBandSpectrumDb ?? analysis.bandSpectrumDb;
+      if (toneSpectrumDb && toneSpectrumDb.length === SPECTRUM_BANDS_HZ.length) {
         for (let b = 0; b < SPECTRUM_BANDS_HZ.length; b += 1) {
-          const value = analysis.bandSpectrumDb[b];
+          const value = toneSpectrumDb[b];
           if (Number.isFinite(value)) {
             for (let i = 0; i < repeats; i += 1) perBandSamples[b].push(value);
           }
@@ -3219,9 +3274,10 @@ const summarizeFailureReason = (error: unknown) => {
     const blendOutdoorDelayMs = Math.round(clamp(52 + (1 - dryness) * 18, 48, 74));
 
     // Compute per-band tone delta vs the batch reference (if we have both).
+    const toneSpectrumDb = analysis.speechBandSpectrumDb ?? analysis.bandSpectrumDb;
     const toneMatchDeltaDb =
-      reference?.bandSpectrumDb && reference.anchorCount >= 3 && analysis.bandSpectrumDb
-        ? computeToneMatchDeltaDb(analysis.bandSpectrumDb, reference.bandSpectrumDb, {
+      reference?.bandSpectrumDb && reference.anchorCount >= 3 && toneSpectrumDb
+        ? computeToneMatchDeltaDb(toneSpectrumDb, reference.bandSpectrumDb, {
             maxDb: 2.5,
             houseBlend: HOUSE_TONE_BLEND,
             priorityBandCount: 2,
@@ -4202,9 +4258,7 @@ const summarizeFailureReason = (error: unknown) => {
 
     const polish = clamp(0.28 + directives.finalPolishIntensity * 0.34, 0.28, 0.62);
     const toneScale = clamp(0.34 + polish * 0.38, 0.34, 0.58);
-    const stabilityScale = clamp(0.42 + polish * 0.46, 0.42, 0.7);
     const deHarshScale = clamp(0.5 + polish * 0.34, 0.5, 0.72);
-    const compressionScale = clamp(0.28 + polish * 0.35, 0.28, 0.5);
 
     return {
       ...profile,
@@ -4213,21 +4267,9 @@ const summarizeFailureReason = (error: unknown) => {
       airGainDb: clamp(profile.airGainDb * toneScale, -0.75, 0.55),
       emotionalHarshnessCutDb: clamp(profile.emotionalHarshnessCutDb * deHarshScale, 0, 1.15),
       topEndHarshnessCutDb: clamp(profile.topEndHarshnessCutDb * deHarshScale, 0, 0.85),
-      levelingNeed: clamp(profile.levelingNeed * stabilityScale, 0, 0.62),
-      emotionProtection: clamp(profile.emotionProtection * stabilityScale, 0, 0.65),
-      compressorRatioOffset: clamp(profile.compressorRatioOffset * compressionScale, -0.16, 0.22),
-      compressorThresholdOffsetDb: clamp(profile.compressorThresholdOffsetDb * compressionScale, -0.65, 0.75),
-      levelerBias: clamp(profile.levelerBias * compressionScale, -0.25, 0.25),
-      dynaTrim: clamp(profile.dynaTrim * 0.45, 0, 1.6),
-      useDenoise: false,
-      denoiseStrength: 0,
-      useTailGate: false,
-      tailGateStrength: 0,
-      echoNotchCutDb: clamp(profile.echoNotchCutDb * 0.55, 0, 0.72),
-      clickTameStrength: clamp(profile.clickTameStrength * stabilityScale, 0, 0.5),
-      breathTameStrength: clamp(profile.breathTameStrength * stabilityScale, 0, 0.58),
-      onsetTameStrength: clamp(profile.onsetTameStrength * stabilityScale, 0, 0.55),
-      sagRecoveryStrength: clamp(profile.sagRecoveryStrength * clamp(0.58 + polish * 0.48, 0.58, 0.82), 0, 0.78),
+      // The primary pass already owns the user's fixed cinematic-color curve.
+      // Repeating it here would turn a finishing pass into cumulative voicing.
+      cinematicColorEnabled: false,
       toneMatchDeltaDb: profile.toneMatchDeltaDb?.map((value) => clamp(value * toneScale, -0.75, 0.75)) ?? null,
     };
   };
@@ -4251,31 +4293,54 @@ const summarizeFailureReason = (error: unknown) => {
     const tempBase = targetName.replace(/\.wav$/i, "");
     const appPassName = `${tempBase}_final_polish_tmp.wav`;
     const sourceSafePolish = context.sourceSafeChain === true || context.candidateVariant === "source-safe";
-    const candidateVariant = sourceSafePolish ? "source-safe" : (context.candidateVariant ?? "continuity-safe");
+    const controls = getActiveAudioReviewControls();
+    const finalPolishFilter = buildFinalPolishFilter(finalPolishProfile, {
+      eqCleanupEnabled: controls.eqCleanup,
+      // The primary pass already applied the user's fixed harshness curve.
+      // This pass uses only the scaled, measured residual tone profile.
+      softenHarshnessEnabled: false,
+      sourceSafe: sourceSafePolish,
+    });
 
     try {
       setStatus(`Final app polish: ${context.base}`);
-      setActiveQueueStage(context.base, "Final app polish", `${context.detail}, subtle single pass`);
+      setActiveQueueStage(context.base, "Final app polish", `${context.detail}, linear tone pass`);
       await safeDeleteFile(activeFfmpeg, appPassName);
       appendLog(
-        `[FinalPolish] ${context.base}: app output -> final app polish (${formatBytes(inputByteLength)}).`,
+        `[FinalPolish] ${context.base}: app output -> linear tone + delivery limiter (${formatBytes(inputByteLength)}).`,
       );
-      await runMixReady(activeFfmpeg, targetName, appPassName, finalPolishProfile, {
-        candidateVariant,
-        forceEndingProtection: true,
-        skipSpeechSegmentation: true,
-        disableSegmentGainMatch: true,
-        disableAdaptiveNoiseReduction: true,
-        disableRoomCleanup: sourceSafePolish ? true : undefined,
-        sourceSafeChain: sourceSafePolish,
-      });
+      resetLogBuffer();
+      await execOrThrow(
+        activeFfmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-filter_threads",
+          "1",
+          "-y",
+          "-i",
+          targetName,
+          "-af",
+          finalPolishFilter,
+          "-ar",
+          "48000",
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_f32le",
+          appPassName,
+        ],
+        "Linear final app polish",
+      );
 
       const passBytes = await readVirtualFileBytes(activeFfmpeg, appPassName);
       const passByteLength = assertUsableWavBytes(passBytes, "Final app polish");
 
       await activeFfmpeg.writeFile(targetName, passBytes);
       appendLog(
-        `[FinalPolish] ${context.base}: final app polish applied once (${formatBytes(
+        `[FinalPolish] ${context.base}: linear final polish applied once (${formatBytes(
           passByteLength,
         )}; delivery uses app + final app polish).`,
       );
@@ -7509,7 +7574,7 @@ const summarizeFailureReason = (error: unknown) => {
                 baseDirectives,
                 adaptiveDirectiveDeltaFromDefault(buildCorrectiveDirectivesForIssueTags(postAutoReview.issueTags)),
               );
-              if (postRenderReviewRequests < POST_RENDER_REVIEW_MAX_REQUESTS) {
+              if (aiAutoPilotEnabled && postRenderReviewRequests < POST_RENDER_REVIEW_MAX_REQUESTS) {
                 postRenderReviewRequests += 1;
                 const postReviewFile = buildAudioReviewFileInput(
                   job,
@@ -7537,8 +7602,12 @@ const summarizeFailureReason = (error: unknown) => {
                 ) {
                   correctiveDirectives = normalizeAdaptiveDirectives(fileReview.adaptiveDirectives);
                 }
-              } else {
+              } else if (aiAutoPilotEnabled) {
                 appendLog(`[Corrective] ${job.base}: Gemini post-render review skipped (batch cap reached).`);
+              } else {
+                appendLog(
+                  `[Corrective] ${job.base}: Gemini review disabled; using deterministic corrective directives.`,
+                );
               }
 
               if (hasNonTrivialAdaptiveDirectives(correctiveDirectives, baseDirectives)) {

@@ -27,6 +27,21 @@ const FRAME_MS = 20;
 const HOP_MS = 20;
 export const DEFAULT_MAX_SPECTRUM_FRAMES = 1600;
 
+export type LogBandSpectrumOptions = {
+  bands?: readonly number[];
+  widthOct?: number;
+  maxFrames?: number;
+  frameStride?: number;
+  /**
+   * Optional activity decisions used only to select which spectrum frames
+   * contribute to the average. `activityFrameMs` must describe their cadence.
+   * If no usable active frame is found, analysis falls back to the legacy
+   * whole-signal average instead of returning an empty measurement.
+   */
+  activityMask?: readonly boolean[];
+  activityFrameMs?: number;
+};
+
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 type BandFilter = {
@@ -71,6 +86,23 @@ export const resolveSpectrumFrameBudget = (
   return { frameSize, hopSize, totalFrames, frameStride, framesToVisit };
 };
 
+const overlapsActiveFrame = (
+  frameStart: number,
+  frameSize: number,
+  sampleRate: number,
+  activityMask: readonly boolean[],
+  activityFrameMs: number,
+) => {
+  const startMs = (frameStart * 1000) / sampleRate;
+  const endMs = ((frameStart + frameSize) * 1000) / sampleRate;
+  const firstActivityFrame = Math.max(0, Math.floor(startMs / activityFrameMs));
+  const lastActivityFrame = Math.min(activityMask.length, Math.ceil(endMs / activityFrameMs));
+  for (let index = firstActivityFrame; index < lastActivityFrame; index += 1) {
+    if (activityMask[index]) return true;
+  }
+  return false;
+};
+
 /**
  * Compute per-band average energy (dB) across the entire signal.
  * Returns one number per band in SPECTRUM_BANDS_HZ order.
@@ -78,12 +110,16 @@ export const resolveSpectrumFrameBudget = (
 export const computeLogBandSpectrumDb = (
   samples: Float32Array,
   sampleRate: number,
-  options?: { bands?: readonly number[]; widthOct?: number; maxFrames?: number; frameStride?: number },
+  options?: LogBandSpectrumOptions,
 ): number[] => {
   const bandsHz = options?.bands ?? SPECTRUM_BANDS_HZ;
   const widthOct = options?.widthOct ?? DEFAULT_BAND_WIDTH_OCT;
   const filters = buildBandFilters(sampleRate, bandsHz, widthOct);
   const { frameSize, hopSize, totalFrames, frameStride } = resolveSpectrumFrameBudget(samples.length, sampleRate, options);
+  const maxFrames =
+    typeof options?.maxFrames === "number" && Number.isFinite(options.maxFrames) && options.maxFrames > 0
+      ? Math.max(1, Math.floor(options.maxFrames))
+      : DEFAULT_MAX_SPECTRUM_FRAMES;
 
   // Hann window for modest leakage suppression.
   const window = new Float32Array(frameSize);
@@ -91,50 +127,102 @@ export const computeLogBandSpectrumDb = (
     window[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (frameSize - 1)));
   }
 
-  const bandSumPower = new Array<number>(filters.length).fill(0);
-  let framesCounted = 0;
+  const activityFrameMs = options?.activityFrameMs;
+  const activityMask = options?.activityMask;
+  const useActivitySelection =
+    activityMask !== undefined &&
+    typeof activityFrameMs === "number" &&
+    Number.isFinite(activityFrameMs) &&
+    activityFrameMs > 0;
 
-  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += frameStride) {
-    const frameStart = frameIndex * hopSize;
-    // Skip near-silent frames so background hiss doesn't dominate the median.
-    let rms = 0;
-    for (let i = 0; i < frameSize; i += 1) {
-      const v = samples[frameStart + i];
-      rms += v * v;
+  const buildLegacyFrameIndices = () => {
+    const frameIndices: number[] = [];
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += frameStride) {
+      frameIndices.push(frameIndex);
     }
-    rms = Math.sqrt(rms / frameSize);
-    if (rms < 1e-4) continue;
+    return frameIndices;
+  };
 
-    framesCounted += 1;
-
-    for (let b = 0; b < filters.length; b += 1) {
-      let totalPower = 0;
-      for (const { cosOmega, sinOmega } of filters[b].grid) {
-        let re = 0;
-        let im = 0;
-        // DFT at this single frequency over the windowed frame.
-        // Iterative rotation avoids Math.cos/sin per sample.
-        let c = 1;
-        let s = 0;
-        for (let i = 0; i < frameSize; i += 1) {
-          const v = samples[frameStart + i] * window[i];
-          re += v * c;
-          im += v * s;
-          const nc = c * cosOmega - s * sinOmega;
-          const ns = s * cosOmega + c * sinOmega;
-          c = nc;
-          s = ns;
-        }
-        totalPower += (re * re + im * im) / (frameSize * frameSize);
+  const buildActivityFrameIndices = () => {
+    if (!useActivitySelection) return null;
+    const activeFrameIndices: number[] = [];
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
+      const frameStart = frameIndex * hopSize;
+      if (overlapsActiveFrame(frameStart, frameSize, sampleRate, activityMask, activityFrameMs)) {
+        activeFrameIndices.push(frameIndex);
       }
-      bandSumPower[b] += totalPower / filters[b].grid.length;
     }
-  }
+    if (activeFrameIndices.length === 0) return null;
 
-  if (framesCounted === 0) return bandsHz.map(() => -120);
+    const activeStride =
+      typeof options?.frameStride === "number" && Number.isFinite(options.frameStride) && options.frameStride > 0
+        ? Math.max(1, Math.floor(options.frameStride))
+        : Math.max(1, Math.ceil(activeFrameIndices.length / maxFrames));
+    const selectedFrameIndices: number[] = [];
+    for (
+      let activeIndex = 0;
+      activeIndex < activeFrameIndices.length && selectedFrameIndices.length < maxFrames;
+      activeIndex += activeStride
+    ) {
+      selectedFrameIndices.push(activeFrameIndices[activeIndex]);
+    }
+    return selectedFrameIndices;
+  };
 
-  return bandSumPower.map((p) => {
-    const avg = p / framesCounted;
+  const accumulateSpectrum = (frameIndices: readonly number[]) => {
+    const bandSumPower = new Array<number>(filters.length).fill(0);
+    let framesCounted = 0;
+
+    for (const frameIndex of frameIndices) {
+      const frameStart = frameIndex * hopSize;
+      // Skip near-silent frames so background hiss doesn't dominate the median.
+      let rms = 0;
+      for (let i = 0; i < frameSize; i += 1) {
+        const v = samples[frameStart + i];
+        rms += v * v;
+      }
+      rms = Math.sqrt(rms / frameSize);
+      if (rms < 1e-4) continue;
+
+      framesCounted += 1;
+
+      for (let b = 0; b < filters.length; b += 1) {
+        let totalPower = 0;
+        for (const { cosOmega, sinOmega } of filters[b].grid) {
+          let re = 0;
+          let im = 0;
+          // DFT at this single frequency over the windowed frame.
+          // Iterative rotation avoids Math.cos/sin per sample.
+          let c = 1;
+          let s = 0;
+          for (let i = 0; i < frameSize; i += 1) {
+            const v = samples[frameStart + i] * window[i];
+            re += v * c;
+            im += v * s;
+            const nc = c * cosOmega - s * sinOmega;
+            const ns = s * cosOmega + c * sinOmega;
+            c = nc;
+            s = ns;
+          }
+          totalPower += (re * re + im * im) / (frameSize * frameSize);
+        }
+        bandSumPower[b] += totalPower / filters[b].grid.length;
+      }
+    }
+
+    return { bandSumPower, framesCounted };
+  };
+
+  const legacyFrameIndices = buildLegacyFrameIndices();
+  const activityFrameIndices = buildActivityFrameIndices();
+  const activeSpectrum = activityFrameIndices ? accumulateSpectrum(activityFrameIndices) : null;
+  const effectiveSpectrum =
+    activeSpectrum && activeSpectrum.framesCounted > 0 ? activeSpectrum : accumulateSpectrum(legacyFrameIndices);
+
+  if (effectiveSpectrum.framesCounted === 0) return bandsHz.map(() => -120);
+
+  return effectiveSpectrum.bandSumPower.map((p) => {
+    const avg = p / effectiveSpectrum.framesCounted;
     return 10 * Math.log10(avg + 1e-30);
   });
 };

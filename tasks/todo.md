@@ -1,3 +1,38 @@
+# Film Enhancer Audio Quality Upgrade
+
+## Checklist
+
+- [x] Read the pasted proposal, project rules, implementation plan, prior lessons, active Git state, and voiceover quality/processing guidance.
+- [x] Inventory the complete optimizer path, current DSP ownership, tests, and the 26 source/output WAV pairs without modifying the corpus.
+- [x] Freeze the pre-change software baseline with the full audio-QC suite, lint, and production build.
+- [x] Capture pre-change source/output metrics for representative clean, roomy/sparse, and long-form fixtures.
+- [x] Classify every proposal item as adopt, adapt, defer, or reject from current-tree and audio evidence.
+- [x] Add failing regression coverage for the selected measurement and DSP defects.
+- [x] Implement the smallest cohesive, reversible audio improvements without adding or tightening any hard quality gate.
+- [x] Run focused and full verification, render exact app outputs, compare source-relative metrics, and record the subjective audition boundary.
+- [x] Complete independent correctness/audio-policy/security reviews and record the final evidence.
+
+## Scope Boundaries
+
+- Do not modify Audio Splitter-owned files or reintroduce neural speech enhancement.
+- Preserve one input to one output, 48 kHz mono mix-ready delivery, and the app's existing integrity/safety behavior.
+- Add no new hard quality gates and do not tighten existing thresholds; new quality measurements must remain diagnostic or advisory.
+- Do not upload the private voice corpus to an external provider; keep diagnostic and render evidence local and immutable.
+- Do not add another broadly acting compressor, limiter, gate, or tamer without proving the creating stage.
+- Do not commit, push, or deploy unless the user separately authorizes it.
+
+## Review Notes
+
+- Adopted: speech-selected tone spectrum for tone reference/matching, activity-first sparse spectrum sampling, linear final app polish, and bounded fricative/onset evidence inside the existing planner.
+- Adapted after browser evidence: the proposed "disable segment matching when planner active" was too broad. On `Antonio Rossi_Batch1-10_TimR.wav` it exposed quiet-speech collapse, so planner activity is not a veto; existing long-duration segment matching remains available.
+- Rejected/deferred: fixed -22.5 house anchor, new stricter quality gates, blind extra tail hold, dynamic de-esser rewrite, full 16-24 band curve, unconditional color/double HPF, neural/enhancement reordering, long-file hard-gate changes, and persistent actor profiles.
+- Exact browser outputs saved under `tasks/render-evidence/`: `01-10_Martina_mixready_browser.wav` (normal final-polish path, quiet-speech PASS) and `Antonio_Rossi_Batch1-10_TimR_mixready_browser_rerender.wav` (audibility recovery path, quiet-speech PASS).
+- The Martina output's advisory rendered-spike diagnostic still reports four high-contrast groups around 550-552s; they remain below -6.2 dBFS with no clipping and do not become a gate. This unresolved perceptual tradeoff is part of the required level-matched audition.
+- Browser verification exposed that post-render corrective review could call Gemini even while source Auto Pilot was default-off. The follow-up now gates source review, post-render review, and the API route behind the same explicit `VO_AI_AUTO_PILOT_ENABLED` opt-in; deterministic corrective directives remain active when it is off. Gemini received filenames plus bounded JSON analysis/profile metrics during those earlier checks, not source or rendered audio bytes; no corpus WAV was uploaded.
+- Final verification: 184 tests passed with 1 existing intentional skip, lint passed, the production build passed, and `git diff --check` found no whitespace errors. A live route smoke with Auto Pilot explicitly off returned `503` and `AI audio review is disabled` before provider configuration. The existing Audio Splitter NFT tracing warning remains unchanged.
+- `tasks/render-evidence/` is ignored so the two large private proof WAVs stay local and cannot be accidentally committed.
+- Subjective audio quality still needs human level-matched listening; this pass verifies local render integrity and objective diagnostics only.
+
 # Emil Design Engineering Frontend Upgrade
 
 ## Checklist

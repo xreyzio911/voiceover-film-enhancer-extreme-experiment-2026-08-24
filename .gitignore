@@ -17,6 +17,7 @@
 # testing
 /coverage
 /.playwright-mcp/
+/tasks/render-evidence/
 __pycache__/
 *.pyc
 

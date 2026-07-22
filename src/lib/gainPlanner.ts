@@ -22,6 +22,14 @@ export type GainPlannerInput = {
   /** 10ms-frame RMS in dB (e.g. from analyzeFloatSamples envelope). */
   frameDb: number[];
   /**
+   * Optional same-length 3.5-7.4 kHz envelope. This is edge evidence only:
+   * it may attach immediately contiguous consonant frames to an existing
+   * speech run, but it never creates a speech run by itself.
+   */
+  fricativeFrameDb?: number[];
+  /** Independently measured floor for fricativeFrameDb. */
+  fricativeNoiseFloorDb?: number;
+  /**
    * Optional same-length perceptual loudness envelope. Target/gain math can
    * use this, but raw frameDb stays authoritative for masks, peaks, crest,
    * and body-relative spike guards whose thresholds were tuned in raw RMS.
@@ -139,8 +147,11 @@ const COLD_OPEN_TRANSIENT_CREST_DB = 15;
 const COLD_OPEN_TRANSIENT_PEAK_OVER_TARGET_DB = 8;
 const COLD_OPEN_LIFT_TOLERANCE_DB = 1.5;
 const COLD_OPEN_LIFT_MAX_DB = 5;
-const COLD_OPEN_ONSET_BACKTRACK_MS = 60;
+const RUN_ONSET_BACKTRACK_MS = 60;
 const COLD_OPEN_ATTACK_LEAD_MS = 40;
+const FRICATIVE_BAND_LOW_HZ = 3500;
+const FRICATIVE_BAND_HIGH_HZ = 7400;
+const FRICATIVE_EVIDENCE_MARGIN_DB = 10;
 const SOFT_TAIL_RESCUE_MAX_MS = 500;
 const SOFT_TAIL_RESCUE_NOISY_MAX_MS = 240;
 const SOFT_TAIL_RESCUE_NOISY_RISK = 0.55;
@@ -234,6 +245,19 @@ const buildHighPassBiquad = (sampleRate: number, frequencyHz: number, q: number)
   return normalizeBiquad(b0, b1, b2, a0, a1, a2);
 };
 
+const buildLowPassBiquad = (sampleRate: number, frequencyHz: number, q: number): BiquadCoefficients => {
+  const w0 = (2 * Math.PI * frequencyHz) / sampleRate;
+  const cosW0 = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * q);
+  const b0 = (1 - cosW0) / 2;
+  const b1 = 1 - cosW0;
+  const b2 = (1 - cosW0) / 2;
+  const a0 = 1 + alpha;
+  const a1 = -2 * cosW0;
+  const a2 = 1 - alpha;
+  return normalizeBiquad(b0, b1, b2, a0, a1, a2);
+};
+
 const buildHighShelfBiquad = (sampleRate: number, frequencyHz: number, gainDb: number): BiquadCoefficients => {
   const a = Math.pow(10, gainDb / 40);
   const w0 = (2 * Math.PI * frequencyHz) / sampleRate;
@@ -275,6 +299,77 @@ export const applyKWeighting = (samples: Float32Array, sampleRate: number) => {
   const shelf = buildHighShelfBiquad(sampleRate, K_WEIGHT_STAGE1_HIGH_SHELF_HZ, K_WEIGHT_STAGE1_GAIN_DB);
   const highPass = buildHighPassBiquad(sampleRate, K_WEIGHT_STAGE2_HIGH_PASS_HZ, K_WEIGHT_STAGE2_Q);
   return applyBiquad(applyBiquad(samples, shelf), highPass);
+};
+
+/**
+ * Measure a narrow high-frequency envelope for unvoiced consonant evidence.
+ *
+ * The filter is streamed directly into frame accumulators so long-form
+ * analysis does not allocate filtered copies of the source. The result is
+ * intentionally not a speech detector or a quality score; the planner can
+ * only use it next to a run already detected by the broadband speech mask.
+ */
+export const computeFricativeFrameDb = (
+  samples: Float32Array,
+  sampleRate: number,
+  frameMs = 10,
+): number[] => {
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || !Number.isFinite(frameMs) || frameMs <= 0) {
+    return [];
+  }
+
+  const samplesPerFrame = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
+  const frameCount = Math.floor(samples.length / samplesPerFrame);
+  const frameDb = new Array<number>(frameCount).fill(-120);
+  if (frameCount === 0) return frameDb;
+
+  const upperFrequencyHz = Math.min(FRICATIVE_BAND_HIGH_HZ, sampleRate * 0.4625);
+  if (upperFrequencyHz <= FRICATIVE_BAND_LOW_HZ * 1.05) return frameDb;
+
+  const highPass = buildHighPassBiquad(sampleRate, FRICATIVE_BAND_LOW_HZ, Math.SQRT1_2);
+  const lowPass = buildLowPassBiquad(sampleRate, upperFrequencyHz, Math.SQRT1_2);
+  let hpX1 = 0;
+  let hpX2 = 0;
+  let hpY1 = 0;
+  let hpY2 = 0;
+  let lpX1 = 0;
+  let lpX2 = 0;
+  let lpY1 = 0;
+  let lpY2 = 0;
+
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    const start = frame * samplesPerFrame;
+    const end = start + samplesPerFrame;
+    let sumPower = 0;
+    for (let index = start; index < end; index += 1) {
+      const inputSample = samples[index];
+      const highPassed =
+        highPass.b0 * inputSample +
+        highPass.b1 * hpX1 +
+        highPass.b2 * hpX2 -
+        highPass.a1 * hpY1 -
+        highPass.a2 * hpY2;
+      hpX2 = hpX1;
+      hpX1 = inputSample;
+      hpY2 = hpY1;
+      hpY1 = highPassed;
+
+      const bandPassed =
+        lowPass.b0 * highPassed +
+        lowPass.b1 * lpX1 +
+        lowPass.b2 * lpX2 -
+        lowPass.a1 * lpY1 -
+        lowPass.a2 * lpY2;
+      lpX2 = lpX1;
+      lpX1 = highPassed;
+      lpY2 = lpY1;
+      lpY1 = bandPassed;
+      sumPower += bandPassed * bandPassed;
+    }
+    frameDb[frame] = 10 * Math.log10(sumPower / samplesPerFrame + 1e-30);
+  }
+
+  return frameDb;
 };
 
 const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => {
@@ -326,6 +421,16 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const frameCount = input.frameDb.length;
   const loudnessFrameDb =
     input.loudnessFrameDb?.length === frameCount ? input.loudnessFrameDb : input.frameDb;
+  const fricativeFrameDb =
+    input.fricativeFrameDb?.length === frameCount && Number.isFinite(input.fricativeNoiseFloorDb)
+      ? input.fricativeFrameDb
+      : null;
+  const fricativeEvidenceFloorDb =
+    fricativeFrameDb && Number.isFinite(input.fricativeNoiseFloorDb)
+      ? (input.fricativeNoiseFloorDb as number) + FRICATIVE_EVIDENCE_MARGIN_DB
+      : Number.POSITIVE_INFINITY;
+  const hasFricativeEvidence = (frame: number) =>
+    fricativeFrameDb !== null && (fricativeFrameDb[frame] ?? -120) >= fricativeEvidenceFloorDb;
   const gainDbCurve = new Float32Array(frameCount);
 
   // Adaptive micro-ride amplitude. The micro-ride applies small corrective
@@ -364,6 +469,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // dB which is the typical speech crest factor.
   const runRmsDb: number[] = []; // body-speech loudness-domain runs ONLY — these drive the target
   type RunEntry = {
+    detectedStartFrame: number;
     startFrame: number;
     endFrame: number;
     meanDb: number;
@@ -404,18 +510,16 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   for (let runIndex = 0; runIndex < input.speechRuns.length; runIndex += 1) {
     const run = input.speechRuns[runIndex];
     let startFrame = run.startFrame;
-    if (runIndex === 0) {
-      const backtrackFrames = Math.max(0, Math.round(COLD_OPEN_ONSET_BACKTRACK_MS / frameMs));
-      const backtrackFloorDb = input.speechThresholdDb - 6;
-      let walkedFrames = 0;
-      while (
-        startFrame > 0 &&
-        walkedFrames < backtrackFrames &&
-        input.frameDb[startFrame - 1] >= backtrackFloorDb
-      ) {
-        startFrame -= 1;
-        walkedFrames += 1;
-      }
+    const backtrackFrames = Math.max(0, Math.round(RUN_ONSET_BACKTRACK_MS / frameMs));
+    const backtrackFloorDb = input.speechThresholdDb - 6;
+    const previousRunEndFrame = runIndex > 0 ? input.speechRuns[runIndex - 1].endFrame : 0;
+    let walkedFrames = 0;
+    while (startFrame > previousRunEndFrame && walkedFrames < backtrackFrames) {
+      const candidateFrame = startFrame - 1;
+      const hasRawEnvelopeEvidence = input.frameDb[candidateFrame] >= backtrackFloorDb;
+      if (!hasRawEnvelopeEvidence && !hasFricativeEvidence(candidateFrame)) break;
+      startFrame = candidateFrame;
+      walkedFrames += 1;
     }
     const runFrames = run.endFrame - startFrame;
     if (runFrames < 6) continue;
@@ -493,6 +597,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
 
     runMeta.push({
+      detectedStartFrame: run.startFrame,
       startFrame,
       endFrame: run.endFrame,
       meanDb,
@@ -869,7 +974,10 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
 
     // Release ramp — lives in the silence AFTER the run, never inside it.
     // Bounded by the NEXT run's start so we don't overwrite its attack.
-    const nextRunStart = r + 1 < runMeta.length ? runMeta[r + 1].startFrame : frameCount;
+    // The preceding run keeps ownership of its already-bounded soft-tail
+    // window up to the detector's original next-run boundary. A later run's
+    // optional onset backtrack must not shorten that established protection.
+    const nextRunStart = r + 1 < runMeta.length ? runMeta[r + 1].detectedStartFrame : frameCount;
     const bodyGainAtEnd = gainDbCurve[endFrame - 1];
     const softTailEndFrame = resolveSoftTailRescueEndFrame(runMeta[r], nextRunStart);
     protectedEndFrameByRun[r] = softTailEndFrame;
