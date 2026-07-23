@@ -9,6 +9,7 @@ import {
   emitSendcmdScript,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
+  relaxNarrowBodySpeechGainValleys,
   relaxNarrowConsonantOwnerCaps,
   resolvePlannerCalibration,
   speechRunsFromMask,
@@ -1431,6 +1432,220 @@ describe("narrow source-relative consonant owner-cap relaxation", () => {
         .map((value) => value.toFixed(3))
         .join(", ")}`,
     );
+  });
+});
+
+describe("narrow body-speech planner-gain valley relaxation", () => {
+  it("materially lifts one- through four-frame valleys without an engagement step", () => {
+    for (const valleyFrames of [1, 2, 3, 4]) {
+      const original = new Float32Array(81).fill(2);
+      const valleyStart = 40 - Math.floor(valleyFrames / 2);
+      original.fill(-2, valleyStart, valleyStart + valleyFrames);
+
+      const relaxed = relaxNarrowBodySpeechGainValleys(
+        original,
+        new Float32Array(original.length).fill(-24),
+        [{ startFrame: 5, endFrame: 76 }],
+      );
+      const valleyLiftDb = Array.from(
+        relaxed.slice(valleyStart, valleyStart + valleyFrames),
+        (gainDb, index) => gainDb - original[valleyStart + index],
+      );
+
+      assert.ok(
+        valleyLiftDb.every((liftDb) => liftDb >= 0.4),
+        `${valleyFrames}-frame valley should be materially relaxed, got lifts ${valleyLiftDb
+          .map((value) => value.toFixed(6))
+          .join(", ")} dB`,
+      );
+    }
+
+    for (const valleyFrames of [13, 19]) {
+      const original = new Float32Array(81).fill(2);
+      const valleyStart = 40 - Math.floor(valleyFrames / 2);
+      original.fill(-2, valleyStart, valleyStart + valleyFrames);
+      const relaxed = relaxNarrowBodySpeechGainValleys(
+        original,
+        new Float32Array(original.length).fill(-24),
+        [{ startFrame: 5, endFrame: 76 }],
+      );
+      assert.ok(
+        relaxed[40] - original[40] >= 0.4,
+        `${valleyFrames}-frame measured-width valley should be materially relaxed at its center`,
+      );
+    }
+
+    const shallow = new Float32Array(61).fill(2);
+    shallow[30] = 1.99;
+    const shallowRelaxed = relaxNarrowBodySpeechGainValleys(
+      shallow,
+      new Float32Array(shallow.length).fill(-24),
+      [{ startFrame: 0, endFrame: shallow.length }],
+    );
+    assert.ok(
+      shallowRelaxed[30] > shallow[30] && shallowRelaxed[30] < 2,
+      `a shallow valley should receive a proportionate nonzero lift, got ${shallowRelaxed[30].toFixed(6)} dB`,
+    );
+  });
+
+  it("preserves sustained and one-sided lower passages", () => {
+    const original = new Float32Array(81).fill(2);
+    for (let frame = 10; frame <= 30; frame += 1) {
+      original[frame] = 2 - ((frame - 10) / 20) * 4;
+    }
+    original.fill(-2, 31, 71);
+
+    const relaxed = relaxNarrowBodySpeechGainValleys(
+      original,
+      new Float32Array(original.length).fill(-24),
+      [{ startFrame: 5, endFrame: 76 }],
+    );
+
+    assert.equal(
+      relaxed[40],
+      original[40],
+      "the fully supported center of a sustained lower plateau must retain its intended depth",
+    );
+    assert.equal(
+      relaxed[32],
+      original[32],
+      "a low passage with one equally low shoulder must not be mistaken for a narrow valley",
+    );
+  });
+
+  it("leaves constant gain, run edges, and every frame outside supplied runs exact", () => {
+    const constant = new Float32Array(12).fill(1.25);
+    assert.deepEqual(
+      relaxNarrowBodySpeechGainValleys(
+        constant,
+        new Float32Array(constant.length).fill(-24),
+        [{ startFrame: 2, endFrame: 10 }],
+      ),
+      constant,
+      "a constant planner curve must remain sample-exact",
+    );
+
+    const original = new Float32Array(81).fill(2);
+    original[4] = -3;
+    original[21] = -2;
+    original[40] = -2;
+    original[76] = -3;
+    const relaxed = relaxNarrowBodySpeechGainValleys(
+      original,
+      new Float32Array(original.length).fill(-24),
+      [{ startFrame: 20, endFrame: 61 }],
+    );
+
+    assert.equal(relaxed[4], original[4], "a valley before the supplied run must remain exact");
+    assert.equal(relaxed[76], original[76], "a valley after the supplied run must remain exact");
+    assert.equal(
+      relaxed[21],
+      original[21],
+      "a run-edge valley without two-sided body context must remain exact",
+    );
+    assert.ok(relaxed[40] > original[40], "the same valley with two-sided body context should relax");
+  });
+
+  it("is immutable and can only lift, never lower, planner gain", () => {
+    const original = Float32Array.from([
+      -1,
+      0.5,
+      -2,
+      1,
+      -0.25,
+      2,
+      -3,
+      0,
+      1.5,
+    ]);
+    const snapshot = new Float32Array(original);
+    const relaxed = relaxNarrowBodySpeechGainValleys(
+      original,
+      new Float32Array(original.length).fill(-24),
+      [{ startFrame: 1, endFrame: 8 }],
+    );
+
+    assert.deepEqual(original, snapshot, "valley relaxation must not mutate its input curve");
+    for (let frame = 0; frame < original.length; frame += 1) {
+      assert.ok(
+        relaxed[frame] >= original[frame],
+        `frame ${frame} was lowered from ${original[frame].toFixed(6)} to ${relaxed[frame].toFixed(6)} dB`,
+      );
+    }
+  });
+
+  it("does not undo intentional leveling or flatten natural source dynamics", () => {
+    const flatOutputGain = new Float32Array(81).fill(1.5);
+    const flatOutputSource = new Float32Array(81).fill(-23.5);
+    flatOutputGain.fill(-1.5, 38, 42);
+    flatOutputSource.fill(-20.5, 38, 42);
+
+    const flatOutputRelaxed = relaxNarrowBodySpeechGainValleys(
+      flatOutputGain,
+      flatOutputSource,
+      [{ startFrame: 5, endFrame: 76 }],
+    );
+    assert.deepEqual(
+      flatOutputRelaxed,
+      flatOutputGain,
+      "a gain valley that intentionally levels a loud phoneme to flat output must remain exact",
+    );
+
+    const naturalDipGain = new Float32Array(81).fill(1);
+    const naturalDipSource = new Float32Array(81).fill(-23);
+    naturalDipSource.fill(-26, 38, 42);
+    const naturalDipRelaxed = relaxNarrowBodySpeechGainValleys(
+      naturalDipGain,
+      naturalDipSource,
+      [{ startFrame: 5, endFrame: 76 }],
+    );
+    assert.deepEqual(
+      naturalDipRelaxed,
+      naturalDipGain,
+      "an unchanged natural source valley must not be mistaken for processing damage",
+    );
+  });
+
+  it("lifts only the processing-added portion of a real planned-output valley", () => {
+    const gain = new Float32Array(81).fill(1.5);
+    const source = new Float32Array(81).fill(-23.5);
+    gain.fill(-1.5, 38, 42);
+    source.fill(-21.5, 38, 42);
+
+    const relaxed = relaxNarrowBodySpeechGainValleys(
+      gain,
+      source,
+      [{ startFrame: 5, endFrame: 76 }],
+    );
+    for (let frame = 38; frame < 42; frame += 1) {
+      const originalOutputDb = source[frame] + gain[frame];
+      const relaxedOutputDb = source[frame] + relaxed[frame];
+      assert.ok(
+        relaxedOutputDb > originalOutputDb,
+        `frame ${frame} should receive a continuous lift for its real output valley`,
+      );
+      assert.ok(
+        relaxedOutputDb < -22,
+        `frame ${frame} must remain below the -22 dB shoulders instead of becoming a bump`,
+      );
+    }
+
+    const naturallyQuietSource = new Float32Array(81).fill(-22);
+    const naturallyQuietGain = new Float32Array(81);
+    naturallyQuietSource.fill(-24, 38, 42);
+    naturallyQuietGain.fill(-1, 38, 42);
+    const naturallyQuietRelaxed = relaxNarrowBodySpeechGainValleys(
+      naturallyQuietGain,
+      naturallyQuietSource,
+      [{ startFrame: 5, endFrame: 76 }],
+    );
+    for (let frame = 38; frame < 42; frame += 1) {
+      const liftDb = naturallyQuietRelaxed[frame] - naturallyQuietGain[frame];
+      assert.ok(
+        liftDb > 0 && liftDb < 1,
+        `only the extra 1 dB processing dip should be relaxed, got ${liftDb.toFixed(6)} dB`,
+      );
+    }
   });
 });
 

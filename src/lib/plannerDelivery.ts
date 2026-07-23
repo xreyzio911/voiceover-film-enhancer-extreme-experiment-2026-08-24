@@ -5,12 +5,16 @@ export const PLANNER_DELIVERY_MAX_MAKEUP_DB = 10.5;
 export const FINAL_TONE_FOUR_KHZ_MAX_TRIM_DB = 0.7;
 export const FINAL_TONE_EIGHT_KHZ_MAX_TRIM_DB = 0.9;
 export const FINAL_TONE_COMBINED_MAX_TRIM_DB = 1.4;
+export const FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB = 2;
+const FINAL_TONE_TOP_OCTAVE_KNEE_DB = 1.65;
 
 export type SourceRelativeFinalTone = Readonly<{
   fourKhzExcessDb: number;
   eightKhzExcessDb: number;
+  topOctaveExcessDb: number;
   fourKhzTrimDb: number;
   eightKhzTrimDb: number;
+  topOctaveTrimDb: number;
 }>;
 
 const clamp = (value: number, min: number, max: number) =>
@@ -18,6 +22,55 @@ const clamp = (value: number, min: number, max: number) =>
 
 const finiteNumber = (value: number | null | undefined): value is number =>
   typeof value === "number" && Number.isFinite(value);
+
+export const resolvePlannerGainFrameRange = ({
+  planStartSec,
+  durationSec,
+  frameMs,
+  totalFrames,
+}: Readonly<{
+  planStartSec: number;
+  durationSec: number;
+  frameMs: number;
+  totalFrames: number;
+}>) => {
+  if (
+    !finiteNumber(planStartSec) ||
+    !finiteNumber(durationSec) ||
+    !finiteNumber(frameMs) ||
+    frameMs <= 0 ||
+    !finiteNumber(totalFrames) ||
+    totalFrames <= 0 ||
+    durationSec <= 0
+  ) {
+    return { frameStart: 0, frameEnd: 0, frameOffsetFrames: 0 };
+  }
+  const safeTotalFrames = Math.max(0, Math.floor(totalFrames));
+  const startFramePosition = Math.max(
+    0,
+    (Math.max(0, planStartSec) * 1000) / frameMs,
+  );
+  if (startFramePosition >= safeTotalFrames) {
+    return {
+      frameStart: safeTotalFrames,
+      frameEnd: safeTotalFrames,
+      frameOffsetFrames: 0,
+    };
+  }
+  const owningFrameStart = Math.floor(startFramePosition);
+  const frameStart = Math.max(0, owningFrameStart - 1);
+  const endFramePosition =
+    ((Math.max(0, planStartSec) + durationSec) * 1000) / frameMs;
+  return {
+    frameStart,
+    frameEnd: clamp(
+      Math.ceil(endFramePosition - 0.5) + 1,
+      0,
+      safeTotalFrames,
+    ),
+    frameOffsetFrames: startFramePosition - frameStart,
+  };
+};
 
 /**
  * Measure K-weighted energy over speech-selected samples only.
@@ -97,7 +150,19 @@ export const resolvePlannerDeliveryMakeupDb = ({
 const meanBodyDb = (spectrumDb: readonly number[]) =>
   (spectrumDb[2] + spectrumDb[3] + spectrumDb[4] + spectrumDb[5]) / 4;
 
+const meanNativeBodyDb = (spectrumDb: readonly number[]) =>
+  (spectrumDb[0] + spectrumDb[1] + spectrumDb[2] + spectrumDb[3]) / 4;
+
 const normalizedZero = (value: number) => (Math.abs(value) < 1e-12 ? 0 : value);
+
+const hasFiniteNativeFinalToneDomain = (
+  spectrumDb: readonly number[] | null | undefined,
+): spectrumDb is readonly number[] =>
+  Boolean(
+    spectrumDb &&
+      spectrumDb.length === 7 &&
+      spectrumDb.every((value) => Number.isFinite(value)),
+  );
 
 /**
  * Reconcile only high-frequency tone that the app added relative to source.
@@ -109,6 +174,8 @@ const normalizedZero = (value: number) => (Math.abs(value) < 1e-12 ? 0 : value);
 export const resolveSourceRelativeFinalTone = (
   sourceSpeechBandSpectrumDb: readonly number[] | null | undefined,
   renderedSpeechBandSpectrumDb: readonly number[] | null | undefined,
+  sourceNativeFinalToneSpectrumDb?: readonly number[] | null,
+  renderedNativeFinalToneSpectrumDb?: readonly number[] | null,
 ): SourceRelativeFinalTone | null => {
   if (
     !sourceSpeechBandSpectrumDb ||
@@ -147,11 +214,39 @@ export const resolveSourceRelativeFinalTone = (
     combinedTrimDb > 0
       ? Math.min(1, FINAL_TONE_COMBINED_MAX_TRIM_DB / combinedTrimDb)
       : 1;
+  let topOctaveExcessDb = 0;
+  let topOctaveTrimDb = 0;
+  if (
+    hasFiniteNativeFinalToneDomain(sourceNativeFinalToneSpectrumDb) &&
+    hasFiniteNativeFinalToneDomain(renderedNativeFinalToneSpectrumDb)
+  ) {
+    const sourceNativeBodyDb = meanNativeBodyDb(sourceNativeFinalToneSpectrumDb);
+    const renderedNativeBodyDb = meanNativeBodyDb(renderedNativeFinalToneSpectrumDb);
+    topOctaveExcessDb = Math.max(
+      0,
+      renderedNativeFinalToneSpectrumDb[6] -
+        renderedNativeBodyDb -
+        (sourceNativeFinalToneSpectrumDb[6] - sourceNativeBodyDb),
+    );
+    // A high-order soft knee keeps sub-dB measurement variance effectively
+    // untouched while remaining mathematically continuous from zero. The
+    // measured 2.8 dB production excess receives ~1.9 dB of static correction.
+    const ratio = topOctaveExcessDb / FINAL_TONE_TOP_OCTAVE_KNEE_DB;
+    const ratioPower = ratio ** 6;
+    topOctaveTrimDb =
+      -FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB *
+      (ratioPower / (1 + ratioPower));
+  }
 
   return {
     fourKhzExcessDb: normalizedZero(fourKhzExcessDb),
     eightKhzExcessDb: normalizedZero(eightKhzExcessDb),
+    topOctaveExcessDb: normalizedZero(topOctaveExcessDb),
     fourKhzTrimDb: normalizedZero(-rawFourKhzTrimDb * budgetScale),
     eightKhzTrimDb: normalizedZero(-rawEightKhzTrimDb * budgetScale),
+    topOctaveTrimDb:
+      topOctaveExcessDb > 0
+        ? topOctaveTrimDb
+        : 0,
   };
 };

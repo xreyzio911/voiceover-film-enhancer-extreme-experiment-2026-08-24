@@ -188,6 +188,14 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "const recoverFinalPolishEvidenceFromExactWav = async (",
     "const runCrossfadeConcat = async (",
   );
+  const virtualEvidenceBlock = sourceBetween(
+    "const measureFinalPolishEvidenceFromVirtualWav = async (",
+    "const recoverFinalPolishEvidenceFromExactWav = async (",
+  );
+  const finalPolishBlock = sourceBetween(
+    "const runFinalAppPolishPass = async",
+    "const analyzeIntegratedLoudness = async",
+  );
   const aggregationBlock = sourceBetween(
     "const aggregateWindowAnalyses = (",
     "type AnalysisOptions =",
@@ -209,7 +217,7 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
   );
   assert.match(
     processFilesBlock,
-    /runFinalAppPolishPass\([\s\S]*?fileAnalysis \?\? null,[\s\S]*?selectedFinalPolishEvidence,[\s\S]*?plannerContext\.plan\?\.targetDb/,
+    /runFinalAppPolishPass\([\s\S]*?sourceFinalPolishEvidence,[\s\S]*?selectedFinalPolishEvidence,[\s\S]*?plannerContext\.plan\?\.targetDb/,
     "the selected candidate's measured post-chain speech level must drive only one static delivery gain",
   );
   assert.match(
@@ -223,18 +231,27 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
   );
   assert.match(exactEvidenceRecoveryBlock, /await ffmpeg\.writeFile\(targetName, cloneBytes\(exactBytes\)\)/);
   assert.match(
-    exactEvidenceRecoveryBlock,
+    virtualEvidenceBlock,
     /"-ar",\s*`\$\{ANALYSIS_SAMPLE_RATE\}`/,
     "fallback evidence must be decoded into the same 16 kHz domain as planner/source analysis",
   );
   assert.match(
-    exactEvidenceRecoveryBlock,
+    virtualEvidenceBlock,
     /measureFinalPolishEvidenceFromAnalysisSamples\(\s*toFloatSamples\(rawBytes\),\s*ANALYSIS_SAMPLE_RATE/,
   );
-  assert.doesNotMatch(
+  assert.match(
     voLevelerSource,
-    /measureFinalPolishEvidenceFromDecodedMono/,
-    "native-rate alignment decodes must never drive 16 kHz planner delivery decisions",
+    /const mergeNativeFinalToneEvidence = \([\s\S]*?measureNativeFinalToneSpectrumDb\(decoded\.monoSamples, decoded\.sampleRate\)/,
+    "native-rate decodes may supply only the missing optional top-octave evidence",
+  );
+  assert.match(
+    processFilesBlock,
+    /candidateFinalPolishEvidence = mergeNativeFinalToneEvidence\([\s\S]*?candidateDecodedForReview/,
+  );
+  assert.match(
+    finalPolishBlock,
+    /resolvePlannerDeliveryMakeupDb\(\{[\s\S]*?speechKWeightedEnergyDb: renderedAnalysis\?\.speechKWeightedEnergyDb/,
+    "native-rate evidence must not replace the established 16 kHz planner delivery measurement",
   );
 });
 
@@ -478,6 +495,55 @@ test("long-form references use bounded native-rate subranges instead of one 16 k
   assert.match(referenceBuilderBlock, /LONG_FORM_REFERENCE_DECODE_SECONDS/);
   assert.match(referenceBuilderBlock, /while \(cursorSample < totalSampleCount/);
   assert.doesNotMatch(referenceBuilderBlock, /GAIN_PLANNER_ANALYSIS_SAMPLE_RATE/);
+});
+
+test("long-form parts use chunk-local planner leveling without the legacy auto-leveler", () => {
+  const rangeMixBlock = sourceBetween(
+    "const runMixReadyRange = async",
+    "const runMixReadySegmented = async",
+  );
+  const rangePlannerBlock = sourceBetween(
+    "const applyPlannerToInputRange = async",
+    "const emptyEnvelopeMetrics =",
+  );
+  const longFormBlock = sourceBetween(
+    "const renderLongFormSafeMode = async",
+    "const safeDeleteFile = async",
+  );
+
+  assert.doesNotMatch(
+    rangeMixBlock,
+    /gainPlannerActive:\s*false/,
+    "the long-form range renderer must not hard-enable the legacy dynaudnorm path",
+  );
+  assertMarkersInOrder(rangePlannerBlock, [
+    "sourceStartSec + localStartSec",
+    "planStartSec: localStartSec",
+    "runCrossfadeConcat(",
+  ]);
+  assertMarkersInOrder(longFormBlock, [
+    "const chunkPlan = await planGainForInput(",
+    "startSec: chunk.startSec",
+    "const leveledChunkName =",
+    "await applyPlannerToInputRange(",
+    "await runMixReadyRange(",
+    "leveledChunkName",
+  ]);
+  assert.match(
+    longFormBlock,
+    /plannerOwnsDynamics:\s*true/,
+    "a no-plan long-form part must fail open without silently restoring legacy broadband dynamics",
+  );
+  assert.doesNotMatch(
+    longFormBlock,
+    /measureFinalPolishEvidenceFromVirtualWav\(/,
+    "memory-bounded long-form delivery must not add a fallible full-part evidence decode",
+  );
+  assert.match(
+    longFormBlock,
+    /runFinalAppPolishPass\(\s*ffmpeg,\s*mixChunkName,\s*null,\s*null,\s*null,/,
+    "long-form parts must remain deliverable through limiter-only final polish when optional evidence is unavailable",
+  );
 });
 
 test("large rendered-candidate QC analyzes bounded WAV windows without restoring whole files after retry", () => {

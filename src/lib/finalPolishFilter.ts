@@ -31,11 +31,15 @@ export const buildFinalPolishFilter = (
   const filters: string[] = [];
   const fourKhzTrimDb = tone ? clamp(finiteOr(tone.fourKhzTrimDb, 0), -0.7, 0) : 0;
   const eightKhzTrimDb = tone ? clamp(finiteOr(tone.eightKhzTrimDb, 0), -0.9, 0) : 0;
+  const topOctaveTrimDb = tone ? clamp(finiteOr(tone.topOctaveTrimDb, 0), -2, 0) : 0;
   if (fourKhzTrimDb < -0.005) {
     filters.push(`equalizer=f=4000:width_type=q:width=1.0:g=${fourKhzTrimDb.toFixed(2)}`);
   }
   if (eightKhzTrimDb < -0.005) {
     filters.push(`equalizer=f=8000:width_type=q:width=0.9:g=${eightKhzTrimDb.toFixed(2)}`);
+  }
+  if (topOctaveTrimDb < -0.005) {
+    filters.push(`highshelf=f=8000:width_type=q:width=0.7:g=${topOctaveTrimDb.toFixed(2)}`);
   }
 
   const makeupGainDb = clamp(

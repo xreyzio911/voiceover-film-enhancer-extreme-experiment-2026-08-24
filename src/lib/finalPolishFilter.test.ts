@@ -8,8 +8,10 @@ import {
 const activeTone = {
   fourKhzExcessDb: 2.4,
   eightKhzExcessDb: 3.2,
+  topOctaveExcessDb: 3.7,
   fourKhzTrimDb: -0.62,
   eightKhzTrimDb: -0.78,
+  topOctaveTrimDb: -1.74,
 };
 
 const assertLinearDeliveryChain = (filter: string) => {
@@ -24,6 +26,7 @@ const assertLinearDeliveryChain = (filter: string) => {
     stages.every(
       (stage) =>
         stage.startsWith("equalizer=") ||
+        stage.startsWith("highshelf=") ||
         stage.startsWith("volume=") ||
         stage === FINAL_POLISH_LIMITER_FILTER,
     ),
@@ -72,6 +75,7 @@ test("final polish emits only measured source-relative trims, static makeup, and
   assertLinearDeliveryChain(filter);
   assert.match(filter, /equalizer=f=4000:width_type=q:width=1\.0:g=-0\.62/);
   assert.match(filter, /equalizer=f=8000:width_type=q:width=0\.9:g=-0\.78/);
+  assert.match(filter, /highshelf=f=8000:width_type=q:width=0\.7:g=-1\.74/);
   assert.match(filter, /volume=7\.450dB/);
 });
 

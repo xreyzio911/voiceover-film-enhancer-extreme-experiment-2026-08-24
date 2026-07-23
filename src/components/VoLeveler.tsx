@@ -36,6 +36,7 @@ import {
 } from "../lib/gainPlanner";
 import {
   computeSpeechKWeightedEnergyDb,
+  resolvePlannerGainFrameRange,
   resolvePlannerDeliveryMakeupDb,
   resolveSourceRelativeFinalTone,
 } from "../lib/plannerDelivery";
@@ -89,6 +90,7 @@ import {
   SPECTRUM_BANDS_HZ,
 } from "../lib/spectrum";
 import { buildFinalPolishFilter } from "../lib/finalPolishFilter";
+import { measureNativeFinalToneSpectrumDb } from "../lib/finalToneEvidence";
 import { planBatchLoudnessAlignment } from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import {
@@ -532,7 +534,10 @@ type FileAnalysis = {
 type FinalPolishEvidence = Pick<
   FileAnalysis,
   "speechBandSpectrumDb" | "speechKWeightedEnergyDb"
->;
+> & {
+  /** Optional native-rate speech spectrum used only for the 10-16 kHz shelf. */
+  nativeFinalToneSpectrumDb?: number[] | null;
+};
 
 type BatchReference = {
   lowTilt: number;
@@ -753,6 +758,21 @@ const measureFinalPolishEvidenceFromAnalysisSamples = (
   } catch {
     return null;
   }
+};
+
+const mergeNativeFinalToneEvidence = (
+  evidence: FinalPolishEvidence | null | undefined,
+  decoded: DecodedMonoAudio | null | undefined,
+): FinalPolishEvidence | null => {
+  const nativeFinalToneSpectrumDb = decoded
+    ? measureNativeFinalToneSpectrumDb(decoded.monoSamples, decoded.sampleRate)
+    : null;
+  if (!evidence && !nativeFinalToneSpectrumDb) return null;
+  return {
+    speechBandSpectrumDb: evidence?.speechBandSpectrumDb ?? null,
+    speechKWeightedEnergyDb: evidence?.speechKWeightedEnergyDb ?? null,
+    nativeFinalToneSpectrumDb,
+  };
 };
 
 export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: boolean }) {
@@ -1806,16 +1826,32 @@ const summarizeFailureReason = (error: unknown) => {
     profile: AdaptiveProfile | null,
     analysis: FileAnalysis | undefined,
     durationSeconds: number | null,
+    range?: Readonly<{
+      startSec: number;
+      durationSec: number;
+    }>,
   ): Promise<PlannedGain | null> => {
     if (!getActiveAudioReviewControls().gainPlannerEnabled) return null;
-    if (durationSeconds !== null && durationSeconds > GAIN_PLANNER_MAX_DURATION_SECONDS) {
+    const plannerDurationSeconds = range?.durationSec ?? durationSeconds;
+    if (
+      plannerDurationSeconds !== null &&
+      plannerDurationSeconds > GAIN_PLANNER_MAX_DURATION_SECONDS
+    ) {
       throw new Error(
-        `duration ${durationSeconds.toFixed(0)}s exceeds planner budget ${GAIN_PLANNER_MAX_DURATION_SECONDS}s`,
+        `duration ${plannerDurationSeconds.toFixed(0)}s exceeds planner budget ${GAIN_PLANNER_MAX_DURATION_SECONDS}s`,
       );
     }
 
     const wavName = `${sanitizeBase(inputName)}_planner_env.wav`;
     try {
+      const inputRangeArgs = range
+        ? [
+            "-ss",
+            Math.max(0, range.startSec).toFixed(6),
+            "-t",
+            Math.max(0, range.durationSec).toFixed(6),
+          ]
+        : [];
       resetLogBuffer();
       await execOrThrow(
         ffmpeg,
@@ -1827,6 +1863,7 @@ const summarizeFailureReason = (error: unknown) => {
           "-filter_threads",
           "1",
           "-y",
+          ...inputRangeArgs,
           "-i",
           inputName,
           "-ar",
@@ -2060,6 +2097,10 @@ const summarizeFailureReason = (error: unknown) => {
     startSec: number,
     durationSec: number,
     referenceCapture?: PlannerRangeReferenceCapture,
+    options?: Readonly<{
+      /** Gain-plan time can be local even when the source range is absolute. */
+      planStartSec?: number;
+    }>,
   ) => {
     const rawName = `${outputName}.raw.wav`;
     let referenceError: string | null = null;
@@ -2117,12 +2158,15 @@ const summarizeFailureReason = (error: unknown) => {
         }
       }
 
-      // Slice the gain curve to just the frames covering [startSec, startSec+durationSec).
-      const frameStart = Math.max(0, Math.floor((startSec * 1000) / plan.frameMs));
-      const frameEnd = Math.min(
-        plan.gainCurve.length,
-        Math.ceil(((startSec + durationSec) * 1000) / plan.frameMs),
-      );
+      // Long-form part plans are range-local even though the source decode
+      // starts at an absolute file offset.
+      const { frameStart, frameEnd, frameOffsetFrames } =
+        resolvePlannerGainFrameRange({
+        planStartSec: options?.planStartSec ?? startSec,
+        durationSec,
+        frameMs: plan.frameMs,
+        totalFrames: plan.gainCurve.length,
+      });
       const gainSlice = frameStart < frameEnd
         ? plan.gainCurve.slice(frameStart, frameEnd)
         : new Float32Array([1]);
@@ -2133,6 +2177,8 @@ const summarizeFailureReason = (error: unknown) => {
         PLANNER_APPLY_SAMPLE_RATE,
         decoded.channels, // should always be 1 given our decode args
         plan.frameMs,
+        undefined,
+        frameOffsetFrames,
       );
       const wav = encodeWavFloat32(leveled, PLANNER_APPLY_SAMPLE_RATE, decoded.channels);
       await ffmpeg.writeFile(outputName, wav);
@@ -2242,6 +2288,88 @@ const summarizeFailureReason = (error: unknown) => {
     } finally {
       for (const name of chunkNames) {
         await safeDeleteFile(ffmpeg, name);
+      }
+    }
+  };
+
+  /**
+   * Apply a part-local plan to one absolute source range.
+   *
+   * The 16 kHz plan is bounded to one exported long-form part. Native apply
+   * remains 60-second chunked with overlap/crossfade, so the browser never
+   * decodes or levels the complete feature-length file in JavaScript.
+   */
+  const applyPlannerToInputRange = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    outputName: string,
+    plan: PlannedGain,
+    sourceStartSec: number,
+  ) => {
+    const total = plan.durationSec;
+    const chunkSeconds = PLANNER_APPLY_CHUNK_SECONDS_LONG;
+    if (total <= chunkSeconds) {
+      await levelInputRange(
+        ffmpeg,
+        inputName,
+        outputName,
+        plan,
+        sourceStartSec,
+        total,
+        undefined,
+        { planStartSec: 0 },
+      );
+      return;
+    }
+
+    const localStarts: number[] = [];
+    const nativeSpans: number[] = [];
+    for (let cursor = 0; cursor < total - 0.01; cursor += chunkSeconds) {
+      localStarts.push(cursor);
+      nativeSpans.push(Math.min(chunkSeconds, total - cursor));
+    }
+
+    const chunkNames: string[] = [];
+    try {
+      for (let index = 0; index < localStarts.length; index += 1) {
+        const isLast = index === localStarts.length - 1;
+        const localStartSec = localStarts[index];
+        const durationSec = isLast
+          ? nativeSpans[index]
+          : Math.min(
+              nativeSpans[index] + CHUNK_CROSSFADE_SECONDS,
+              total - localStartSec,
+            );
+        const chunkName = `${sanitizeBase(outputName)}_range_chunk_${index}.wav`;
+        await levelInputRange(
+          ffmpeg,
+          inputName,
+          chunkName,
+          plan,
+          sourceStartSec + localStartSec,
+          durationSec,
+          undefined,
+          { planStartSec: localStartSec },
+        );
+        chunkNames.push(chunkName);
+      }
+
+      await runCrossfadeConcat(
+        ffmpeg,
+        chunkNames,
+        outputName,
+        CHUNK_CROSSFADE_SECONDS,
+        "Long-form planner apply crossfade",
+      );
+      await logDurationDelta(
+        ffmpeg,
+        "Long-form planner apply crossfade",
+        total,
+        outputName,
+      );
+    } finally {
+      for (const chunkName of chunkNames) {
+        await safeDeleteFile(ffmpeg, chunkName);
       }
     }
   };
@@ -4622,6 +4750,8 @@ const summarizeFailureReason = (error: unknown) => {
       : resolveSourceRelativeFinalTone(
           sourceAnalysis?.speechBandSpectrumDb,
           renderedAnalysis?.speechBandSpectrumDb,
+          sourceAnalysis?.nativeFinalToneSpectrumDb,
+          renderedAnalysis?.nativeFinalToneSpectrumDb,
         );
     const makeupGainDb = sourceSafePolish
       ? 0
@@ -4643,6 +4773,8 @@ const summarizeFailureReason = (error: unknown) => {
           sourceRelativeTone ? sourceRelativeTone.fourKhzTrimDb.toFixed(2) : "0.00"
         } dB / 8 kHz ${
           sourceRelativeTone ? sourceRelativeTone.eightKhzTrimDb.toFixed(2) : "0.00"
+        } dB / top octave ${
+          sourceRelativeTone ? sourceRelativeTone.topOctaveTrimDb.toFixed(2) : "0.00"
         } dB, static planner makeup +${makeupGainDb.toFixed(
           2,
         )} dB, then delivery limiter (${formatBytes(inputByteLength)}).`,
@@ -4852,10 +4984,19 @@ const summarizeFailureReason = (error: unknown) => {
     startSec: number,
     durationSec: number,
     options?: MixRenderOptions,
+    rangeOptions?: Readonly<{
+      plannerLeveledInputName?: string | null;
+      plannerOwnsDynamics?: boolean;
+    }>,
   ) => {
+    const plannerLeveledInputName = rangeOptions?.plannerLeveledInputName ?? null;
+    const chainInput = plannerLeveledInputName ?? inputName;
+    const chainStartSec = plannerLeveledInputName ? 0 : startSec;
     const filterChain = buildMixFilter(profile, {
       ...options,
-      gainPlannerActive: false,
+      gainPlannerActive:
+        Boolean(plannerLeveledInputName) ||
+        rangeOptions?.plannerOwnsDynamics === true,
     });
     resetLogBuffer();
     await execOrThrow(
@@ -4869,11 +5010,11 @@ const summarizeFailureReason = (error: unknown) => {
         "1",
         "-y",
         "-ss",
-        startSec.toFixed(3),
+        chainStartSec.toFixed(3),
         "-t",
         durationSec.toFixed(3),
         "-i",
-        inputName,
+        chainInput,
         "-af",
         filterChain,
         "-ar",
@@ -6143,6 +6284,7 @@ const summarizeFailureReason = (error: unknown) => {
     ffmpeg: FFmpeg,
     job: JobEntry,
     profile: AdaptiveProfile | null,
+    analysis: FileAnalysis | undefined,
     durationSeconds: number,
     fileIndex: number,
     totalFiles: number,
@@ -6177,8 +6319,45 @@ const summarizeFailureReason = (error: unknown) => {
       const blendLoudChunkName =
         loudnessConfig && sceneBlend ? `${job.base}_${partTag}_blend_${loudnessConfig.suffix}.wav` : null;
       let blendRendered = false;
+      let plannerLeveledChunkName: string | null = null;
 
       try {
+        const chunkPlan = await planGainForInput(
+          ffmpeg,
+          job.inputName,
+          profile,
+          analysis,
+          chunk.durationSec,
+          {
+            startSec: chunk.startSec,
+            durationSec: chunk.durationSec,
+          },
+        );
+        const leveledChunkName = chunkPlan
+          ? `${job.base}_${partTag}_planner_leveled.wav`
+          : null;
+        plannerLeveledChunkName = leveledChunkName;
+        if (chunkPlan && leveledChunkName) {
+          await applyPlannerToInputRange(
+            ffmpeg,
+            job.inputName,
+            leveledChunkName,
+            chunkPlan,
+            chunk.startSec,
+          );
+          appendLog(
+            `[LongForm] ${job.base} ${partTag}: chunk-local planner leveled ${chunkPlan.speechRunCount} speech runs to ${chunkPlan.targetDb.toFixed(
+              1,
+            )} dB.`,
+          );
+        } else {
+          appendLog(
+            `[LongForm] ${job.base} ${partTag}: no usable chunk-local speech plan; using source-preserving static chain without legacy broadband dynamics.`,
+          );
+        }
+        const chunkCandidateVariant: CandidateVariant = chunkPlan
+          ? candidateVariant
+          : "source-safe";
         const chunkConsonantReference = await buildConsonantReferenceForInputRange(
           ffmpeg,
           job.inputName,
@@ -6192,13 +6371,19 @@ const summarizeFailureReason = (error: unknown) => {
           ffmpeg,
           job.inputName,
           mixChunkName,
-          profile,
+          chunkPlan ? profile : null,
           chunk.startSec,
           chunk.durationSec,
           {
-            candidateVariant,
+            candidateVariant: chunkCandidateVariant,
             forceEndingProtection: true,
             skipSpeechSegmentation: true,
+            disableRoomCleanup: chunkPlan ? undefined : true,
+            disableAdaptiveNoiseReduction: chunkPlan ? undefined : true,
+          },
+          {
+            plannerLeveledInputName: leveledChunkName,
+            plannerOwnsDynamics: true,
           },
         );
         const chunkPolishFfmpeg = ffmpeg;
@@ -6211,7 +6396,8 @@ const summarizeFailureReason = (error: unknown) => {
           {
             base: job.base,
             detail: `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}, final app polish`,
-            candidateVariant,
+            candidateVariant: chunkCandidateVariant,
+            sourceSafeChain: !chunkPlan,
           },
         );
         ffmpeg = chunkPolish.ffmpeg;
@@ -6313,6 +6499,9 @@ const summarizeFailureReason = (error: unknown) => {
           ).toFixed(1)}s).`,
         );
       } finally {
+        if (plannerLeveledChunkName) {
+          await safeDeleteFile(ffmpeg, plannerLeveledChunkName);
+        }
         await safeDeleteFile(ffmpeg, mixChunkName);
         await safeDeleteFile(ffmpeg, blendChunkName);
         if (loudChunkName) await safeDeleteFile(ffmpeg, loudChunkName);
@@ -6346,13 +6535,11 @@ const summarizeFailureReason = (error: unknown) => {
     }
   };
 
-  const recoverFinalPolishEvidenceFromExactWav = async (
+  const measureFinalPolishEvidenceFromVirtualWav = async (
     ffmpeg: FFmpeg,
     targetName: string,
-    exactBytes: Uint8Array,
   ): Promise<FinalPolishEvidence | null> => {
     const rawName = `${sanitizeBase(targetName)}_final_polish_evidence.f32`;
-    await ffmpeg.writeFile(targetName, cloneBytes(exactBytes));
     try {
       resetLogBuffer();
       await execOrThrow(
@@ -6387,6 +6574,15 @@ const summarizeFailureReason = (error: unknown) => {
     } finally {
       await safeDeleteFile(ffmpeg, rawName);
     }
+  };
+
+  const recoverFinalPolishEvidenceFromExactWav = async (
+    ffmpeg: FFmpeg,
+    targetName: string,
+    exactBytes: Uint8Array,
+  ): Promise<FinalPolishEvidence | null> => {
+    await ffmpeg.writeFile(targetName, cloneBytes(exactBytes));
+    return measureFinalPolishEvidenceFromVirtualWav(ffmpeg, targetName);
   };
 
   /**
@@ -7687,6 +7883,7 @@ const summarizeFailureReason = (error: unknown) => {
               ffmpeg,
               job,
               profile,
+              fileAnalysis,
               longFormDurationSeconds,
               i,
               jobs.length,
@@ -7734,6 +7931,10 @@ const summarizeFailureReason = (error: unknown) => {
           if (fileDurationForVariants === null) {
             fileDurationForVariants = sourceDecodedForReview?.durationSec ?? null;
           }
+          const sourceFinalPolishEvidence = mergeNativeFinalToneEvidence(
+            fileAnalysis ?? null,
+            sourceDecodedForReview,
+          );
 
           const plannerContext = await preparePlannerRenderContext(
             ffmpeg,
@@ -7956,6 +8157,10 @@ const summarizeFailureReason = (error: unknown) => {
                   }
                 }
               }
+              candidateFinalPolishEvidence = mergeNativeFinalToneEvidence(
+                candidateFinalPolishEvidence,
+                candidateDecodedForReview,
+              );
               const alignment = useBoundedCandidateReviewMemory
                 ? buildDurationOnlyAlignmentMetrics(
                     fileDurationForVariants,
@@ -8144,7 +8349,7 @@ const summarizeFailureReason = (error: unknown) => {
             const polishResult = await runFinalAppPolishPass(
               ffmpeg,
               job.mixName,
-              fileAnalysis ?? null,
+              sourceFinalPolishEvidence,
               selectedFinalPolishEvidence,
               plannerContext.plan?.targetDb,
               {
@@ -8486,12 +8691,12 @@ const summarizeFailureReason = (error: unknown) => {
                     const correctiveBytesBeforePolish = await readVirtualFileBytes(ffmpeg, correctiveName);
                     const correctiveMeasurementFfmpeg = ffmpeg;
                     let correctiveFinalPolishEvidence: FinalPolishEvidence | null = null;
+                    const useBoundedCorrectiveMeasurement = shouldUseBoundedCandidateQc(
+                      candidateQcSafeDurationSeconds,
+                      correctiveBytesBeforePolish.byteLength,
+                      job.file.size,
+                    );
                     try {
-                      const useBoundedCorrectiveMeasurement = shouldUseBoundedCandidateQc(
-                        candidateQcSafeDurationSeconds,
-                        correctiveBytesBeforePolish.byteLength,
-                        job.file.size,
-                      );
                       const correctiveAnalysisResult = useBoundedCorrectiveMeasurement
                         ? await analyzeRenderedPcmWindows(
                             ffmpeg,
@@ -8553,11 +8758,29 @@ const summarizeFailureReason = (error: unknown) => {
                         );
                       }
                     }
+                    let correctiveDecodedForFinalTone: DecodedMonoAudio | null = null;
+                    if (!useBoundedCorrectiveMeasurement) {
+                      try {
+                        correctiveDecodedForFinalTone = decodeWavToMono(
+                          correctiveBytesBeforePolish,
+                        );
+                      } catch (error) {
+                        appendLog(
+                          `[FinalPolish] ${job.base}: native corrective top-octave evidence unavailable (${describeError(
+                            error,
+                          )}).`,
+                        );
+                      }
+                    }
+                    correctiveFinalPolishEvidence = mergeNativeFinalToneEvidence(
+                      correctiveFinalPolishEvidence,
+                      correctiveDecodedForFinalTone,
+                    );
                     const correctivePolishFfmpeg = ffmpeg;
                     const correctivePolish = await runFinalAppPolishPass(
                       ffmpeg,
                       correctiveName,
-                      fileAnalysis ?? null,
+                      sourceFinalPolishEvidence,
                       correctiveFinalPolishEvidence,
                       correctivePlannerContext.plan?.targetDb,
                       {
@@ -9393,8 +9616,8 @@ const summarizeFailureReason = (error: unknown) => {
               <div className={styles.label}>
                 Plans a gain curve from the actual sentences before any compressor runs. This is the core
                 fix for sudden volume spikes. Classifies breaths and short onomatopoeia runs separately so
-                they sit with the performance instead of spiking above it. Handles batch-episode files up
-                to 80 minutes (longer files fall back to the legacy leveler).
+                they sit with the performance instead of spiking above it. Files over 80 minutes use
+                the same planner in memory-bounded, chunk-local parts.
               </div>
             </div>
             <input

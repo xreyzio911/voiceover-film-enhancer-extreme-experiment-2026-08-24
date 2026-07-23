@@ -217,6 +217,9 @@ const K_WEIGHT_STAGE1_HIGH_SHELF_HZ = 1681.974450955533;
 const K_WEIGHT_STAGE1_GAIN_DB = 4;
 const K_WEIGHT_STAGE2_HIGH_PASS_HZ = 38.13547087602444;
 const K_WEIGHT_STAGE2_Q = 0.5;
+const BODY_GAIN_VALLEY_INNER_SHOULDER_MS = 60;
+const BODY_GAIN_VALLEY_OUTER_SHOULDER_MS = 140;
+const BODY_GAIN_VALLEY_RELAXATION_BLEND = 0.7;
 
 /**
  * Relax millisecond-scale attenuation caps without widening their ownership.
@@ -493,6 +496,114 @@ const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => 
     sumPower += Math.pow(10, frameDb[i] / 10);
   }
   return 10 * Math.log10(sumPower / (b - a) + 1e-30);
+};
+
+/**
+ * Continuously relax short processing-added output valleys inside body speech.
+ *
+ * A centered micro-ride can turn energy in nearby phonemes into a brief gain
+ * notch at the current phoneme. Source plus gain is compared with the source
+ * alone, so an intentional correction of a loud phoneme, an unchanged natural
+ * dip, and a sustained or monotonic low passage all veto their own lift.
+ * Independent left/right shoulder means also keep trends from looking like a
+ * valley. There is no engagement threshold: even an arbitrarily shallow
+ * processing-added valley gets an arbitrarily shallow correction. The
+ * response is lift-only, and missing two-sided body context fails open so
+ * attacks, releases, and run edges remain untouched.
+ */
+export const relaxNarrowBodySpeechGainValleys = (
+  gainDbCurve: Float32Array,
+  sourceFrameDb: ArrayLike<number>,
+  bodySpeechRuns: readonly SpeechRun[],
+  frameMs = 10,
+): Float32Array => {
+  const relaxedGainDbCurve = new Float32Array(gainDbCurve);
+  if (sourceFrameDb.length !== gainDbCurve.length) return relaxedGainDbCurve;
+  const effectiveFrameMs = Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 10;
+  const innerShoulderFrames = Math.max(
+    1,
+    Math.round(BODY_GAIN_VALLEY_INNER_SHOULDER_MS / effectiveFrameMs),
+  );
+  const outerShoulderFrames = Math.max(
+    innerShoulderFrames,
+    Math.round(BODY_GAIN_VALLEY_OUTER_SHOULDER_MS / effectiveFrameMs),
+  );
+
+  for (const run of bodySpeechRuns) {
+    const startFrame = clamp(Math.trunc(run.startFrame), 0, gainDbCurve.length);
+    const endFrame = clamp(Math.trunc(run.endFrame), startFrame, gainDbCurve.length);
+    for (let frame = startFrame; frame < endFrame; frame += 1) {
+      if (
+        frame - outerShoulderFrames < startFrame ||
+        frame + outerShoulderFrames >= endFrame
+      ) {
+        continue;
+      }
+
+      let leftSourceShoulderSumDb = 0;
+      let rightSourceShoulderSumDb = 0;
+      let leftOutputShoulderSumDb = 0;
+      let rightOutputShoulderSumDb = 0;
+      let shoulderFrameCount = 0;
+      let hasValidEvidence = Number.isFinite(sourceFrameDb[frame]) &&
+        Number.isFinite(gainDbCurve[frame]);
+      for (
+        let offset = innerShoulderFrames;
+        offset <= outerShoulderFrames;
+        offset += 1
+      ) {
+        const leftFrame = frame - offset;
+        const rightFrame = frame + offset;
+        const leftSourceDb = sourceFrameDb[leftFrame];
+        const rightSourceDb = sourceFrameDb[rightFrame];
+        const leftGainDb = gainDbCurve[leftFrame];
+        const rightGainDb = gainDbCurve[rightFrame];
+        if (
+          !Number.isFinite(leftSourceDb) ||
+          !Number.isFinite(rightSourceDb) ||
+          !Number.isFinite(leftGainDb) ||
+          !Number.isFinite(rightGainDb)
+        ) {
+          hasValidEvidence = false;
+          break;
+        }
+        leftSourceShoulderSumDb += leftSourceDb;
+        rightSourceShoulderSumDb += rightSourceDb;
+        leftOutputShoulderSumDb += leftSourceDb + leftGainDb;
+        rightOutputShoulderSumDb += rightSourceDb + rightGainDb;
+        shoulderFrameCount += 1;
+      }
+      if (!hasValidEvidence || shoulderFrameCount === 0) continue;
+
+      const sourceShoulderDb = Math.min(
+        leftSourceShoulderSumDb / shoulderFrameCount,
+        rightSourceShoulderSumDb / shoulderFrameCount,
+      );
+      const outputShoulderDb = Math.min(
+        leftOutputShoulderSumDb / shoulderFrameCount,
+        rightOutputShoulderSumDb / shoulderFrameCount,
+      );
+      const sourceCenterDb = sourceFrameDb[frame];
+      const originalGainDb = gainDbCurve[frame];
+      const sourceConcavityDb = sourceShoulderDb - sourceCenterDb;
+      const outputConcavityDb =
+        outputShoulderDb - (sourceCenterDb + originalGainDb);
+      const processingAddedConcavityDb =
+        outputConcavityDb - sourceConcavityDb;
+      const repairableConcavityDb = Math.max(
+        0,
+        Math.min(outputConcavityDb, processingAddedConcavityDb),
+      );
+      const proportionalLiftDb =
+        repairableConcavityDb * BODY_GAIN_VALLEY_RELAXATION_BLEND;
+      relaxedGainDbCurve[frame] = Math.max(
+        relaxedGainDbCurve[frame],
+        originalGainDb + proportionalLiftDb,
+      );
+    }
+  }
+
+  return relaxedGainDbCurve;
 };
 
 /**
@@ -1081,16 +1192,18 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
   }
 
-  // 6) No additional slew limiting. Every transition in `gainDbCurve` is
-  //    already explicitly shaped:
-  //      - attack: 80 ms cos² rising ramp (sits in preceding silence)
-  //      - release: 500 ms cos² falling ramp (sits in following silence)
-  //      - intra-run micro-ride: bounded to ±microRideDb over a 200 ms
-  //        window = at most ~7 dB/sec slope
-  //    A slew limiter here would actively fight those intended curves and
-  //    produce under-powered attacks (the first syllable gets ducked
-  //    because the slew can't catch up to body gain in 80 ms).
-  const slewed = gainDbCurve;
+  // 6) Preserve the explicit attack/release shapes, then continuously relax
+  //    only short downward concavities created by the centered micro-ride.
+  //    Symmetric context rejects a simple level trend, and lift-only response
+  //    cannot create a new dip or attenuate a performance transient.
+  const slewed = relaxNarrowBodySpeechGainValleys(
+    gainDbCurve,
+    input.frameDb,
+    runMeta
+      .filter(({ runClass }) => runClass === "body-speech")
+      .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
+    frameMs,
+  );
 
   // 7) LOCALIZED absolute-peak guard.
   //
@@ -1336,18 +1449,23 @@ export const applyGainCurveToSamples = (
   channels: number,
   frameMs: number,
   outSamples?: Float32Array,
+  frameOffsetFrames = 0,
 ): Float32Array => {
   const out = outSamples ?? new Float32Array(samples.length);
   const samplesPerFrame = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
   const framesPerSec = 1000 / frameMs;
   const centerOffset = samplesPerFrame / 2;
+  const safeFrameOffsetFrames = Number.isFinite(frameOffsetFrames)
+    ? frameOffsetFrames
+    : 0;
   const totalFrames = gainCurve.length;
   const sampleCount = samples.length;
   const frameCountByChannel = Math.floor(sampleCount / channels);
 
   for (let sIdx = 0; sIdx < frameCountByChannel; sIdx += 1) {
     // position in frame units, offset so gains line up at frame midpoints
-    const framePos = (sIdx - centerOffset) / samplesPerFrame;
+    const framePos =
+      (sIdx - centerOffset) / samplesPerFrame + safeFrameOffsetFrames;
     const f0 = Math.max(0, Math.min(totalFrames - 1, Math.floor(framePos)));
     const f1 = Math.max(0, Math.min(totalFrames - 1, f0 + 1));
     const mix = Math.max(0, Math.min(1, framePos - f0));
