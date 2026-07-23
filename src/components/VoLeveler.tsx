@@ -3965,8 +3965,9 @@ const summarizeFailureReason = (error: unknown) => {
         const gateAmp = fromDb(gateDb);
         const safetyF = 161;
         const safetyG = toOddInt(3 * levelerAdaptationScale, 3, 9);
+        const baseSecondaryMaxGainFactor = toOddInt(5 * levelerAdaptationScale, 3, 11);
         const secondaryMaxGainFactor = resolvePlannerSecondaryMaxGainFactor({
-          baseMaxGainFactor: 5,
+          baseMaxGainFactor: baseSecondaryMaxGainFactor,
           speechDutyCyclePct: profile?.speechDutyCyclePct ?? null,
           speechSegmentCount: profile?.speechSegmentCount ?? null,
         });
@@ -7510,7 +7511,7 @@ const summarizeFailureReason = (error: unknown) => {
                 fileAnalysis?.analysisConfidence ?? 0
               ).toFixed(2)}, tail-gate ${profile.useTailGate ? "on" : "off"}${
                 profile.preserveEndings ? " (endings protect)" : ""
-              }${profile.strictEndingProtection ? " [strict]" : ""}, dyna ${dynaPreview}, echo ${
+              }${profile.strictEndingProtection ? " [strict]" : ""}, dyna preview ${dynaPreview}, echo ${
                 fileAnalysis?.echoDelayMs ?? 0
               } ms, blend ${
                 (profile.blendIndoorGain * 100).toFixed(1)

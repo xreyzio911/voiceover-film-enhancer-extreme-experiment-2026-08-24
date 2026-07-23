@@ -42,6 +42,15 @@ test("dense or well-sampled speech preserves the existing secondary dynamics ran
     5,
     "many measured runs remain well sampled even when a long file has low duty cycle",
   );
+  const scaledDenseFactor = resolvePlannerSecondaryMaxGainFactor({
+    baseMaxGainFactor: 7,
+    speechDutyCyclePct: 36,
+    speechSegmentCount: 24,
+  });
+  assert.ok(
+    Math.abs(scaledDenseFactor - 7) < 1e-12,
+    "well-sampled speech must retain the caller's existing adaptive ceiling",
+  );
 });
 
 test("secondary lift changes continuously and fails open when density evidence is unavailable", () => {

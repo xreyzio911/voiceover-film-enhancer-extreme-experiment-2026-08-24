@@ -181,11 +181,16 @@ test("planner-active secondary dynamics use continuous speech evidence instead o
     "const runMixReady = async",
   );
 
+  assert.match(
+    mixFilterBlock,
+    /const baseSecondaryMaxGainFactor = toOddInt\(5 \* levelerAdaptationScale, 3, 11\)/,
+  );
   assert.match(mixFilterBlock, /resolvePlannerSecondaryMaxGainFactor\(\{/);
+  assert.match(mixFilterBlock, /baseMaxGainFactor: baseSecondaryMaxGainFactor/);
   assert.match(mixFilterBlock, /speechDutyCyclePct: profile\?\.speechDutyCyclePct \?\? null/);
   assert.match(mixFilterBlock, /speechSegmentCount: profile\?\.speechSegmentCount \?\? null/);
   assert.match(mixFilterBlock, /m=\$\{secondaryMaxGainFactor\.toFixed\(3\)\}/);
-  assert.doesNotMatch(mixFilterBlock, /toOddInt\(5 \* levelerAdaptationScale, 3, 11\)/);
+  assert.doesNotMatch(mixFilterBlock, /baseMaxGainFactor:\s*5[,}]/);
 });
 
 test("speech-only spectrum drives tone, tilts, and de-essing without changing the QC speech mask", () => {
