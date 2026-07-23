@@ -108,6 +108,16 @@ test("distributed speech spectra recompute de-esser depth from the aggregated ev
   ]);
 });
 
+test("window QC carries the measured sentence-jump and breath-spike evidence into aggregation", () => {
+  const windowAnalysisBlock = sourceBetween(
+    "const analyzeFileWindow = async",
+    "const aggregateWindowAnalyses = (",
+  );
+
+  assert.match(windowAnalysisBlock, /analysis\.sentenceJumpScore = envelope\.sentenceJumpScore/);
+  assert.match(windowAnalysisBlock, /analysis\.breathSpikeRisk = envelope\.breathSpikeRisk/);
+});
+
 test("de-esser depth follows a continuous evidence curve without the legacy engagement gate", () => {
   const mixFilterBlock = sourceBetween(
     "const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions)",
@@ -299,6 +309,10 @@ test("large rendered-candidate QC analyzes bounded WAV windows without restoring
     /ffmpeg\.writeFile\(windowName, cloneBytes\(boundedWindow\.bytes\)\)/,
     "each worker attempt needs its own transferable copy so a failed write cannot detach the retry bytes",
   );
+  assert.match(boundedQcBlock, /analysisWindowsAttempted: windows\.length/);
+  assert.match(boundedQcBlock, /analysisWindowsSucceeded: windowAnalyses\.length/);
+  assert.match(boundedQcBlock, /analysisWindowsDropped: windowDropCount/);
+  assert.match(processFilesBlock, /applyCandidateMeasurementWindowSummary\(candidateMeta, analysisResult\.windowSummary\)/);
   assert.match(processFilesBlock, /shouldUseBoundedCandidateQc[\s\S]*?analyzeRenderedPcmWindows\(/);
 });
 
@@ -373,7 +387,7 @@ test("sampled candidate QC stays advisory instead of authorizing a file-wide cor
     "const downloadOutputsSequentially = async",
   );
 
-  assert.match(scoreBuilderBlock, /resolveCandidateMeasurementStatus\(/);
+  assert.match(scoreBuilderBlock, /buildCandidateScoreFromAnalysis\(analysis\)/);
   assert.match(
     processFilesBlock,
     /const hasFileScopedCorrectiveEvidence[\s\S]*?measurementStatus === "measured"/,

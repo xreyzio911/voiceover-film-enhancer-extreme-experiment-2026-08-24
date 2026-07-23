@@ -7,8 +7,12 @@ import {
   buildReviewMetricDelta,
   estimateAlignmentMetrics,
   fitLearnedReviewWeights,
+  formatCandidateAcousticReviewValue,
+  isCandidateAcousticQcAvailable,
+  isCandidateAcousticQcCompleteForAutomatedReview,
   parseLearnedReviewWeights,
   parseReviewDecisionJsonl,
+  resolveAutomatedReviewDraftVerdict,
   resolveCorrectiveMaxFilesPerBatch,
   scoreCandidateWithLearnedWeights,
   serializeReviewDecisionJsonl,
@@ -171,6 +175,94 @@ const buildManifest = (bundleId: string): ReviewBundleManifest => {
     ],
   };
 };
+
+test("candidate acoustic QC availability preserves legacy and partial evidence while rejecting unavailable evidence", () => {
+  const manifest = buildManifest("bundle-acoustic-availability");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  assert.equal(isCandidateAcousticQcAvailable(winner), true);
+  assert.equal(
+    isCandidateAcousticQcAvailable({
+      ...winner,
+      baselineScore: buildScore({ measurementStatus: "partial" }),
+    }),
+    true,
+  );
+  assert.equal(isCandidateAcousticQcAvailable({ ...winner, qc: null }), false);
+  assert.equal(
+    isCandidateAcousticQcAvailable({
+      ...winner,
+      baselineScore: buildScore({ measurementStatus: "unavailable" }),
+    }),
+    false,
+  );
+  assert.equal(isCandidateAcousticQcCompleteForAutomatedReview(winner), true);
+  assert.equal(
+    isCandidateAcousticQcCompleteForAutomatedReview({
+      ...winner,
+      baselineScore: buildScore({ measurementStatus: "partial" }),
+    }),
+    false,
+  );
+});
+
+test("unavailable candidate score presentation masks rank-derived fallback numbers", () => {
+  const manifest = buildManifest("bundle-acoustic-value-presentation");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  assert.equal(formatCandidateAcousticReviewValue(winner, 278.44, 1), "278.4");
+  assert.equal(
+    formatCandidateAcousticReviewValue(
+      {
+        ...winner,
+        baselineScore: buildScore({ measurementStatus: "unavailable" }),
+      },
+      100123.4,
+      1,
+    ),
+    "n/a — QC unavailable",
+  );
+});
+
+test("automated review draft verdict remains pending when selected acoustic QC is unavailable", () => {
+  const measuredManifest = buildManifest("bundle-measured-draft-verdict");
+  assert.equal(resolveAutomatedReviewDraftVerdict(measuredManifest, "pass"), "pass");
+
+  const unavailableManifest = buildManifest("bundle-unavailable-draft-verdict");
+  const winner = unavailableManifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+  const manifestWithUnavailableWinner = {
+    ...unavailableManifest,
+    candidates: unavailableManifest.candidates.map((candidate) =>
+      candidate.role === "winner"
+        ? {
+            ...candidate,
+            baselineScore: buildScore({ measurementStatus: "unavailable" }),
+          }
+        : candidate,
+    ),
+  } satisfies ReviewBundleManifest;
+
+  assert.equal(resolveAutomatedReviewDraftVerdict(manifestWithUnavailableWinner, "fail"), null);
+
+  const manifestWithPartialWinner = {
+    ...measuredManifest,
+    candidates: measuredManifest.candidates.map((candidate) =>
+      candidate.role === "winner"
+        ? {
+            ...candidate,
+            baselineScore: buildScore({ measurementStatus: "partial" }),
+          }
+        : candidate,
+    ),
+  } satisfies ReviewBundleManifest;
+  assert.equal(resolveAutomatedReviewDraftVerdict(manifestWithPartialWinner, "pass"), null);
+});
 
 test("parseLearnedReviewWeights merges valid input and rejects invalid payloads", () => {
   const parsed = parseLearnedReviewWeights({
@@ -622,6 +714,9 @@ test("autoReviewBundle does not infer acoustic defects or correction from unavai
     false,
   );
   assert.match(auto.selectedAssessment.summary, /acoustic QC unavailable/i);
+  assert.match(auto.executiveSummary, /verdict withheld pending manual listening/i);
+  assert.match(auto.note, /verdict withheld pending manual listening/i);
+  assert.doesNotMatch(auto.note, /Selected output verdict:/);
   assert.equal(
     shouldAttemptCorrectivePassForAssessment(
       auto.selectedAssessment,
@@ -629,6 +724,142 @@ test("autoReviewBundle does not infer acoustic defects or correction from unavai
     ),
     false,
   );
+});
+
+test("autoReviewBundle ignores a populated QC snapshot explicitly marked unavailable", () => {
+  const manifest = buildManifest("bundle-explicit-qc-unavailable");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  const unavailableQc = toReviewMetricSnapshot({
+    inputTP: 0,
+    overallRisk: 1,
+    instabilityScore: 1,
+    sentenceJumpScore: 1,
+    pauseNoiseRisk: 1,
+    compressionScore: 1,
+    clickScore: 1,
+    echoScore: 1,
+    endFadeRiskScore: 1,
+    sibilanceScore: 1,
+  });
+  const manifestWithUnavailableWinner = {
+    ...manifest,
+    candidates: manifest.candidates.map((candidate) =>
+      candidate.role === "winner"
+        ? {
+            ...candidate,
+            baselineScore: buildScore({ measurementStatus: "unavailable" }),
+            qc: unavailableQc,
+            sourceComparison: {
+              ...candidate.sourceComparison,
+              qcDelta: buildReviewMetricDelta(manifest.source.qc, unavailableQc),
+            },
+          }
+        : candidate,
+    ),
+  } satisfies ReviewBundleManifest;
+
+  const auto = autoReviewBundle(manifestWithUnavailableWinner);
+  const acousticFindingIds = new Set([
+    "level-continuity",
+    "cold-open",
+    "pause-bed",
+    "dynamic-control",
+    "endings",
+    "end-edge-dip",
+    "sibilance",
+    "echo-room",
+    "clicks-artifacts",
+    "noise-contrast",
+  ]);
+
+  assert.equal(
+    auto.selectedAssessment.findings.some((finding) => acousticFindingIds.has(finding.id)),
+    false,
+  );
+  assert.match(auto.executiveSummary, /verdict withheld pending manual listening/i);
+});
+
+test("autoReviewBundle keeps sampled partial QC advisory instead of auto-labeling acoustic checks", () => {
+  const manifest = buildManifest("bundle-partial-qc-advisory");
+  const partialQc = toReviewMetricSnapshot({
+    inputTP: 0,
+    overallRisk: 1,
+    instabilityScore: 1,
+    sentenceJumpScore: 1,
+    pauseNoiseRisk: 1,
+    compressionScore: 1,
+    clickScore: 1,
+    echoScore: 1,
+    endFadeRiskScore: 1,
+    sibilanceScore: 1,
+  });
+  const manifestWithPartialWinner = {
+    ...manifest,
+    candidates: manifest.candidates.map((candidate) =>
+      candidate.role === "winner"
+        ? {
+            ...candidate,
+            baselineScore: buildScore({ measurementStatus: "partial" }),
+            qc: partialQc,
+            sourceComparison: {
+              ...candidate.sourceComparison,
+              qcDelta: buildReviewMetricDelta(manifest.source.qc, partialQc),
+            },
+          }
+        : candidate,
+    ),
+  } satisfies ReviewBundleManifest;
+
+  const auto = autoReviewBundle(manifestWithPartialWinner);
+  const acousticFindingIds = new Set([
+    "level-continuity",
+    "cold-open",
+    "pause-bed",
+    "dynamic-control",
+    "endings",
+    "end-edge-dip",
+    "sibilance",
+    "echo-room",
+    "clicks-artifacts",
+    "noise-contrast",
+  ]);
+
+  assert.equal(
+    auto.selectedAssessment.findings.some((finding) => acousticFindingIds.has(finding.id)),
+    false,
+  );
+  assert.match(auto.selectedAssessment.summary, /acoustic QC partial/i);
+  assert.match(auto.executiveSummary, /partial and advisory/i);
+  assert.equal(auto.preferredRole, null);
+  assert.equal(auto.confidence, 0);
+  assert.doesNotMatch(auto.note, /Selected output verdict:/);
+});
+
+test("autoReviewBundle withholds A/B preference when the challenger QC is partial", () => {
+  const manifest = buildManifest("bundle-partial-challenger-advisory");
+  const manifestWithPartialChallenger = {
+    ...manifest,
+    candidates: manifest.candidates.map((candidate) =>
+      candidate.role === "challenger"
+        ? {
+            ...candidate,
+            baselineScore: buildScore({ measurementStatus: "partial" }),
+          }
+        : candidate,
+    ),
+  } satisfies ReviewBundleManifest;
+
+  const auto = autoReviewBundle(manifestWithPartialChallenger);
+  assert.notEqual(
+    resolveAutomatedReviewDraftVerdict(manifestWithPartialChallenger, auto.finalVerdict),
+    null,
+  );
+  assert.equal(auto.preferredRole, null);
+  assert.equal(auto.confidence, 0);
+  assert.match(auto.executiveSummary, /challenger acoustic QC was partial/i);
 });
 
 test("autoReviewBundle treats a dropped analysis window as diagnostic when measured QC is clean", () => {

@@ -23,6 +23,8 @@ export type CandidateScore = {
   compression: number;
   echo: number;
   total: number;
+  /** False means the numeric value is only an internal ranking fallback and must not be presented as measured. */
+  metricAvailability?: CandidateScoreMetricAvailability;
   /** Whether the acoustic metrics were actually observed. Missing means measured for legacy callers. */
   measurementStatus?: CandidateMeasurementStatus;
   hardGatePenalty?: number;
@@ -33,11 +35,61 @@ export type CandidateScore = {
 
 export type CandidateMeasurementStatus = "measured" | "partial" | "unavailable";
 
-type CandidateMeasurementWindowSummary = Readonly<{
+export type CandidateScoreMetric = "stability" | "pause" | "compression" | "echo";
+
+export type CandidateScoreMetricAvailability = Readonly<Record<CandidateScoreMetric, boolean>>;
+
+export type CandidateMeasurementWindowSummary = Readonly<{
   analysisWindowsAttempted?: number | null;
   analysisWindowsSucceeded?: number | null;
   analysisWindowsDropped?: number | null;
 }>;
+
+export type CandidateAcousticMeasurement = CandidateMeasurementWindowSummary & Readonly<{
+  instabilityScore?: number | null;
+  lineSwingScore?: number | null;
+  sentenceJumpScore?: number | null;
+  breathSpikeRisk?: number | null;
+  onsetOvershootScore?: number | null;
+  midLineSagScore?: number | null;
+  endFadeRiskScore?: number | null;
+  pauseNoiseRisk?: number | null;
+  pauseNoiseFloorDb?: number | null;
+  compressionScore?: number | null;
+  echoScore?: number | null;
+}>;
+
+const CANDIDATE_ACOUSTIC_FIELDS = [
+  "instabilityScore",
+  "lineSwingScore",
+  "sentenceJumpScore",
+  "breathSpikeRisk",
+  "onsetOvershootScore",
+  "midLineSagScore",
+  "endFadeRiskScore",
+  "pauseNoiseRisk",
+  "pauseNoiseFloorDb",
+  "compressionScore",
+  "echoScore",
+] as const satisfies ReadonlyArray<keyof CandidateAcousticMeasurement>;
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+const clampUnit = (value: number) => Math.min(1, Math.max(0, value));
+
+const weightedObservedMean = (
+  components: ReadonlyArray<readonly [value: number | null | undefined, weight: number]>,
+): number | null => {
+  let weightedTotal = 0;
+  let observedWeight = 0;
+  for (const [value, weight] of components) {
+    if (!isFiniteNumber(value)) continue;
+    weightedTotal += clampUnit(value) * weight;
+    observedWeight += weight;
+  }
+  return observedWeight > 0 ? weightedTotal / observedWeight : null;
+};
 
 /**
  * Whole-file measurements may describe the file as measured. Any distributed
@@ -45,14 +97,94 @@ type CandidateMeasurementWindowSummary = Readonly<{
  * so it remains partial instead of gaining file-wide corrective authority.
  */
 export const resolveCandidateMeasurementStatus = (
-  summary: CandidateMeasurementWindowSummary,
+  summary: CandidateAcousticMeasurement,
 ): Exclude<CandidateMeasurementStatus, "unavailable"> => {
   const hasSampledWindows = [
     summary.analysisWindowsAttempted,
     summary.analysisWindowsSucceeded,
     summary.analysisWindowsDropped,
   ].some((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
-  return hasSampledWindows ? "partial" : "measured";
+  const hasCompleteAcousticEvidence = CANDIDATE_ACOUSTIC_FIELDS.every((field) =>
+    isFiniteNumber(summary[field])
+  );
+  return hasSampledWindows || !hasCompleteAcousticEvidence ? "partial" : "measured";
+};
+
+/**
+ * Scores only evidence that was actually measured. A partial composite is
+ * renormalized over its observed members; absent categories receive a masked
+ * neutral fallback solely so legacy scalar ranking remains total.
+ */
+export const buildCandidateScoreFromAnalysis = (
+  analysis: CandidateAcousticMeasurement | null,
+): CandidateScore => {
+  if (!analysis) {
+    return {
+      stability: 1,
+      pause: 1,
+      compression: 1,
+      echo: 1,
+      total: 1111,
+      metricAvailability: {
+        stability: false,
+        pause: false,
+        compression: false,
+        echo: false,
+      },
+      measurementStatus: "unavailable",
+    };
+  }
+
+  const stabilityMeasured = weightedObservedMean([
+    [analysis.instabilityScore, 0.24],
+    [analysis.lineSwingScore, 0.16],
+    [analysis.sentenceJumpScore, 0.2],
+    [analysis.breathSpikeRisk, 0.12],
+    [analysis.onsetOvershootScore, 0.12],
+    [analysis.midLineSagScore, 0.1],
+    [analysis.endFadeRiskScore, 0.06],
+  ]);
+  const pauseFloorRisk = isFiniteNumber(analysis.pauseNoiseFloorDb)
+    ? clampUnit((analysis.pauseNoiseFloorDb + 62) / 18)
+    : null;
+  const pauseMeasured = weightedObservedMean([
+    [analysis.pauseNoiseRisk, 0.58],
+    [analysis.breathSpikeRisk, 0.24],
+    [pauseFloorRisk, 0.18],
+  ]);
+  const compressionMeasured = isFiniteNumber(analysis.compressionScore)
+    ? clampUnit(analysis.compressionScore)
+    : null;
+  const echoMeasured = isFiniteNumber(analysis.echoScore) ? clampUnit(analysis.echoScore) : null;
+  const measuredCategories = [
+    stabilityMeasured,
+    pauseMeasured,
+    compressionMeasured,
+    echoMeasured,
+  ].filter(isFiniteNumber);
+  const maskedFallback = measuredCategories.length > 0
+    ? measuredCategories.reduce((sum, value) => sum + value, 0) / measuredCategories.length
+    : 0.5;
+
+  const stability = stabilityMeasured ?? maskedFallback;
+  const pause = pauseMeasured ?? maskedFallback;
+  const compression = compressionMeasured ?? maskedFallback;
+  const echo = echoMeasured ?? maskedFallback;
+  const total = stability * 1000 + pause * 100 + compression * 10 + echo;
+  return {
+    stability,
+    pause,
+    compression,
+    echo,
+    total,
+    metricAvailability: {
+      stability: stabilityMeasured !== null,
+      pause: pauseMeasured !== null,
+      compression: compressionMeasured !== null,
+      echo: echoMeasured !== null,
+    },
+    measurementStatus: resolveCandidateMeasurementStatus(analysis),
+  };
 };
 
 export const summarizeCandidateScore = (score: CandidateScore) => {
@@ -68,9 +200,15 @@ export const summarizeCandidateScore = (score: CandidateScore) => {
     return `QC unavailable${rankingSuffix}${gateSuffix}`;
   }
 
-  const metrics = `stability ${(score.stability * 100).toFixed(0)} / pause ${(score.pause * 100).toFixed(
-    0,
-  )} / compression ${(score.compression * 100).toFixed(0)} / echo ${(score.echo * 100).toFixed(0)}`;
+  const formatMetric = (metric: CandidateScoreMetric, value: number) =>
+    score.metricAvailability?.[metric] === false ? "n/a" : (value * 100).toFixed(0);
+  const metrics = `stability ${formatMetric("stability", score.stability)} / pause ${formatMetric(
+    "pause",
+    score.pause,
+  )} / compression ${formatMetric("compression", score.compression)} / echo ${formatMetric(
+    "echo",
+    score.echo,
+  )}`;
   const riskLabel = score.measurementStatus === "partial"
     ? "QC partial risks (lower is better): "
     : "QC risks (lower is better): ";
@@ -87,6 +225,28 @@ export type CandidateRenderMeta = {
   analysisWindowsSucceeded: number;
   analysisWindowsDropped: number;
 };
+
+const normalizedWindowCount = (value: number | null | undefined, fallback: number) =>
+  isFiniteNumber(value) ? Math.max(0, Math.trunc(value)) : fallback;
+
+export const applyCandidateMeasurementWindowSummary = (
+  meta: CandidateRenderMeta,
+  summary: CandidateMeasurementWindowSummary,
+): CandidateRenderMeta => ({
+  ...meta,
+  analysisWindowsAttempted: normalizedWindowCount(
+    summary.analysisWindowsAttempted,
+    meta.analysisWindowsAttempted,
+  ),
+  analysisWindowsSucceeded: normalizedWindowCount(
+    summary.analysisWindowsSucceeded,
+    meta.analysisWindowsSucceeded,
+  ),
+  analysisWindowsDropped: normalizedWindowCount(
+    summary.analysisWindowsDropped,
+    meta.analysisWindowsDropped,
+  ),
+});
 
 export type RenderRiskProfile = {
   level: "normal" | "high";

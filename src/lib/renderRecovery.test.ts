@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   AUDIBILITY_SAFE_STRATEGY_LABEL,
   PLANNER_TAIL_SAFE_STRATEGY_LABEL,
+  applyCandidateMeasurementWindowSummary,
+  buildCandidateScoreFromAnalysis,
   buildRenderRiskProfile,
   compareCandidateScores,
   resolveCandidateMeasurementStatus,
@@ -298,9 +300,96 @@ test("distributed candidate QC remains partial even when every sampled window su
       analysisWindowsAttempted: 0,
       analysisWindowsSucceeded: 0,
       analysisWindowsDropped: 0,
+      instabilityScore: 0.2,
+      lineSwingScore: 0.2,
+      sentenceJumpScore: 0.2,
+      breathSpikeRisk: 0.2,
+      onsetOvershootScore: 0.2,
+      midLineSagScore: 0.2,
+      endFadeRiskScore: 0.2,
+      pauseNoiseRisk: 0.2,
+      pauseNoiseFloorDb: -62,
+      compressionScore: 0.2,
+      echoScore: 0.2,
     }),
     "measured",
   );
+});
+
+test("candidate score renormalizes finite measured evidence instead of substituting maximum risk", () => {
+  const score = buildCandidateScoreFromAnalysis({
+    instabilityScore: 0.2,
+    lineSwingScore: 0.5,
+    sentenceJumpScore: null,
+    breathSpikeRisk: Number.NaN,
+    onsetOvershootScore: null,
+    midLineSagScore: null,
+    endFadeRiskScore: null,
+    pauseNoiseRisk: 0.25,
+    pauseNoiseFloorDb: -53,
+    compressionScore: 0.3,
+    echoScore: 0.4,
+    analysisWindowsAttempted: 0,
+    analysisWindowsSucceeded: 0,
+    analysisWindowsDropped: 0,
+  });
+
+  assert.ok(Math.abs(score.stability - 0.32) < 1e-12);
+  assert.ok(Math.abs(score.pause - (0.25 * 0.58 + 0.5 * 0.18) / (0.58 + 0.18)) < 1e-12);
+  assert.equal(score.compression, 0.3);
+  assert.equal(score.echo, 0.4);
+  assert.equal(score.measurementStatus, "partial");
+  assert.ok(score.total < 400, "missing measurements must not manufacture maximum-risk scores");
+});
+
+test("candidate score stays measured only when every scoring component is finite", () => {
+  const score = buildCandidateScoreFromAnalysis({
+    instabilityScore: 0.2,
+    lineSwingScore: 0.3,
+    sentenceJumpScore: 0.4,
+    breathSpikeRisk: 0.5,
+    onsetOvershootScore: 0.6,
+    midLineSagScore: 0.7,
+    endFadeRiskScore: 0.8,
+    pauseNoiseRisk: 0.25,
+    pauseNoiseFloorDb: -53,
+    compressionScore: 0.3,
+    echoScore: 0.4,
+    analysisWindowsAttempted: 0,
+    analysisWindowsSucceeded: 0,
+    analysisWindowsDropped: 0,
+  });
+
+  assert.ok(
+    Math.abs(
+      score.stability -
+        (0.2 * 0.24 + 0.3 * 0.16 + 0.4 * 0.2 + 0.5 * 0.12 + 0.6 * 0.12 + 0.7 * 0.1 + 0.8 * 0.06)
+    ) < 1e-12,
+  );
+  assert.ok(Math.abs(score.pause - (0.25 * 0.58 + 0.5 * 0.24 + 0.5 * 0.18)) < 1e-12);
+  assert.equal(score.compression, 0.3);
+  assert.equal(score.echo, 0.4);
+  assert.equal(score.measurementStatus, "measured");
+});
+
+test("failed bounded QC preserves the attempted succeeded and dropped window counts", () => {
+  const original = buildMeta({
+    analysisWindowsAttempted: 0,
+    analysisWindowsSucceeded: 0,
+    analysisWindowsDropped: 0,
+  });
+
+  const updated = applyCandidateMeasurementWindowSummary(original, {
+    analysisWindowsAttempted: 6,
+    analysisWindowsSucceeded: 0,
+    analysisWindowsDropped: 6,
+  });
+
+  assert.notEqual(updated, original);
+  assert.equal(updated.analysisWindowsAttempted, 6);
+  assert.equal(updated.analysisWindowsSucceeded, 0);
+  assert.equal(updated.analysisWindowsDropped, 6);
+  assert.equal(original.analysisWindowsAttempted, 0);
 });
 
 test("unavailable candidate QC is described as unavailable instead of measured 100 percent risks", () => {
@@ -335,6 +424,20 @@ test("partial candidate QC remains explicitly labelled while preserving measured
     summary,
     /^QC partial risks \(lower is better\): stability 24 \/ pause 17 \/ compression 8 \/ echo 11/,
   );
+});
+
+test("partial candidate QC presents absent categories as n/a instead of synthetic measurements", () => {
+  const summary = summarizeCandidateScore(
+    buildCandidateScoreFromAnalysis({
+      instabilityScore: 0.24,
+      pauseNoiseRisk: 0.17,
+      compressionScore: null,
+      echoScore: null,
+    }),
+  );
+
+  assert.match(summary, /^QC partial risks \(lower is better\): stability 24 \/ pause 17/);
+  assert.match(summary, /compression n\/a \/ echo n\/a/);
 });
 
 test("measured candidate QC explains that each displayed score is a lower-is-better risk", () => {

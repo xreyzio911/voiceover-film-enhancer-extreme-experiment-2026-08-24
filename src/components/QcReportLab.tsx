@@ -22,6 +22,9 @@ import {
   REVIEW_ISSUE_TAGS,
   autoReviewBundle,
   fitLearnedReviewWeights,
+  formatCandidateAcousticReviewValue,
+  isCandidateAcousticQcAvailable,
+  resolveAutomatedReviewDraftVerdict,
   serializeReviewDecisionJsonl,
   type AutoReviewResult,
   type ReviewBundleManifest,
@@ -99,8 +102,6 @@ const formatPercent = (value: number | null | undefined, digits = 0) =>
   typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : "n/a";
 const formatDb = (value: number | null | undefined, digits = 1) =>
   typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(digits)} dB` : "n/a";
-const formatNumber = (value: number | null | undefined, digits = 2) =>
-  typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "n/a";
 const formatSeconds = (value: number | null | undefined, digits = 2) =>
   typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(digits)} s` : "n/a";
 const formatIssueTag = (tag: ReviewIssueTag) =>
@@ -563,19 +564,34 @@ export default function QcReportLab() {
     () => ({
       total: reviewBundles.length,
       completed: completedReviewRecords.length,
+      pending: Math.max(0, reviewBundles.length - completedReviewRecords.length),
       failed: completedReviewRecords.filter((record) => record.finalVerdict === "fail").length,
       challengerWins: completedReviewRecords.filter((record) => record.preferredRole === "challenger").length,
     }),
     [completedReviewRecords, reviewBundles.length],
   );
-  const autoReviewSummary = useMemo(
-    () => ({
-      total: Object.keys(autoReviewResults).length,
-      failed: Object.values(autoReviewResults).filter((result) => result.finalVerdict === "fail").length,
-      challengerPreferred: Object.values(autoReviewResults).filter((result) => result.preferredRole === "challenger").length,
-    }),
-    [autoReviewResults],
-  );
+  const autoReviewSummary = useMemo(() => {
+    const reviewedBundles = reviewBundles.filter(
+      (bundle) => autoReviewResults[bundle.manifest.bundleId],
+    );
+    const verdictAvailable = (bundle: ImportedReviewBundle) => {
+      const result = autoReviewResults[bundle.manifest.bundleId];
+      return result
+        ? resolveAutomatedReviewDraftVerdict(bundle.manifest, result.finalVerdict) !== null
+        : false;
+    };
+    return {
+      total: reviewedBundles.length,
+      pending: reviewedBundles.filter((bundle) => !verdictAvailable(bundle)).length,
+      failed: reviewedBundles.filter((bundle) => {
+        const result = autoReviewResults[bundle.manifest.bundleId];
+        return verdictAvailable(bundle) && result?.finalVerdict === "fail";
+      }).length,
+      challengerPreferred: reviewedBundles.filter(
+        (bundle) => autoReviewResults[bundle.manifest.bundleId]?.preferredRole === "challenger",
+      ).length,
+    };
+  }, [autoReviewResults, reviewBundles]);
 
   const handleFiles = (incoming: FileList | null) => {
     if (!incoming) return;
@@ -730,12 +746,18 @@ export default function QcReportLab() {
 
     const nextResults: Record<string, AutoReviewResult> = {};
     const nextDrafts: Record<string, ReviewDecisionDraft> = {};
+    let pendingManualListening = 0;
 
     for (const bundle of reviewBundles) {
       const auto = autoReviewBundle(bundle.manifest);
+      const draftVerdict = resolveAutomatedReviewDraftVerdict(
+        bundle.manifest,
+        auto.finalVerdict,
+      );
+      if (draftVerdict === null) pendingManualListening += 1;
       nextResults[bundle.manifest.bundleId] = auto;
       nextDrafts[bundle.manifest.bundleId] = {
-        finalVerdict: auto.finalVerdict,
+        finalVerdict: draftVerdict,
         issueTags: auto.issueTags,
         preferredRole: auto.preferredRole,
         confidence: Number(auto.confidence.toFixed(2)),
@@ -746,7 +768,9 @@ export default function QcReportLab() {
     setAutoReviewResults(nextResults);
     setReviewDecisions(nextDrafts);
     setReviewStatus(
-      `Auto-reviewed ${reviewBundles.length} bundle(s) with detailed technical notes. Review labels are ready for training.`,
+      pendingManualListening > 0
+        ? `Auto-reviewed ${reviewBundles.length} bundle(s) with detailed technical notes. ${pendingManualListening} remain pending manual listening and verdict because acoustic QC was partial or unavailable.`
+        : `Auto-reviewed ${reviewBundles.length} bundle(s) with detailed technical notes. All automated verdict drafts are ready for review and training.`,
     );
   };
 
@@ -1200,7 +1224,7 @@ export default function QcReportLab() {
               <h3>Review Summary</h3>
               <div className={styles.summaryRow}>
                 <span>{reviewSummary.total} bundle(s)</span>
-                <span>{reviewSummary.completed} labeled</span>
+                <span>{reviewSummary.completed} labeled / {reviewSummary.pending} pending</span>
               </div>
               <div className={styles.summaryRow}>
                 <span>{reviewSummary.failed} fail verdict(s)</span>
@@ -1208,7 +1232,7 @@ export default function QcReportLab() {
               </div>
               <div className={styles.summaryRow}>
                 <span>{autoReviewSummary.total} auto-reviewed</span>
-                <span>{autoReviewSummary.failed} auto-fail / {autoReviewSummary.challengerPreferred} challenger preferred</span>
+                <span>{autoReviewSummary.pending} pending manual / {autoReviewSummary.failed} auto-fail / {autoReviewSummary.challengerPreferred} challenger preferred</span>
               </div>
               <div className={styles.badges}>
                 {REVIEW_ISSUE_TAGS.map((tag) => (
@@ -1344,19 +1368,19 @@ export default function QcReportLab() {
                               </div>
                               <div className={styles.metric}>
                                 <span>Baseline total</span>
-                                <strong>{formatNumber(candidate.baselineScore.total, 1)}</strong>
+                                <strong>{formatCandidateAcousticReviewValue(candidate, candidate.baselineScore.total, 1)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>Ranking score</span>
-                                <strong>{formatNumber(candidate.ranking.rankingScore, 1)}</strong>
+                                <strong>{formatCandidateAcousticReviewValue(candidate, candidate.ranking.rankingScore, 1)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>Hard gate penalty</span>
-                                <strong>{formatNumber(candidate.ranking.hardGatePenalty, 1)}</strong>
+                                <strong>{formatCandidateAcousticReviewValue(candidate, candidate.ranking.hardGatePenalty, 1)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>Learned adjustment</span>
-                                <strong>{formatNumber(candidate.ranking.learnedAdjustment, 1)}</strong>
+                                <strong>{formatCandidateAcousticReviewValue(candidate, candidate.ranking.learnedAdjustment, 1)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>Duration delta</span>
@@ -1371,19 +1395,19 @@ export default function QcReportLab() {
                               </div>
                               <div className={styles.metric}>
                                 <span>Overall risk delta</span>
-                                <strong>{formatPercent(candidate.sourceComparison.qcDelta?.overallRisk)}</strong>
+                                <strong>{formatPercent(isCandidateAcousticQcAvailable(candidate) ? candidate.sourceComparison.qcDelta?.overallRisk : null)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>Pause noise delta</span>
-                                <strong>{formatPercent(candidate.sourceComparison.qcDelta?.pauseNoiseRisk)}</strong>
+                                <strong>{formatPercent(isCandidateAcousticQcAvailable(candidate) ? candidate.sourceComparison.qcDelta?.pauseNoiseRisk : null)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>True peak</span>
-                                <strong>{formatDb(candidate.qc?.inputTP)}</strong>
+                                <strong>{formatDb(isCandidateAcousticQcAvailable(candidate) ? candidate.qc?.inputTP : null)}</strong>
                               </div>
                               <div className={styles.metric}>
                                 <span>End-fade risk</span>
-                                <strong>{formatPercent(candidate.qc?.endFadeRiskScore)}</strong>
+                                <strong>{formatPercent(isCandidateAcousticQcAvailable(candidate) ? candidate.qc?.endFadeRiskScore : null)}</strong>
                               </div>
                             </div>
                             {candidate.ranking.gateReasons.length > 0 && (

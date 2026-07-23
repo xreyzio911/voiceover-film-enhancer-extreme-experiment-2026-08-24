@@ -322,6 +322,39 @@ const formatDb = (value: number | null | undefined, digits = 1) =>
 const formatNumber = (value: number | null | undefined, digits = 2) =>
   hasFiniteNumber(value) ? value.toFixed(digits) : "n/a";
 
+export const isCandidateAcousticQcAvailable = (
+  candidate: Pick<ReviewBundleCandidate, "baselineScore" | "qc">,
+) =>
+  candidate.qc !== null &&
+  candidate.qc !== undefined &&
+  candidate.baselineScore.measurementStatus !== "unavailable";
+
+export const isCandidateAcousticQcCompleteForAutomatedReview = (
+  candidate: Pick<ReviewBundleCandidate, "baselineScore" | "qc">,
+) =>
+  isCandidateAcousticQcAvailable(candidate) &&
+  candidate.baselineScore.measurementStatus !== "partial" &&
+  !Object.values(candidate.baselineScore.metricAvailability ?? {}).some(
+    (available) => available === false,
+  );
+
+export const formatCandidateAcousticReviewValue = (
+  candidate: Pick<ReviewBundleCandidate, "baselineScore" | "qc">,
+  value: number | null | undefined,
+  digits = 1,
+) =>
+  isCandidateAcousticQcAvailable(candidate)
+    ? formatNumber(value, digits)
+    : "n/a — QC unavailable";
+
+export const resolveAutomatedReviewDraftVerdict = (
+  manifest: Pick<ReviewBundleManifest, "candidates">,
+  verdict: ReviewVerdict,
+): ReviewVerdict | null => {
+  const selected = manifest.candidates.find((candidate) => candidate.role === "winner");
+  return selected && isCandidateAcousticQcCompleteForAutomatedReview(selected) ? verdict : null;
+};
+
 export const DEFAULT_LEARNED_REVIEW_WEIGHTS: LearnedReviewWeights =
   BUILTIN_REVIEW_WEIGHTS as unknown as LearnedReviewWeights;
 
@@ -742,11 +775,13 @@ const pushAssessmentCheck = (
 
 const summarizeAssessment = (
   assessment: AutoReviewCandidateAssessment,
-  acousticQcAvailable: boolean,
+  acousticQcStatus: "complete" | "partial" | "unavailable",
 ) => {
   const issueLead =
-    !acousticQcAvailable
+    acousticQcStatus === "unavailable"
       ? "Acoustic QC unavailable; missing measurements were not treated as acoustic defects."
+      : acousticQcStatus === "partial"
+        ? "Acoustic QC partial; sampled or incomplete measurements stayed advisory and were not treated as complete acoustic evidence."
       : assessment.issueTags.length > 0
       ? `Issues: ${assessment.issueTags.join(", ")}.`
       : "No significant technical defects detected.";
@@ -794,9 +829,16 @@ const buildCandidateAssessment = (
 ): AutoReviewCandidateAssessment => {
   const findings: AutoReviewCheck[] = [];
   const issueTags = new Set<ReviewIssueTag>();
-  const qc = candidate.qc;
+  const acousticQcAvailable = isCandidateAcousticQcAvailable(candidate);
+  const acousticQcComplete = isCandidateAcousticQcCompleteForAutomatedReview(candidate);
+  const acousticQcStatus = acousticQcComplete
+    ? "complete"
+    : acousticQcAvailable
+      ? "partial"
+      : "unavailable";
+  const qc = acousticQcComplete ? candidate.qc : null;
   const sourceQc = manifest.source.qc;
-  const delta = candidate.sourceComparison.qcDelta;
+  const delta = acousticQcComplete ? candidate.sourceComparison.qcDelta : null;
   const alignment = candidate.sourceComparison.alignment;
   const absDurationDelta = Math.abs(alignment.durationDeltaSec);
   const absOffset = Math.abs(alignment.estimatedOffsetSec);
@@ -1020,10 +1062,10 @@ const buildCandidateAssessment = (
       hasFiniteNumber(delta?.noiseContrastDb) ? ` (${formatSignedDb(delta.noiseContrastDb)} vs source)` : ""
     }.`,
   });
-  const applicableFindings = qc
+  const applicableFindings = acousticQcComplete
     ? findings
     : findings.slice(0, findingCountBeforeAcousticChecks);
-  const applicableIssueTags = qc ? issueTags : issueTagsBeforeAcousticChecks;
+  const applicableIssueTags = acousticQcComplete ? issueTags : issueTagsBeforeAcousticChecks;
 
   pushAssessmentCheck(applicableFindings, applicableIssueTags, {
     id: "render-robustness",
@@ -1052,7 +1094,7 @@ const buildCandidateAssessment = (
     summary: "",
   };
   assessment.technicalRiskScore = buildAssessmentRiskScore(assessment, candidate.ranking);
-  assessment.summary = summarizeAssessment(assessment, qc !== null);
+  assessment.summary = summarizeAssessment(assessment, acousticQcStatus);
   return assessment;
 };
 
@@ -1064,6 +1106,22 @@ export const autoReviewBundle = (manifest: ReviewBundleManifest): AutoReviewResu
   const challenger = findCandidateRole(manifest, "challenger");
   const selectedAssessment = buildCandidateAssessment(manifest, selected);
   const challengerAssessment = challenger ? buildCandidateAssessment(manifest, challenger) : null;
+  const selectedAcousticQcAvailable = isCandidateAcousticQcAvailable(selected);
+  const selectedAcousticQcComplete = isCandidateAcousticQcCompleteForAutomatedReview(selected);
+  const challengerAcousticQcAvailable = challenger
+    ? isCandidateAcousticQcAvailable(challenger)
+    : true;
+  const challengerAcousticQcComplete = challenger
+    ? isCandidateAcousticQcCompleteForAutomatedReview(challenger)
+    : true;
+  const comparisonAcousticQcComplete =
+    selectedAcousticQcComplete && challengerAcousticQcComplete;
+  const withheldReason = selectedAcousticQcAvailable
+    ? "acoustic QC was partial and advisory"
+    : "acoustic QC was unavailable";
+  const comparisonWithheldReason = challengerAcousticQcAvailable
+    ? "challenger acoustic QC was partial and advisory"
+    : "challenger acoustic QC was unavailable";
 
   const selectedFailsCritical = selectedAssessment.findings.some(
     (finding) => finding.status === "fail" && finding.severity === "critical",
@@ -1098,12 +1156,18 @@ export const autoReviewBundle = (manifest: ReviewBundleManifest): AutoReviewResu
     0.3,
     0.97,
   );
+  const reviewPreferredRole = comparisonAcousticQcComplete ? preferredRole : null;
+  const reviewConfidence = comparisonAcousticQcComplete ? confidence : 0;
 
-  const executiveSummary = `Selected output ${finalVerdict.toUpperCase()} with ${selectedAssessment.failCount} fail and ${selectedAssessment.warnCount} warn checks. ${summarizePreferredRoleReason(
-    selectedAssessment,
-    challengerAssessment,
-    preferredRole,
-  )}`;
+  const executiveSummary = !selectedAcousticQcComplete
+    ? `Automated verdict withheld pending manual listening; A/B preference was also withheld because ${withheldReason}. Diagnostics found ${selectedAssessment.failCount} fail and ${selectedAssessment.warnCount} warn checks.`
+    : challenger && !challengerAcousticQcComplete
+      ? `Selected output ${finalVerdict.toUpperCase()} with ${selectedAssessment.failCount} fail and ${selectedAssessment.warnCount} warn checks. A/B preference withheld because ${comparisonWithheldReason}.`
+      : `Selected output ${finalVerdict.toUpperCase()} with ${selectedAssessment.failCount} fail and ${selectedAssessment.warnCount} warn checks. ${summarizePreferredRoleReason(
+          selectedAssessment,
+          challengerAssessment,
+          reviewPreferredRole,
+        )}`;
 
   const buildFindingsBlock = (heading: string, assessment: AutoReviewCandidateAssessment) =>
     [
@@ -1116,8 +1180,10 @@ export const autoReviewBundle = (manifest: ReviewBundleManifest): AutoReviewResu
 
   const note = [
     "Automated engineering review generated from source/output alignment, QC deltas, and render diagnostics.",
-    `Selected output verdict: ${finalVerdict.toUpperCase()}.`,
-    `A/B preference: ${preferredRole ?? "skip"} (confidence ${(confidence * 100).toFixed(0)}%).`,
+    selectedAcousticQcComplete
+      ? `Selected output verdict: ${finalVerdict.toUpperCase()}.`
+      : `Automated verdict withheld pending manual listening because ${withheldReason}.`,
+    `A/B preference: ${reviewPreferredRole ?? "skip"} (confidence ${(reviewConfidence * 100).toFixed(0)}%).`,
     executiveSummary,
     buildFindingsBlock("Selected output assessment", selectedAssessment),
     challengerAssessment ? buildFindingsBlock("Challenger assessment", challengerAssessment) : null,
@@ -1129,8 +1195,8 @@ export const autoReviewBundle = (manifest: ReviewBundleManifest): AutoReviewResu
     bundleId: manifest.bundleId,
     finalVerdict,
     issueTags: selectedAssessment.issueTags,
-    preferredRole,
-    confidence,
+    preferredRole: reviewPreferredRole,
+    confidence: reviewConfidence,
     note,
     executiveSummary,
     selectedAssessment,

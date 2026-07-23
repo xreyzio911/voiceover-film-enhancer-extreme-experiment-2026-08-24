@@ -37,14 +37,16 @@ import {
 import {
   AUDIBILITY_SAFE_STRATEGY_LABEL,
   PLANNER_TAIL_SAFE_STRATEGY_LABEL,
+  applyCandidateMeasurementWindowSummary,
+  buildCandidateScoreFromAnalysis,
   buildRenderRiskProfile,
   compareCandidateScores,
   isHealthySegmentedRender,
-  resolveCandidateMeasurementStatus,
   resolveNextAudibilityFallbackIndex,
   selectQcUnavailableFallbackCandidate,
   summarizeCandidateScore,
   type CandidateRenderMeta,
+  type CandidateMeasurementWindowSummary,
   type CandidateScore,
   type DegradeReason,
   type RenderPath,
@@ -99,6 +101,7 @@ import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlo
 import { estimateVoZipBytes, planVoZipExportParts } from "../lib/downloadPolicy";
 import { shouldEmitMixReadyOutput } from "../lib/outputDeliveryPolicy";
 import {
+  runFfmpegOperationWithOneResetRetry,
   shouldPublishGenericFfmpegProgress,
   shouldRecycleFfmpegBeforeOperation,
 } from "../lib/ffmpegLifecyclePolicy";
@@ -2695,8 +2698,10 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.drynessScore = envelope.drynessScore;
       analysis.instabilityScore = envelope.instabilityScore;
       analysis.lineSwingScore = envelope.lineSwingScore;
+      analysis.sentenceJumpScore = envelope.sentenceJumpScore;
       analysis.coldOpenDipDb = envelope.coldOpenDipDb;
       analysis.coldOpenRiskScore = envelope.coldOpenRiskScore;
+      analysis.breathSpikeRisk = envelope.breathSpikeRisk;
       analysis.pauseNoiseRisk = envelope.pauseNoiseRisk;
       analysis.compressionScore = envelope.compressionScore;
       analysis.overallRisk = envelope.overallRisk;
@@ -3026,7 +3031,11 @@ const summarizeFailureReason = (error: unknown) => {
     durationSeconds: number,
     speechSpans: SpeechSpan[] = [],
     silenceSpans: SilenceSpan[] = [],
-  ): Promise<{ analysis: FileAnalysis | null; ffmpeg: FFmpeg }> => {
+  ): Promise<{
+    analysis: FileAnalysis | null;
+    ffmpeg: FFmpeg;
+    windowSummary: CandidateMeasurementWindowSummary;
+  }> => {
     const wavInfo = inspectMonoFloat32Wav(inputBytes);
     const effectiveDurationSec = Math.min(durationSeconds, wavInfo.durationSec);
     const windows = selectDistributedAnalysisWindowsWithConfig(
@@ -3089,9 +3098,15 @@ const summarizeFailureReason = (error: unknown) => {
       }
     }
 
+    const windowSummary: CandidateMeasurementWindowSummary = {
+      analysisWindowsAttempted: windows.length,
+      analysisWindowsSucceeded: windowAnalyses.length,
+      analysisWindowsDropped: windowDropCount,
+    };
+
     if (windowAnalyses.length === 0) {
       appendLog(`[CandidateQC] ${sanitizeBase(inputName)}: bounded QC unavailable (0/${windows.length} windows measured).`);
-      return { analysis: null, ffmpeg };
+      return { analysis: null, ffmpeg, windowSummary };
     }
     const speechStats = speechSpans.length > 0
       ? computeSpeechMapStats(speechSpans, silenceSpans, effectiveDurationSec)
@@ -3102,7 +3117,7 @@ const summarizeFailureReason = (error: unknown) => {
     analysis.analysisWindowsSucceeded = windowAnalyses.length;
     analysis.analysisWindowsDropped = windowDropCount;
     analysis.analysisWindowRetryCount = windowRetryCount;
-    return { analysis, ffmpeg };
+    return { analysis, ffmpeg, windowSummary };
   };
 
   const shouldUseBoundedCandidateQc = (
@@ -6522,43 +6537,7 @@ const summarizeFailureReason = (error: unknown) => {
   };
 
   const buildCandidateScore = (analysis: FileAnalysis | null): CandidateScore => {
-    if (!analysis) {
-      return {
-        stability: 1,
-        pause: 1,
-        compression: 1,
-        echo: 1,
-        total: 1111,
-        measurementStatus: "unavailable",
-      };
-    }
-
-    const instability = clamp(analysis.instabilityScore ?? 1, 0, 1);
-    const lineSwing = clamp(analysis.lineSwingScore ?? 1, 0, 1);
-    const sentenceJump = clamp(analysis.sentenceJumpScore ?? 1, 0, 1);
-    const breathSpike = clamp(analysis.breathSpikeRisk ?? 1, 0, 1);
-    const onset = clamp(analysis.onsetOvershootScore ?? 1, 0, 1);
-    const sag = clamp(analysis.midLineSagScore ?? 1, 0, 1);
-    const endFade = clamp(analysis.endFadeRiskScore ?? 1, 0, 1);
-    const pauseRisk = clamp(analysis.pauseNoiseRisk ?? 1, 0, 1);
-    const compression = clamp(analysis.compressionScore ?? 1, 0, 1);
-    const echo = clamp(analysis.echoScore ?? 1, 0, 1);
-
-    const stability =
-      instability * 0.24 +
-      lineSwing * 0.16 +
-      sentenceJump * 0.2 +
-      breathSpike * 0.12 +
-      onset * 0.12 +
-      sag * 0.1 +
-      endFade * 0.06;
-    const pause =
-      pauseRisk * 0.58 +
-      breathSpike * 0.24 +
-      clamp(((analysis.pauseNoiseFloorDb ?? -120) + 62) / 18, 0, 1) * 0.18;
-    const total = stability * 1000 + pause * 100 + compression * 10 + echo;
-    const measurementStatus = resolveCandidateMeasurementStatus(analysis);
-    return { stability, pause, compression, echo, total, measurementStatus };
+    return buildCandidateScoreFromAnalysis(analysis);
   };
 
   const countUsableSpeechPauseBoundaries = (silenceSpans: SilenceSpan[]) => {
@@ -7259,8 +7238,26 @@ const summarizeFailureReason = (error: unknown) => {
           setStatus(`Analyze: ${job.base} (${i + 1}/${jobs.length})`);
           setActiveQueueStage(job.base, "Analyze", `Pass ${i + 1} of ${jobs.length}`);
           try {
-            await writeJobInput(ffmpeg, job);
-            const analysisResult = await analyzeFile(ffmpeg, job.inputName);
+            const analysisAttempt = await runFfmpegOperationWithOneResetRetry({
+              worker: ffmpeg,
+              operation: async (activeFfmpeg) => {
+                await writeJobInput(activeFfmpeg, job);
+                return analyzeFile(activeFfmpeg, job.inputName);
+              },
+              shouldReset: shouldResetFfmpegForError,
+              reset: async (_failedWorker, initialError) => {
+                appendLog(
+                  `Analysis retry (${job.base}): ${
+                    initialError instanceof Error ? initialError.message : String(initialError)
+                  }`,
+                );
+                ffmpeg = await refreshFfmpeg(`analysis retry on ${job.base}`);
+                analysisWorkerCumulativeAudioSec = 0;
+                return ffmpeg;
+              },
+            });
+            ffmpeg = analysisAttempt.worker;
+            const analysisResult = analysisAttempt.result;
             ffmpeg = analysisResult.ffmpeg;
             const analysis = analysisResult.analysis;
             analysisByBase.set(job.base, analysis);
@@ -7664,6 +7661,9 @@ const summarizeFailureReason = (error: unknown) => {
                       )
                     : await analyzeFile(ffmpeg, candidateName, [job.inputName]);
                   ffmpeg = analysisResult.ffmpeg;
+                  if ("windowSummary" in analysisResult) {
+                    candidateMeta = applyCandidateMeasurementWindowSummary(candidateMeta, analysisResult.windowSummary);
+                  }
                   candidateAnalysis = analysisResult.analysis;
                   if (!candidateAnalysis) {
                     throw new Error("bounded candidate QC returned no measured windows");
@@ -7675,14 +7675,14 @@ const summarizeFailureReason = (error: unknown) => {
                   if ((candidateAnalysis.analysisWindowsDropped ?? 0) > 0) {
                     degradeReasons.push("analysis-window-drop");
                   }
-                  candidateMeta = {
-                    ...candidateMeta,
-                    degradeReasons: Array.from(new Set(degradeReasons)),
-                    degraded: degradeReasons.length > 0,
-                    analysisWindowsAttempted: candidateAnalysis.analysisWindowsAttempted ?? 0,
-                    analysisWindowsSucceeded: candidateAnalysis.analysisWindowsSucceeded ?? 0,
-                    analysisWindowsDropped: candidateAnalysis.analysisWindowsDropped ?? 0,
-                  };
+                  candidateMeta = applyCandidateMeasurementWindowSummary(
+                    {
+                      ...candidateMeta,
+                      degradeReasons: Array.from(new Set(degradeReasons)),
+                      degraded: degradeReasons.length > 0,
+                    },
+                    candidateAnalysis,
+                  );
                   if (ffmpeg !== candidateAnalysisFfmpeg) await writeJobInput(ffmpeg, job);
                 } catch (error) {
                   candidateQcUnavailable = true;
@@ -7939,6 +7939,9 @@ const summarizeFailureReason = (error: unknown) => {
                   )
                 : await analyzeFile(ffmpeg, renderedName, [job.inputName]);
               ffmpeg = analysisResult.ffmpeg;
+              if ("windowSummary" in analysisResult) {
+                renderedMeta = applyCandidateMeasurementWindowSummary(renderedMeta, analysisResult.windowSummary);
+              }
               renderedAnalysis = analysisResult.analysis;
               if (!renderedAnalysis) {
                 throw new Error("bounded rendered QC returned no measured windows");
