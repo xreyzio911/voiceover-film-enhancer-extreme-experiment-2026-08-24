@@ -175,6 +175,19 @@ test("final app polish uses the isolated linear filter instead of rerunning the 
   assert.doesNotMatch(finalPolishBlock, /runMixReady\(/);
 });
 
+test("planner-active secondary dynamics use continuous speech evidence instead of a fixed large lift", () => {
+  const mixFilterBlock = sourceBetween(
+    "const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions)",
+    "const runMixReady = async",
+  );
+
+  assert.match(mixFilterBlock, /resolvePlannerSecondaryMaxGainFactor\(\{/);
+  assert.match(mixFilterBlock, /speechDutyCyclePct: profile\?\.speechDutyCyclePct \?\? null/);
+  assert.match(mixFilterBlock, /speechSegmentCount: profile\?\.speechSegmentCount \?\? null/);
+  assert.match(mixFilterBlock, /m=\$\{secondaryMaxGainFactor\.toFixed\(3\)\}/);
+  assert.doesNotMatch(mixFilterBlock, /toOddInt\(5 \* levelerAdaptationScale, 3, 11\)/);
+});
+
 test("speech-only spectrum drives tone, tilts, and de-essing without changing the QC speech mask", () => {
   const envelopeBlock = sourceBetween(
     "const computeEnvelopeMetrics = (samples: Float32Array)",

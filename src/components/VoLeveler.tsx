@@ -106,6 +106,7 @@ import {
   shouldRecycleFfmpegBeforeOperation,
 } from "../lib/ffmpegLifecyclePolicy";
 import { resolveGainPlannerOutcome } from "../lib/plannerFallbackPolicy";
+import { resolvePlannerSecondaryMaxGainFactor } from "../lib/plannerSecondaryDynamics";
 import {
   formatLongFormPartTag,
   planLongFormChunks,
@@ -555,6 +556,8 @@ type AdaptiveProfile = {
   noiseContrastDb: number | null;
   pauseNoiseRisk: number;
   speechThresholdDb: number | null;
+  speechDutyCyclePct: number | null;
+  speechSegmentCount: number | null;
   roomRisk: RoomRisk;
   useDenoise: boolean;
   denoiseStrength: number;
@@ -3567,6 +3570,8 @@ const summarizeFailureReason = (error: unknown) => {
       noiseContrastDb: measuredNoiseContrast,
       pauseNoiseRisk,
       speechThresholdDb: measuredSpeechThreshold,
+      speechDutyCyclePct: analysis.speechDutyCyclePct,
+      speechSegmentCount: analysis.speechSegmentCount,
       roomRisk,
       useDenoise,
       denoiseStrength: directedDenoiseStrength,
@@ -3762,10 +3767,9 @@ const summarizeFailureReason = (error: unknown) => {
     forceEndingProtection?: boolean;
     /**
      * When true, the input the chain is about to process has already been
-     * leveled by the speech-aware gain planner. The downstream `dynaudnorm`
-     * is downgraded to a gentle safety pass (tight window, low `g/m`) and
-     * `acompressor` is relaxed to glue duty only. This is what actually
-     * kills sentence-to-sentence jumps.
+     * leveled by the speech-aware gain planner. That planner remains the main
+     * broadband level owner; any `dynaudnorm` lift is constrained by measured
+     * speech evidence and `acompressor` is relaxed to optional glue duty only.
      */
     gainPlannerActive?: boolean;
   };
@@ -3944,17 +3948,11 @@ const summarizeFailureReason = (error: unknown) => {
     }
 
     if (dyn && gainPlannerActive && !minimalStabilityChain) {
-      // The planner has already done speech-aware leveling. What the
-      // dynaudnorm safety pass does from here depends on how clean the
-      // source is:
-      //  - Very clean (instabilityBlend < 0.30): BYPASS. Any intra-line
-      //    micro-smoothing is either already done by the planner's micro-
-      //    ride or is actively adding audible artifacts (the "too
-      //    compressed" complaint was tracked to this pass firing on
-      //    already-flat material).
-      //  - Otherwise: narrow-window safety pass with amplitude threshold
-      //    anchored above the pause-noise floor so silences cannot be
-      //    lifted.
+      // The planner already owns the main gain curve. Retain only a bounded
+      // stability pass, and taper its possible lift continuously when both
+      // speech duty and independent-run evidence are sparse. This prevents an
+      // isolated phrase from being peak-normalized many dB above the planner
+      // target without creating a binary sparse-file processing switch.
       const dynaSafetyBlend = clamp(
         (profile?.instabilityScore ?? 0.5) * 0.5 +
           (profile?.lineSwingScore ?? 0.5) * 0.3 +
@@ -3967,9 +3965,13 @@ const summarizeFailureReason = (error: unknown) => {
         const gateAmp = fromDb(gateDb);
         const safetyF = 161;
         const safetyG = toOddInt(3 * levelerAdaptationScale, 3, 9);
-        const safetyM = toOddInt(5 * levelerAdaptationScale, 3, 11);
+        const secondaryMaxGainFactor = resolvePlannerSecondaryMaxGainFactor({
+          baseMaxGainFactor: 5,
+          speechDutyCyclePct: profile?.speechDutyCyclePct ?? null,
+          speechSegmentCount: profile?.speechSegmentCount ?? null,
+        });
         filters.push(
-          `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${safetyM}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
+          `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${secondaryMaxGainFactor.toFixed(3)}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
         );
       }
     } else if (dyn) {
@@ -4725,7 +4727,7 @@ const summarizeFailureReason = (error: unknown) => {
   ) => {
     // When the caller has already produced a planner-leveled version of the
     // input, we use it verbatim and tell the mix chain that broadband leveling
-    // is already done (so it downgrades dynaudnorm to a gentle safety pass).
+    // is already done (so any secondary lift is evidence-bounded).
     const chainInput = plannerLeveledInputName ?? inputName;
     const gainPlannerActive = Boolean(plannerLeveledInputName);
     const filterChain = buildMixFilter(profile, {
@@ -7455,7 +7457,14 @@ const summarizeFailureReason = (error: unknown) => {
           const profile = buildAdaptiveProfile(fileAnalysis, batchReference);
           const roomScore = profile ? (fileAnalysis?.roomScore ?? 0) : null;
           const adaptiveNoiseReductionFilter = profile ? resolveAdaptiveNoiseReductionFilter(profile) : null;
-          const primaryMixFilterPreview = profile ? buildMixFilter(profile) : "";
+          const plannerPreviewEligible =
+            getActiveAudioReviewControls().gainPlannerEnabled &&
+            estDurationSec <= GAIN_PLANNER_MAX_DURATION_SECONDS;
+          const primaryMixFilterPreview = profile
+            ? buildMixFilter(profile, {
+                gainPlannerActive: plannerPreviewEligible,
+              })
+            : "";
           const dynaPreviewMatch = primaryMixFilterPreview.match(/dynaudnorm=([^,]+)/i);
           const dynaPreview = dynaPreviewMatch ? dynaPreviewMatch[1] : "off";
           const adaptiveNoiseReductionLabel =
