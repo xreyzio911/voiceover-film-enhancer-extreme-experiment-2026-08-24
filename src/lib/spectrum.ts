@@ -30,6 +30,7 @@ const DEFAULT_BAND_WIDTH_OCT = 0.7;
 const FRAME_MS = 20;
 const HOP_MS = 20;
 export const DEFAULT_MAX_SPECTRUM_FRAMES = 1600;
+export const DEFAULT_MAX_EVENT_SIBILANCE_FRAMES = 240;
 
 export type LogBandSpectrumOptions = {
   bands?: readonly number[];
@@ -44,6 +45,12 @@ export type LogBandSpectrumOptions = {
    */
   activityMask?: readonly boolean[];
   activityFrameMs?: number;
+};
+
+export type EventSibilanceAuthorityOptions = {
+  activityMask: readonly boolean[];
+  activityFrameMs: number;
+  maxFrames?: number;
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -105,6 +112,61 @@ const overlapsActiveFrame = (
     if (activityMask[index]) return true;
   }
   return false;
+};
+
+/**
+ * Select active 20 ms spectrum frames at even positions across the recording.
+ *
+ * Event evidence deliberately has no whole-signal fallback: an absent or
+ * unusable speech mask must not let room tone acquire de-essing authority.
+ */
+export const resolveEventSibilanceFrameIndices = (
+  sampleCount: number,
+  sampleRate: number,
+  options: EventSibilanceAuthorityOptions,
+): number[] => {
+  if (
+    !Number.isFinite(sampleCount) ||
+    sampleCount <= 0 ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    !Number.isFinite(options.activityFrameMs) ||
+    options.activityFrameMs <= 0 ||
+    options.activityMask.length === 0
+  ) {
+    return [];
+  }
+
+  const { frameSize, hopSize, totalFrames } = resolveSpectrumFrameBudget(sampleCount, sampleRate);
+  const activeFrameIndices: number[] = [];
+  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
+    const frameStart = frameIndex * hopSize;
+    if (
+      overlapsActiveFrame(
+        frameStart,
+        frameSize,
+        sampleRate,
+        options.activityMask,
+        options.activityFrameMs,
+      )
+    ) {
+      activeFrameIndices.push(frameIndex);
+    }
+  }
+
+  const maxFrames =
+    typeof options.maxFrames === "number" && Number.isFinite(options.maxFrames) && options.maxFrames > 0
+      ? Math.max(1, Math.floor(options.maxFrames))
+      : DEFAULT_MAX_EVENT_SIBILANCE_FRAMES;
+  if (activeFrameIndices.length <= maxFrames) return activeFrameIndices;
+  if (maxFrames === 1) return [activeFrameIndices[Math.floor((activeFrameIndices.length - 1) / 2)]];
+
+  return Array.from({ length: maxFrames }, (_, sampleIndex) => {
+    const activePosition = Math.round(
+      (sampleIndex * (activeFrameIndices.length - 1)) / (maxFrames - 1),
+    );
+    return activeFrameIndices[activePosition];
+  });
 };
 
 /**
@@ -244,6 +306,74 @@ export const computeSibilanceScore = (bandDb: number[]): number => {
   const sib = (bandDb[6] + bandDb[7]) / 2;
   const ratio = sib - body; // positive => bright/sibilant
   return clamp((ratio + 1) / 9, 0, 1); // 0 at ratio=-1dB, 1 at ratio=+8dB
+};
+
+/**
+ * Measure short, speech-localized sibilance without turning it into a gate.
+ *
+ * Each selected active 20 ms frame contributes its squared per-frame
+ * sibilance score. The root mean square therefore rises continuously with
+ * both event strength and event density. The 0.5 authority cap limits the
+ * existing quadratic de-esser curve to -1 dB main / -0.6 dB secondary when
+ * this event evidence is used.
+ */
+export const computeEventSibilanceAuthority = (
+  samples: Float32Array,
+  sampleRate: number,
+  options: EventSibilanceAuthorityOptions,
+): number => {
+  const frameIndices = resolveEventSibilanceFrameIndices(samples.length, sampleRate, options);
+  if (frameIndices.length === 0) return 0;
+
+  const { frameSize, hopSize } = resolveSpectrumFrameBudget(samples.length, sampleRate);
+  const filters = buildBandFilters(sampleRate, SPECTRUM_BANDS_HZ, DEFAULT_BAND_WIDTH_OCT);
+  const window = new Float32Array(frameSize);
+  for (let index = 0; index < frameSize; index += 1) {
+    window[index] = 0.5 * (1 - Math.cos((2 * Math.PI * index) / (frameSize - 1)));
+  }
+
+  let sumSquaredScores = 0;
+  for (const frameIndex of frameIndices) {
+    const frameStart = frameIndex * hopSize;
+    let squaredSum = 0;
+    let frameIsFinite = true;
+    for (let index = 0; index < frameSize; index += 1) {
+      const value = samples[frameStart + index];
+      if (!Number.isFinite(value)) {
+        frameIsFinite = false;
+        break;
+      }
+      squaredSum += value * value;
+    }
+    if (!frameIsFinite) continue;
+    const rms = Math.sqrt(squaredSum / frameSize);
+    if (rms < 1e-4) continue;
+
+    const frameBandDb = filters.map((filter) => {
+      let bandPower = 0;
+      for (const { cosOmega, sinOmega } of filter.grid) {
+        let re = 0;
+        let im = 0;
+        let cosine = 1;
+        let sine = 0;
+        for (let index = 0; index < frameSize; index += 1) {
+          const value = samples[frameStart + index] * window[index];
+          re += value * cosine;
+          im += value * sine;
+          const nextCosine = cosine * cosOmega - sine * sinOmega;
+          const nextSine = sine * cosOmega + cosine * sinOmega;
+          cosine = nextCosine;
+          sine = nextSine;
+        }
+        bandPower += (re * re + im * im) / (frameSize * frameSize);
+      }
+      return 10 * Math.log10(bandPower / filter.grid.length + 1e-30);
+    });
+    const frameScore = computeSibilanceScore(frameBandDb);
+    sumSquaredScores += frameScore * frameScore;
+  }
+
+  return clamp(Math.sqrt(sumSquaredScores / frameIndices.length), 0, 0.5);
 };
 
 export type DeEsserCutsDb = {

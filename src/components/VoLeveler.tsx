@@ -73,6 +73,7 @@ import {
   type ReviewMetricSnapshot,
 } from "../lib/reviewLearning";
 import {
+  computeEventSibilanceAuthority,
   computeLogBandSpectrumDb,
   computeSibilanceScore,
   computeToneMatchDeltaDb,
@@ -565,7 +566,7 @@ type AdaptiveProfile = {
   bandSpectrumDb: number[] | null;
   /** Per-band dB delta the tone matcher wants to apply (clamped), or null. */
   toneMatchDeltaDb: number[] | null;
-  /** Sibilance score 0..1 — drives the de-esser gate. */
+  /** Continuous 0..1 spectral authority for conservative de-essing. */
   sibilanceScore: number;
   /** When true, include the cinematic color shelves in the mix. */
   cinematicColorEnabled: boolean;
@@ -2262,6 +2263,7 @@ const summarizeFailureReason = (error: unknown) => {
     // the return type locally.
     let bandSpectrumDb: number[] | null = null;
     let speechBandSpectrumDb: number[] | null = null;
+    let eventSibilanceAuthority = 0;
     let sibilanceScore: number | null = null;
     if (samples.length >= ANALYSIS_SAMPLE_RATE) {
       try {
@@ -2284,13 +2286,21 @@ const summarizeFailureReason = (error: unknown) => {
             activityMask,
             activityFrameMs: ENVELOPE_FRAME_MS,
           });
+          eventSibilanceAuthority = computeEventSibilanceAuthority(samples, ANALYSIS_SAMPLE_RATE, {
+            activityMask,
+            activityFrameMs: ENVELOPE_FRAME_MS,
+          });
         }
       } catch {
         speechBandSpectrumDb = null;
       }
     }
     const spectralDecisionDb = speechBandSpectrumDb ?? bandSpectrumDb;
-    sibilanceScore = spectralDecisionDb ? computeSibilanceScore(spectralDecisionDb) : null;
+    sibilanceScore = spectralDecisionDb
+      ? Math.max(computeSibilanceScore(spectralDecisionDb), eventSibilanceAuthority)
+      : eventSibilanceAuthority > 0
+        ? eventSibilanceAuthority
+        : null;
     return { ...base, bandSpectrumDb, speechBandSpectrumDb, sibilanceScore };
   };
 
@@ -2788,6 +2798,11 @@ const summarizeFailureReason = (error: unknown) => {
     aggregated.analysisWindowCount = windowAnalyses.length;
     aggregated.longSparseModeEligible = speechMapStats?.longSparseModeEligible ?? false;
 
+    const eventSibilanceAuthority = weightedMetric(
+      windowAnalyses,
+      (analysis) => analysis.sibilanceScore,
+      60,
+    );
     const speechBandMedians = SPECTRUM_BANDS_HZ.map((_, bandIndex) =>
       weightedMetric(
         windowAnalyses,
@@ -2797,7 +2812,12 @@ const summarizeFailureReason = (error: unknown) => {
     );
     if (speechBandMedians.every((value): value is number => value !== null)) {
       aggregated.speechBandSpectrumDb = speechBandMedians;
-      aggregated.sibilanceScore = computeSibilanceScore(speechBandMedians);
+      aggregated.sibilanceScore = Math.max(
+        computeSibilanceScore(speechBandMedians),
+        eventSibilanceAuthority ?? 0,
+      );
+    } else {
+      aggregated.sibilanceScore = eventSibilanceAuthority;
     }
 
     for (const key of Object.keys(baseAnalysis) as Array<keyof FileAnalysis>) {
@@ -7476,6 +7496,7 @@ const summarizeFailureReason = (error: unknown) => {
                 : "on(wavelet)";
 
           if (profile) {
+            const deEsserMainCutDb = resolveDeEsserCutsDb(profile.sibilanceScore).mainCutDb;
             appendLog(
               `[Adaptive] ${job.base}: HPF ${profile.highpassHz} Hz, low-mid ${formatSigned(
                 profile.lowMidGainDb
@@ -7483,7 +7504,9 @@ const summarizeFailureReason = (error: unknown) => {
                 roomScore ?? 0
               ).toFixed(2)}), noise ${profile.noiseRisk} (${(profile.noiseFloorDb ?? -70).toFixed(
                 1
-              )} dB; adaptive-NR ${adaptiveNoiseReductionLabel}), QC risks (lower is better): instability ${(
+              )} dB; adaptive-NR ${adaptiveNoiseReductionLabel}), de-ess authority ${(
+                profile.sibilanceScore * 100
+              ).toFixed(0)}% (main ${deEsserMainCutDb.toFixed(2)} dB), QC risks (lower is better): instability ${(
                 profile.instabilityScore * 100
               ).toFixed(0)}%, line swing ${(profile.lineSwingScore * 100).toFixed(0)}%, sentence jump ${(
                 profile.sentenceJumpScore * 100

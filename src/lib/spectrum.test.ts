@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CINEMATIC_VO_REFERENCE_DB,
+  DEFAULT_MAX_EVENT_SIBILANCE_FRAMES,
   HOUSE_TONE_BLEND,
+  computeEventSibilanceAuthority,
   computeLogBandSpectrumDb,
   computeSibilanceScore,
   computeToneMatchDeltaDb,
   deriveSpectrumTiltsDb,
   resolveDeEsserCutsDb,
   resolveDeEsserBands,
+  resolveEventSibilanceFrameIndices,
   resolveSpectrumFrameBudget,
 } from "./spectrum.ts";
 
@@ -24,6 +27,30 @@ const buildTone = (
     for (let index = start; index < end; index += 1) {
       samples[index] += section.amplitude * Math.sin((2 * Math.PI * section.hz * index) / sampleRate);
     }
+  }
+  return samples;
+};
+
+const buildFramedSpeech = (
+  sampleRate: number,
+  frameCount: number,
+  eventFrames: readonly number[],
+  eventAmplitude: number,
+) => {
+  const frameSize = Math.round(sampleRate * 0.02);
+  const samples = new Float32Array(frameSize * frameCount);
+  const eventFrameSet = new Set(eventFrames);
+  for (let index = 0; index < samples.length; index += 1) {
+    const frameIndex = Math.floor(index / frameSize);
+    const body =
+      0.14 * Math.sin((2 * Math.PI * 1030 * index) / sampleRate) +
+      0.12 * Math.sin((2 * Math.PI * 2060 * index) / sampleRate);
+    const event = eventFrameSet.has(frameIndex)
+      ? eventAmplitude *
+        (Math.sin((2 * Math.PI * 4118 * index) / sampleRate) +
+          Math.sin((2 * Math.PI * 8236 * index) / sampleRate))
+      : 0;
+    samples[index] = body + event;
   }
   return samples;
 };
@@ -109,6 +136,99 @@ test("de-esser depth sanitizes invalid scores and remains monotonic within its c
   }
   assert.ok(cuts.every(({ mainCutDb }) => mainCutDb >= -4 && mainCutDb <= 0));
   assert.ok(cuts.every(({ secondaryCutDb }) => secondaryCutDb >= -2.4 && secondaryCutDb <= 0));
+});
+
+test("event sibilance authority ignores clean body speech and inactive or silent frames", () => {
+  const sampleRate = 24000;
+  const frameCount = 20;
+  const activeMask = new Array<boolean>(frameCount).fill(true);
+  const cleanBody = buildFramedSpeech(sampleRate, frameCount, [], 0);
+
+  const cleanAuthority = computeEventSibilanceAuthority(cleanBody, sampleRate, {
+    activityMask: activeMask,
+    activityFrameMs: 20,
+  });
+  const inactiveAuthority = computeEventSibilanceAuthority(cleanBody, sampleRate, {
+    activityMask: new Array<boolean>(frameCount).fill(false),
+    activityFrameMs: 20,
+  });
+  const silentAuthority = computeEventSibilanceAuthority(new Float32Array(cleanBody.length), sampleRate, {
+    activityMask: activeMask,
+    activityFrameMs: 20,
+  });
+
+  assert.ok(cleanAuthority <= 0.01, `body-only speech should carry negligible event authority: ${cleanAuthority}`);
+  assert.equal(inactiveAuthority, 0);
+  assert.equal(silentAuthority, 0);
+});
+
+test("event sibilance authority cannot be poisoned by non-finite audio samples", () => {
+  const sampleRate = 24000;
+  const samples = buildFramedSpeech(sampleRate, 4, [1], 0.25);
+  samples[Math.round(sampleRate * 0.025)] = Number.NaN;
+  const authority = computeEventSibilanceAuthority(samples, sampleRate, {
+    activityMask: new Array<boolean>(4).fill(true),
+    activityFrameMs: 20,
+  });
+
+  assert.ok(Number.isFinite(authority), `authority must stay finite, got ${authority}`);
+  assert.ok(authority >= 0 && authority <= 0.5);
+});
+
+test("event sibilance authority is continuous, density-sensitive, and conservatively bounded", () => {
+  const sampleRate = 24000;
+  const frameCount = 20;
+  const activityMask = new Array<boolean>(frameCount).fill(true);
+  const options = { activityMask, activityFrameMs: 20 } as const;
+  const weakSparse = computeEventSibilanceAuthority(
+    buildFramedSpeech(sampleRate, frameCount, [5], 0.12),
+    sampleRate,
+    options,
+  );
+  const strongSparse = computeEventSibilanceAuthority(
+    buildFramedSpeech(sampleRate, frameCount, [5], 0.25),
+    sampleRate,
+    options,
+  );
+  const strongDense = computeEventSibilanceAuthority(
+    buildFramedSpeech(sampleRate, frameCount, [1, 5, 9, 13, 17], 0.25),
+    sampleRate,
+    options,
+  );
+  const saturated = computeEventSibilanceAuthority(
+    buildFramedSpeech(sampleRate, frameCount, Array.from({ length: frameCount }, (_, index) => index), 0.8),
+    sampleRate,
+    options,
+  );
+
+  assert.ok(weakSparse > 0, `a sparse weak fricative should retain nonzero evidence: ${weakSparse}`);
+  assert.ok(strongSparse > weakSparse, `${strongSparse} should exceed weaker evidence ${weakSparse}`);
+  assert.ok(strongDense > strongSparse, `${strongDense} should exceed sparser evidence ${strongSparse}`);
+  assert.equal(saturated, 0.5);
+
+  const maximumCuts = resolveDeEsserCutsDb(saturated);
+  assert.equal(maximumCuts.mainCutDb, -1);
+  assert.equal(maximumCuts.secondaryCutDb, -0.6);
+});
+
+test("event sibilance sampling is evenly distributed and capped by default", () => {
+  const sampleRate = 24000;
+  const frameCount = 500;
+  const sampleCount = Math.round(sampleRate * 0.02) * frameCount;
+  const activityMask = new Array<boolean>(frameCount).fill(true);
+  const defaultSelection = resolveEventSibilanceFrameIndices(sampleCount, sampleRate, {
+    activityMask,
+    activityFrameMs: 20,
+  });
+  const narrowSelection = resolveEventSibilanceFrameIndices(sampleCount, sampleRate, {
+    activityMask,
+    activityFrameMs: 20,
+    maxFrames: 7,
+  });
+
+  assert.equal(DEFAULT_MAX_EVENT_SIBILANCE_FRAMES, 240);
+  assert.equal(defaultSelection.length, DEFAULT_MAX_EVENT_SIBILANCE_FRAMES);
+  assert.deepEqual(narrowSelection, [0, 83, 166, 250, 333, 416, 499]);
 });
 
 test("production tone matching does not apply the unvalidated static house curve", () => {

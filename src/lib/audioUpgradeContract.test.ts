@@ -193,7 +193,7 @@ test("planner-active secondary dynamics use continuous speech evidence instead o
   assert.doesNotMatch(mixFilterBlock, /baseMaxGainFactor:\s*5[,}]/);
 });
 
-test("speech-only spectrum drives tone, tilts, and de-essing without changing the QC speech mask", () => {
+test("speech-only spectrum and continuous event evidence drive de-essing without changing the QC speech mask", () => {
   const envelopeBlock = sourceBetween(
     "const computeEnvelopeMetrics = (samples: Float32Array)",
     "const parseSilencedetectSpans =",
@@ -206,23 +206,37 @@ test("speech-only spectrum drives tone, tilts, and de-essing without changing th
   assert.match(envelopeBlock, /const activityNoiseFloorDb = percentile\(frameDb, 25\) \?\? -72/);
   assert.match(envelopeBlock, /buildSpeechMask\(frameDb, activityNoiseFloorDb/);
   assert.match(envelopeBlock, /const spectralDecisionDb = speechBandSpectrumDb \?\? bandSpectrumDb/);
-  assert.match(envelopeBlock, /computeSibilanceScore\(spectralDecisionDb\)/);
+  assert.match(
+    envelopeBlock,
+    /computeEventSibilanceAuthority\(samples, ANALYSIS_SAMPLE_RATE, \{/,
+  );
+  assert.match(envelopeBlock, /activityMask/);
+  assert.match(envelopeBlock, /activityFrameMs: ENVELOPE_FRAME_MS/);
+  assert.doesNotMatch(envelopeBlock, /maxAuthority/);
+  assert.match(
+    envelopeBlock,
+    /Math\.max\(computeSibilanceScore\(spectralDecisionDb\), eventSibilanceAuthority\)/,
+  );
   assert.match(adaptiveProfileBlock, /deriveSpectrumTiltsDb\(analysis\.speechBandSpectrumDb \?\? \[\]\)/);
   assert.match(adaptiveProfileBlock, /const deEsserSpectrumDb = analysis\.speechBandSpectrumDb \?\? analysis\.bandSpectrumDb/);
   assert.match(adaptiveProfileBlock, /bandSpectrumDb: deEsserSpectrumDb/);
 });
 
-test("distributed speech spectra recompute de-esser depth from the aggregated evidence", () => {
+test("distributed speech spectra retain recurring event authority without a binary engagement gate", () => {
   const aggregationBlock = sourceBetween(
     "const aggregateWindowAnalyses = (",
     "type AnalysisOptions =",
   );
 
   assertMarkersInOrder(aggregationBlock, [
+    "const eventSibilanceAuthority = weightedMetric(",
     "const speechBandMedians =",
     "aggregated.speechBandSpectrumDb = speechBandMedians",
-    "aggregated.sibilanceScore = computeSibilanceScore(speechBandMedians)",
+    "aggregated.sibilanceScore = Math.max(",
+    "computeSibilanceScore(speechBandMedians)",
+    "eventSibilanceAuthority ?? 0",
   ]);
+  assert.doesNotMatch(aggregationBlock, /sibilanceScore\s*>=/);
 });
 
 test("window QC carries the measured sentence-jump and breath-spike evidence into aggregation", () => {
