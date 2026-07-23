@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { resolveGainPlannerOutcome } from "./plannerFallbackPolicy.ts";
 
 const voLevelerSource = readFileSync(new URL("../components/VoLeveler.tsx", import.meta.url), "utf8");
 const qcReportLabSource = readFileSync(
@@ -31,6 +32,104 @@ const assertMarkersInOrder = (source: string, markers: string[]) => {
     cursor = index + marker.length;
   }
 };
+
+test("speech-bearing input without a usable gain plan remains a source-preserving output", () => {
+  const outcome = resolveGainPlannerOutcome({
+    hasUsablePlan: false,
+    speechBearing: true,
+  });
+
+  assert.equal(outcome.action, "render-source-preserving");
+  assert.equal(outcome.shouldEmitOutput, true);
+  assert.equal(outcome.claimsAdaptiveEnhancement, false);
+  assert.equal(outcome.candidateVariant, "source-safe");
+  assert.equal(outcome.sourcePassthroughChain, true);
+  assert.equal(outcome.disableLimiter, true);
+});
+
+test("planner no-plan fallback is wired to a truthful source-preserving render instead of throwing", () => {
+  const plannerContextBlock = sourceBetween(
+    "const preparePlannerRenderContext = async",
+    "const formatCandidateVariant =",
+  );
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assert.match(plannerContextBlock, /resolveGainPlannerOutcome\(\{/);
+  assert.match(plannerContextBlock, /context\.sourcePreservingFallback = true/);
+  assert.match(plannerContextBlock, /no adaptive enhancement claimed/);
+  assert.doesNotMatch(
+    plannerContextBlock,
+    /throw new Error\("speech-aware planner produced no plan on speech-bearing input"\)/,
+  );
+  assertMarkersInOrder(processFilesBlock, [
+    'const candidateVariants: CandidateVariant[] = plannerContext.sourcePreservingFallback',
+    '["source-safe"]',
+    "sourcePassthroughChain: plannerContext.sourcePreservingFallback",
+    "disableLimiter: plannerContext.sourcePreservingFallback",
+    "disableGainPlanner: plannerContext.sourcePreservingFallback",
+    "selectedSourcePreservingFallback",
+    "final polish skipped; planner produced no usable gain plan",
+    "corrective processing skipped; planner produced no usable gain plan",
+  ]);
+});
+
+test("planner no-plan output stays source-preserving through every later delivery transform", () => {
+  const outputEntryBlock = sourceBetween(
+    "type OutputEntry = {",
+    "type ReviewBundleAsset =",
+  );
+  const batchAlignmentBlock = sourceBetween(
+    "const alignBatchMixReadyOutputs = async",
+    "const applyFinalConsonantResidualToOutputs = async",
+  );
+  const renderFallbackBlock = sourceBetween(
+    "const renderMixReadyWithFallbacks = async",
+    "let lastMixError: unknown = null",
+  );
+  const finalResidualBlock = sourceBetween(
+    "const applyFinalConsonantResidualToOutputs = async",
+    "const buildFinalReviewBundles = async",
+  );
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assert.match(outputEntryBlock, /sourcePreservingFallback\?: boolean/);
+  assertMarkersInOrder(renderFallbackBlock, [
+    "options?.sourcePassthroughChain",
+    "source-preserving passthrough",
+    "disableLimiter: true",
+    "if (!options?.sourcePassthroughChain)",
+    "room cleanup bypass",
+    "stability-safe chain",
+    "audibility passthrough",
+  ]);
+  assert.match(
+    batchAlignmentBlock,
+    /\.filter\(\(\{ entry \}\) => entry\.kind === "mixready" && !entry\.sourcePreservingFallback\)/,
+  );
+  assert.match(batchAlignmentBlock, /excluded \(source-preserving planner fallback\)/);
+  assertMarkersInOrder(finalResidualBlock, [
+    "if (entry.sourcePreservingFallback)",
+    "source-preserving planner fallback; original bytes kept",
+    "continue",
+  ]);
+  assertMarkersInOrder(processFilesBlock, [
+    "shouldEmitMixReadyOutput(loudnessConfig !== null) || selectedSourcePreservingFallback",
+    "sourcePreservingFallback: selectedSourcePreservingFallback",
+    "sceneBlend && !selectedSourcePreservingFallback",
+    "loudnessConfig && !selectedSourcePreservingFallback",
+    "decoded 48 kHz float source-preserving output",
+  ]);
+  assert.match(
+    voLevelerSource,
+    /Source-preserving fallback: the gain planner returned no usable plan, so no adaptive enhancement or later mastering transform was applied\./,
+  );
+});
 
 test("adaptive diagnostics identify percentage scores as lower-is-better risks", () => {
   assert.match(voLevelerSource, /QC risks \(lower is better\): instability/);

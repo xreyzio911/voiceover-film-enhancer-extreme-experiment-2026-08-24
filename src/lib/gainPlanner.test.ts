@@ -1233,6 +1233,46 @@ const synthesizeIsolatedEvidenceLaneTake = (eventPeakDb: readonly number[]) => {
   return { samples, sampleRate, centersSec };
 };
 
+const synthesizeAlternatingEvidenceLaneTake = (
+  eventPeakDb: readonly number[],
+  centersSec: readonly number[] = [
+    0.051,
+    0.101,
+    0.105,
+    0.109,
+    0.113,
+    0.117,
+    0.203,
+    0.307,
+  ],
+) => {
+  const sampleRate = 48000;
+  const durationSec = 0.4;
+  // The five central bursts occupy every other 2 ms owner. This reproduces
+  // the alternating authorized/zero owner pattern measured in the German
+  // stage probe while the irregular outer events keep reference alignment
+  // unambiguous.
+  const eventRadiusSec = 0.0004;
+  const samples = new Float32Array(Math.round(sampleRate * durationSec));
+  for (let index = 0; index < samples.length; index += 1) {
+    samples[index] = dbToLin(-20.2)
+      * Math.sin((2 * Math.PI * 220 * index) / sampleRate)
+      * Math.SQRT2;
+  }
+  for (const [eventIndex, centerSec] of centersSec.entries()) {
+    const centerSample = Math.round(centerSec * sampleRate);
+    const radiusSamples = Math.round(eventRadiusSec * sampleRate);
+    for (let index = centerSample - radiusSamples; index <= centerSample + radiusSamples; index += 1) {
+      const normalizedOffset = (index - centerSample) / radiusSamples;
+      const envelope = Math.cos((normalizedOffset * Math.PI) / 2) ** 2;
+      samples[index] = dbToLin(eventPeakDb[eventIndex] ?? -120)
+        * Math.sin((2 * Math.PI * 6000 * index) / sampleRate)
+        * envelope;
+    }
+  }
+  return { samples, sampleRate, centersSec };
+};
+
 const synthesizeFractionalBoundaryLaneTake = (
   eventPeakDb: readonly [number, number | null],
 ) => {
@@ -1622,6 +1662,133 @@ describe("full-rate rendered consonant peak tamer", () => {
       result.samples.slice(secondOwnerEnd + 1, secondOwnerEnd + 1 + samplesPerEvidenceFrame),
       rendered.samples.slice(secondOwnerEnd + 1, secondOwnerEnd + 1 + samplesPerEvidenceFrame),
       "the following native owner must remain sample-identical",
+    );
+  });
+
+  it("reconciles one-frame holes inside a processing-grown consonant event without raising its bounded depth", () => {
+    const source = synthesizeAlternatingEvidenceLaneTake([
+      -4,
+      -4,
+      -4,
+      -4,
+      -4,
+      -4,
+      -4,
+      -4,
+    ]);
+    const rendered = synthesizeAlternatingEvidenceLaneTake([
+      -4,
+      2,
+      2,
+      2,
+      2,
+      2,
+      -4,
+      -4,
+    ]);
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+
+    const result = tameRenderedConsonantPeaks(rendered.samples, rendered.sampleRate, 10, {
+      reference,
+      maxReductionDb: 2.5,
+    });
+    const samplesPerEvidenceFrame = Math.round(
+      (rendered.sampleRate * RENDERED_CONSONANT_SOURCE_FRAME_MS) / 1000,
+    );
+    const firstEvidenceFrame = Math.floor(
+      (rendered.centersSec[1] * 1000) / RENDERED_CONSONANT_SOURCE_FRAME_MS,
+    );
+    const ownerPeakReductionDb = (frame: number) => maxSampleReductionDb(
+      rendered.samples,
+      result.samples,
+      frame * samplesPerEvidenceFrame,
+      (frame + 1) * samplesPerEvidenceFrame - 1,
+    ).maxReductionDb;
+    const evidenceReductionDb = Array.from(
+      { length: 5 },
+      (_, eventIndex) => ownerPeakReductionDb(firstEvidenceFrame + eventIndex * 2),
+    );
+    const bridgedReductionDb = Array.from(
+      { length: 4 },
+      (_, gapIndex) => ownerPeakReductionDb(firstEvidenceFrame + gapIndex * 2 + 1),
+    );
+
+    assert.equal(result.stats.referenceUsed, true);
+    assert.ok(
+      evidenceReductionDb.every((reductionDb) => reductionDb >= 0.4 && reductionDb <= 0.75),
+      `multi-frame event must retain useful repair, got ${evidenceReductionDb.map((value) => value.toFixed(3)).join(", ")}`,
+    );
+    assert.ok(
+      bridgedReductionDb.every((reductionDb) => reductionDb >= 0.12 && reductionDb <= 0.25),
+      `one-frame event holes must receive a soft bridge, got ${bridgedReductionDb.map((value) => value.toFixed(3)).join(", ")}`,
+    );
+    for (const [gapIndex, bridgedDb] of bridgedReductionDb.entries()) {
+      assert.ok(
+        bridgedDb
+          <= Math.min(evidenceReductionDb[gapIndex], evidenceReductionDb[gapIndex + 1]) * 0.41,
+        `bridge ${gapIndex} borrowed depth: ${bridgedDb.toFixed(3)} dB vs neighbors ${evidenceReductionDb[gapIndex].toFixed(3)}/${evidenceReductionDb[gapIndex + 1].toFixed(3)} dB`,
+      );
+    }
+    assert.ok(
+      result.stats.maxReductionDb <= 0.75,
+      `bridging must not deepen the event's existing isolated-owner ceiling, got ${result.stats.maxReductionDb.toFixed(3)} dB`,
+    );
+    assert.deepEqual(
+      result.samples.slice(
+        (firstEvidenceFrame - 1) * samplesPerEvidenceFrame,
+        firstEvidenceFrame * samplesPerEvidenceFrame,
+      ),
+      rendered.samples.slice(
+        (firstEvidenceFrame - 1) * samplesPerEvidenceFrame,
+        firstEvidenceFrame * samplesPerEvidenceFrame,
+      ),
+      "an unbounded owner before the event must remain sample-identical",
+    );
+    assert.deepEqual(
+      result.samples.slice(
+        (firstEvidenceFrame + 9) * samplesPerEvidenceFrame,
+        (firstEvidenceFrame + 10) * samplesPerEvidenceFrame,
+      ),
+      rendered.samples.slice(
+        (firstEvidenceFrame + 9) * samplesPerEvidenceFrame,
+        (firstEvidenceFrame + 10) * samplesPerEvidenceFrame,
+      ),
+      "an unbounded owner after the event must remain sample-identical",
+    );
+  });
+
+  it("does not propagate event smoothing across a true two-frame evidence gap", () => {
+    const centersSec = [0.051, 0.101, 0.107, 0.203, 0.307] as const;
+    const source = synthesizeAlternatingEvidenceLaneTake(
+      [-4, -4, -4, -4, -4],
+      centersSec,
+    );
+    const rendered = synthesizeAlternatingEvidenceLaneTake(
+      [-4, 2, 2, -4, -4],
+      centersSec,
+    );
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+
+    const result = tameRenderedConsonantPeaks(rendered.samples, rendered.sampleRate, 10, {
+      reference,
+      maxReductionDb: 2.5,
+    });
+    const samplesPerEvidenceFrame = Math.round(
+      (rendered.sampleRate * RENDERED_CONSONANT_SOURCE_FRAME_MS) / 1000,
+    );
+    const firstEvidenceFrame = Math.floor(
+      (centersSec[1] * 1000) / RENDERED_CONSONANT_SOURCE_FRAME_MS,
+    );
+    const gapStart = (firstEvidenceFrame + 1) * samplesPerEvidenceFrame;
+    const gapEnd = (firstEvidenceFrame + 3) * samplesPerEvidenceFrame;
+
+    assert.equal(result.stats.referenceUsed, true);
+    assert.deepEqual(
+      result.samples.slice(gapStart, gapEnd),
+      rendered.samples.slice(gapStart, gapEnd),
+      "two unsupported owners must remain sample-identical instead of becoming a propagated bridge",
     );
   });
 

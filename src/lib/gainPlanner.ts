@@ -1925,7 +1925,43 @@ export const tameRenderedConsonantPeaks = (
             * (previousEvidenceSupportDb + nextEvidenceSupportDb),
       );
     }
-    sourceRelativeOwnerCapDbByFrame = evidenceSupportedCapDbByFrame;
+    const eventContiguousCapDbByFrame = new Float32Array(
+      evidenceSupportedCapDbByFrame,
+    );
+    for (let frame = 1; frame + 1 < frameCount; frame += 1) {
+      const requestedReductionDb = sourceRelativeReductionDbByFrame[frame];
+      const previousSupportDb = sourceRelativeReductionDbByFrame[frame - 1];
+      const nextSupportDb = sourceRelativeReductionDbByFrame[frame + 1];
+      const boundedBridgeEvidenceDb = Math.min(previousSupportDb, nextSupportDb);
+      const missingBridgeEvidenceDb = Math.max(
+        0,
+        boundedBridgeEvidenceDb - requestedReductionDb,
+      );
+      const missingAuthority = boundedBridgeEvidenceDb > 0
+        ? smoothUnitRamp(
+            missingBridgeEvidenceDb / boundedBridgeEvidenceDb,
+            0,
+            1,
+          )
+        : 0;
+      const boundedBridgeCapDb = Math.min(
+        evidenceSupportedCapDbByFrame[frame - 1],
+        evidenceSupportedCapDbByFrame[frame + 1],
+      ) * RENDERED_CONSONANT_ADJACENT_SUPPORT_SCALE;
+      const missingBridgeCapDb = Math.max(
+        0,
+        boundedBridgeCapDb - evidenceSupportedCapDbByFrame[frame],
+      );
+      // Reconcile only a one-frame valley bounded by original evidence on both
+      // sides. Neighbor caps come from the untouched decision array, so a wider
+      // gap stays at zero and a bridge cannot deepen either evidence owner.
+      // Smooth missing-evidence authority avoids introducing an engagement step;
+      // the existing adjacent-support scale keeps a fully missing cell shallow.
+      eventContiguousCapDbByFrame[frame] =
+        evidenceSupportedCapDbByFrame[frame]
+        + missingBridgeCapDb * missingAuthority;
+    }
+    sourceRelativeOwnerCapDbByFrame = eventContiguousCapDbByFrame;
     tamedFrameCount = 0;
     maxReductionDb = 0;
     for (let frame = 0; frame < frameCount; frame += 1) {
@@ -1935,7 +1971,7 @@ export const tameRenderedConsonantPeaks = (
       // down-up hole while a real multi-frame event retains useful depth.
       dipDbByFrame[frame] = Math.min(
         dipDbByFrame[frame],
-        evidenceSupportedCapDbByFrame[frame],
+        eventContiguousCapDbByFrame[frame],
       );
       if (dipDbByFrame[frame] > 0) {
         tamedFrameCount += 1;

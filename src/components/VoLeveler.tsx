@@ -105,6 +105,7 @@ import {
   shouldPublishGenericFfmpegProgress,
   shouldRecycleFfmpegBeforeOperation,
 } from "../lib/ffmpegLifecyclePolicy";
+import { resolveGainPlannerOutcome } from "../lib/plannerFallbackPolicy";
 import {
   formatLongFormPartTag,
   planLongFormChunks,
@@ -414,6 +415,7 @@ type OutputEntry = {
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
   processingFlow: "app" | "app-final-polish";
+  sourcePreservingFallback?: boolean;
   sourceBase?: string;
   sourceName?: string;
   partIndex?: number;
@@ -4494,7 +4496,10 @@ const summarizeFailureReason = (error: unknown) => {
     kind: OutputEntry["kind"],
     variant: OutputEntry["variant"],
     processingFlow: OutputEntry["processingFlow"] = "app",
-    metadata: Pick<OutputEntry, "sourceBase" | "sourceName" | "partIndex" | "partTotal"> = {},
+    metadata: Pick<
+      OutputEntry,
+      "sourceBase" | "sourceName" | "partIndex" | "partTotal" | "sourcePreservingFallback"
+    > = {},
   ): Promise<OutputEntry> => {
     const bytes = await readVirtualFileBytes(ffmpeg, name);
     const blob = new Blob([bytes], { type: "audio/wav" });
@@ -5527,9 +5532,14 @@ const summarizeFailureReason = (error: unknown) => {
       return `${entry.variant}:${sourceKey}`;
     };
 
+    for (const entry of outputEntries) {
+      if (entry.kind === "mixready" && entry.sourcePreservingFallback) {
+        appendLog(`[BatchAlign] ${entry.name}: excluded (source-preserving planner fallback).`);
+      }
+    }
     const targets = outputEntries
       .map((entry, index) => ({ entry, index }))
-      .filter(({ entry }) => entry.kind === "mixready")
+      .filter(({ entry }) => entry.kind === "mixready" && !entry.sourcePreservingFallback)
       .map(({ entry, index }) => ({ entry, index, groupId: buildGroupId(entry) }));
     if (targets.length < 2) {
       appendLog("[BatchAlign] skipped (fewer than 2 mix-ready outputs).");
@@ -5744,6 +5754,12 @@ const summarizeFailureReason = (error: unknown) => {
   ): Promise<OutputEntry[]> => {
     for (let index = 0; index < outputEntries.length; index += 1) {
       const entry = outputEntries[index];
+      if (entry.sourcePreservingFallback) {
+        appendLog(
+          `[FinalPeakTamer] ${entry.name}: source-preserving planner fallback; original bytes kept.`,
+        );
+        continue;
+      }
       const sourceReference =
         consonantReferencesByOutputKey.get(entry.name) ??
         (entry.sourceBase ? consonantReferencesByOutputKey.get(entry.sourceBase) : undefined);
@@ -6432,6 +6448,7 @@ const summarizeFailureReason = (error: unknown) => {
     leveledReady: boolean;
     applyChunkSeconds: number | null;
     nativeSourceConsonantReference: RenderedConsonantReference | null;
+    sourcePreservingFallback: boolean;
   };
 
   const analysisLooksSpeechBearing = (analysis: FileAnalysis | undefined, durationSeconds: number | null) => {
@@ -6453,13 +6470,22 @@ const summarizeFailureReason = (error: unknown) => {
       leveledReady: false,
       applyChunkSeconds: null,
       nativeSourceConsonantReference: null,
+      sourcePreservingFallback: false,
     };
     if (!getActiveAudioReviewControls().gainPlannerEnabled) return context;
 
     const plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, durationSeconds);
+    const plannerOutcome = resolveGainPlannerOutcome({
+      hasUsablePlan: plan !== null,
+      speechBearing: analysisLooksSpeechBearing(analysis, durationSeconds),
+    });
     if (!plan) {
-      if (analysisLooksSpeechBearing(analysis, durationSeconds)) {
-        throw new Error("speech-aware planner produced no plan on speech-bearing input");
+      if (plannerOutcome.action === "render-source-preserving") {
+        context.sourcePreservingFallback = true;
+        appendLog(
+          `[PlannerFallback] ${job.base}: no usable gain plan for speech-bearing input; continuing with a source-preserving single-pass output (no adaptive enhancement claimed).`,
+        );
+        return context;
       }
       appendLog(`[Planner] ${job.base}: bypassed (no-op; short or silent input).`);
       return context;
@@ -6610,75 +6636,97 @@ const summarizeFailureReason = (error: unknown) => {
     const hasRoomFilters =
       getActiveAudioReviewControls().roomCleanup && !!profile && (profile.useTailGate || profile.echoNotchCutDb >= 0.25);
     const hasAdaptiveNoiseReduction = resolveAdaptiveNoiseReductionFilter(profile, options) !== null;
-    const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = [{ label: "primary chain" }];
-    if (hasRoomFilters) {
+    const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = options?.sourcePassthroughChain
+      ? [
+          {
+            label: "source-preserving passthrough",
+            options: {
+              candidateVariant: "source-safe",
+              disableRoomCleanup: true,
+              disableAdaptiveNoiseReduction: true,
+              disableSegmentGainMatch: true,
+              disableGainPlanner: true,
+              disableHeadPriming: true,
+              skipSpeechSegmentation: true,
+              sourceSafeChain: true,
+              sourcePassthroughChain: true,
+              disableLimiter: true,
+              disableTailGate: true,
+              disableSpikeTamers: true,
+            },
+          },
+        ]
+      : [{ label: "primary chain" }];
+    if (!options?.sourcePassthroughChain) {
+      if (hasRoomFilters) {
+        fallbackStrategies.push({
+          label: "room cleanup bypass",
+          options: { disableRoomCleanup: true },
+        });
+      }
+      if (hasAdaptiveNoiseReduction) {
+        fallbackStrategies.push({
+          label: "adaptive-NR bypass",
+          options: { disableAdaptiveNoiseReduction: true },
+        });
+      }
+      if (hasRoomFilters && hasAdaptiveNoiseReduction) {
+        fallbackStrategies.push({
+          label: "room cleanup + adaptive-NR bypass",
+          options: { disableRoomCleanup: true, disableAdaptiveNoiseReduction: true },
+        });
+      }
       fallbackStrategies.push({
-        label: "room cleanup bypass",
-        options: { disableRoomCleanup: true },
+        label: "stability-safe chain",
+        options: {
+          disableRoomCleanup: true,
+          disableAdaptiveNoiseReduction: true,
+          minimalStabilityChain: true,
+        },
+      });
+      fallbackStrategies.push({
+        label: PLANNER_TAIL_SAFE_STRATEGY_LABEL,
+        options: {
+          candidateVariant: "source-safe",
+          sourceSafeChain: true,
+          disableRoomCleanup: true,
+          disableAdaptiveNoiseReduction: true,
+          disableSegmentGainMatch: true,
+          skipSpeechSegmentation: true,
+          disableHeadPriming: true,
+          minimalStabilityChain: true,
+          disableTailGate: true,
+          disableSpikeTamers: true,
+        },
+      });
+      fallbackStrategies.push({
+        label: AUDIBILITY_SAFE_STRATEGY_LABEL,
+        options: {
+          candidateVariant: "source-safe",
+          sourceSafeChain: true,
+          disableRoomCleanup: true,
+          disableAdaptiveNoiseReduction: true,
+          disableSegmentGainMatch: true,
+          disableHeadPriming: true,
+          skipSpeechSegmentation: true,
+          minimalStabilityChain: true,
+        },
+      });
+      fallbackStrategies.push({
+        label: "audibility passthrough",
+        options: {
+          candidateVariant: "source-safe",
+          disableRoomCleanup: true,
+          disableAdaptiveNoiseReduction: true,
+          disableSegmentGainMatch: true,
+          disableGainPlanner: true,
+          disableHeadPriming: true,
+          skipSpeechSegmentation: true,
+          sourceSafeChain: true,
+          sourcePassthroughChain: true,
+        },
       });
     }
-    if (hasAdaptiveNoiseReduction) {
-      fallbackStrategies.push({
-        label: "adaptive-NR bypass",
-        options: { disableAdaptiveNoiseReduction: true },
-      });
-    }
-    if (hasRoomFilters && hasAdaptiveNoiseReduction) {
-      fallbackStrategies.push({
-        label: "room cleanup + adaptive-NR bypass",
-        options: { disableRoomCleanup: true, disableAdaptiveNoiseReduction: true },
-      });
-    }
-    fallbackStrategies.push({
-      label: "stability-safe chain",
-      options: {
-        disableRoomCleanup: true,
-        disableAdaptiveNoiseReduction: true,
-        minimalStabilityChain: true,
-      },
-    });
-    fallbackStrategies.push({
-      label: PLANNER_TAIL_SAFE_STRATEGY_LABEL,
-      options: {
-        candidateVariant: "source-safe",
-        sourceSafeChain: true,
-        disableRoomCleanup: true,
-        disableAdaptiveNoiseReduction: true,
-        disableSegmentGainMatch: true,
-        skipSpeechSegmentation: true,
-        disableHeadPriming: true,
-        minimalStabilityChain: true,
-        disableTailGate: true,
-        disableSpikeTamers: true,
-      },
-    });
-    fallbackStrategies.push({
-      label: AUDIBILITY_SAFE_STRATEGY_LABEL,
-      options: {
-        candidateVariant: "source-safe",
-        sourceSafeChain: true,
-        disableRoomCleanup: true,
-        disableAdaptiveNoiseReduction: true,
-        disableSegmentGainMatch: true,
-        disableHeadPriming: true,
-        skipSpeechSegmentation: true,
-        minimalStabilityChain: true,
-      },
-    });
-    fallbackStrategies.push({
-      label: "audibility passthrough",
-      options: {
-        candidateVariant: "source-safe",
-        disableRoomCleanup: true,
-        disableAdaptiveNoiseReduction: true,
-        disableSegmentGainMatch: true,
-        disableGainPlanner: true,
-        disableHeadPriming: true,
-        skipSpeechSegmentation: true,
-        sourceSafeChain: true,
-        sourcePassthroughChain: true,
-      },
-    });
 
     let lastMixError: unknown = null;
     let mixRendered = false;
@@ -7555,13 +7603,22 @@ const summarizeFailureReason = (error: unknown) => {
             fileAnalysis,
             fileDurationForVariants,
           );
+          if (plannerContext.sourcePreservingFallback) {
+            sourceConsonantReference = null;
+            consonantReferencesByOutputKey.delete(job.base);
+            appendLog(
+              `[FinalPeakTamer] ${job.base}: skipped because the planner no-plan fallback must preserve the source.`,
+            );
+          }
           if (!sourceConsonantReference && plannerContext.plan?.sourceConsonantReference) {
             consonantReferencesByOutputKey.set(job.base, plannerContext.plan.sourceConsonantReference);
             appendLog(
               `[FinalPeakTamer] ${job.base}: retained compact 16 kHz planner reference for final delivery.`,
             );
           }
-          const candidateVariants = buildMixCandidateVariants(profile, fileDurationForVariants);
+          const candidateVariants: CandidateVariant[] = plannerContext.sourcePreservingFallback
+            ? ["source-safe"]
+            : buildMixCandidateVariants(profile, fileDurationForVariants);
           const isLongFile =
             fileDurationForVariants !== null && fileDurationForVariants >= LONG_FILE_DURATION_SECONDS;
           if (isLongFile) {
@@ -7595,11 +7652,19 @@ const summarizeFailureReason = (error: unknown) => {
             const candidateOptions: MixRenderOptions = {
               candidateVariant,
               skipSpeechSegmentation:
+                plannerContext.sourcePreservingFallback ||
                 candidateVariant === "source-safe" ||
                 (candidateVariant === "continuity-safe" && (profile?.preferSinglePassContinuity ?? false)),
               sourceSafeChain: candidateVariant === "source-safe",
               disableRoomCleanup: candidateVariant === "source-safe" ? true : undefined,
               disableAdaptiveNoiseReduction: candidateVariant === "source-safe" ? true : undefined,
+              sourcePassthroughChain: plannerContext.sourcePreservingFallback,
+              disableLimiter: plannerContext.sourcePreservingFallback,
+              disableGainPlanner: plannerContext.sourcePreservingFallback,
+              disableHeadPriming: plannerContext.sourcePreservingFallback,
+              disableSegmentGainMatch: plannerContext.sourcePreservingFallback,
+              disableTailGate: plannerContext.sourcePreservingFallback,
+              disableSpikeTamers: plannerContext.sourcePreservingFallback,
             };
             try {
               const renderResult = await renderMixReadyWithFallbacks(
@@ -7786,7 +7851,9 @@ const summarizeFailureReason = (error: unknown) => {
                 selectedScore = candidateScore;
                 selectedAnalysis = candidateAnalysis;
                 selectedMeta = candidateMeta;
-                selectedReason = "source-first single render; reranking temporarily disabled";
+                selectedReason = plannerContext.sourcePreservingFallback
+                  ? "source-preserving fallback because the gain planner returned no usable plan; adaptive enhancement not claimed"
+                  : "source-first single render; reranking temporarily disabled";
               }
 
               const candidateHasRenderDegrade = candidateMeta.degradeReasons.some(
@@ -7892,9 +7959,14 @@ const summarizeFailureReason = (error: unknown) => {
             }.`
           );
           appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
+          const selectedSourcePreservingFallback = plannerContext.sourcePreservingFallback;
           const selectedAudibilityProtected = isAudibilityProtectedRender(selectedMeta);
           let outputProcessingFlow: OutputEntry["processingFlow"] = "app";
-          if (selectedAudibilityProtected) {
+          if (selectedSourcePreservingFallback) {
+            appendLog(
+              `[FinalPolish] ${job.base}: final polish skipped; planner produced no usable gain plan, so the source-preserving fallback remains untouched.`,
+            );
+          } else if (selectedAudibilityProtected) {
             appendLog(
               `[FinalPolish] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`,
             );
@@ -8082,11 +8154,20 @@ const summarizeFailureReason = (error: unknown) => {
             ],
           });
 
-          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedAudibilityProtected) {
+          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedSourcePreservingFallback) {
+            appendLog(
+              `[Corrective] ${job.base}: corrective processing skipped; planner produced no usable gain plan and the source-preserving fallback must remain untouched.`,
+            );
+          } else if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedAudibilityProtected) {
             appendLog(`[Corrective] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`);
           }
 
-          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && !selectedAudibilityProtected) {
+          if (
+            MAX_CORRECTIVE_PASSES > 0 &&
+            selectedVariant &&
+            !selectedSourcePreservingFallback &&
+            !selectedAudibilityProtected
+          ) {
             const selectedPostPolishBytes = await readVirtualFileBytes(ffmpeg, job.mixName);
             const selectedPostPolishArtifact = await buildArtifactForRenderedMix(
               job.mixName,
@@ -8367,10 +8448,11 @@ const summarizeFailureReason = (error: unknown) => {
             };
           }
 
-          if (shouldEmitMixReadyOutput(loudnessConfig !== null)) {
+          if (shouldEmitMixReadyOutput(loudnessConfig !== null) || selectedSourcePreservingFallback) {
             const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean", outputProcessingFlow, {
               sourceBase: job.base,
               sourceName: job.file.name,
+              sourcePreservingFallback: selectedSourcePreservingFallback,
             });
             outputEntries.push(mixOutput);
             if (pendingFinalReviewBundle) {
@@ -8378,7 +8460,7 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          if (sceneBlend) {
+          if (sceneBlend && !selectedSourcePreservingFallback) {
             const indoorGain = profile?.blendIndoorGain ?? 0;
             const outdoorGain = profile?.blendOutdoorGain ?? 0;
             if (indoorGain + outdoorGain <= 0.0001) {
@@ -8411,7 +8493,7 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          if (loudnessConfig) {
+          if (loudnessConfig && !selectedSourcePreservingFallback) {
             cleanLoudName = `${job.base}_${loudnessConfig.suffix}.wav`;
             setStatus(`Loudness clean: ${job.base} (${i + 1}/${jobs.length})`);
             setActiveQueueStage(job.base, "Loudness (clean)", `File ${i + 1} of ${jobs.length}`);
@@ -8442,6 +8524,11 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
+          if (selectedSourcePreservingFallback) {
+            appendLog(
+              `[PlannerFallback] ${job.base}: emitted one decoded 48 kHz float source-preserving output; scene blend, loudness normalization, batch alignment, and final consonant residual are excluded.`,
+            );
+          }
           markQueueDone(job.base, "Outputs ready");
           }
         } catch (error) {
@@ -8700,6 +8787,7 @@ const summarizeFailureReason = (error: unknown) => {
       kind: output.kind,
       variant: output.variant,
       processingFlow: output.processingFlow,
+      sourcePreservingFallback: output.sourcePreservingFallback === true,
       sizeBytes: output.size,
     })),
   });
@@ -9423,7 +9511,9 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={`${styles.outputList} ${styles.sectionTop}`}>
             {outputs.length === 0 && <div className={styles.dropHint}>No output yet.</div>}
             {outputs.map((output, index) => {
-              const outputHelpText = output.kind === "mixready"
+              const outputHelpText = output.sourcePreservingFallback
+                ? "Source-preserving fallback: the gain planner returned no usable plan, so no adaptive enhancement or later mastering transform was applied."
+                : output.kind === "mixready"
                 ? output.variant === "blend"
                   ? "Blend mix-ready: subtle scene glue applied; not loudness-normalized."
                   : "Mix-ready: processed and leveled, but not loudness-normalized. Best for film mix stems."
@@ -9442,6 +9532,9 @@ const summarizeFailureReason = (error: unknown) => {
                     </span>
                     {output.processingFlow === "app-final-polish" && (
                       <span className={styles.outputBadge}>Final app polish</span>
+                    )}
+                    {output.sourcePreservingFallback && (
+                      <span className={styles.outputBadge}>Source preserved</span>
                     )}
                     {output.kind === "mixready" ? (
                       <>
