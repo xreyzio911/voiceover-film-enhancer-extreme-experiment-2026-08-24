@@ -5,9 +5,11 @@ import {
   PLANNER_TAIL_SAFE_STRATEGY_LABEL,
   buildRenderRiskProfile,
   compareCandidateScores,
+  resolveCandidateMeasurementStatus,
   resolveNextAudibilityFallbackIndex,
   selectQcUnavailableFallbackCandidate,
   shouldPreferCandidate,
+  summarizeCandidateScore,
   type CandidateRenderMeta,
   type CandidateScore,
 } from "./renderRecovery.ts";
@@ -280,4 +282,74 @@ test("qc-unavailable fallback rejects candidates without rendered audio or with 
   ]);
 
   assert.equal(selection, null);
+});
+
+test("distributed candidate QC remains partial even when every sampled window succeeds", () => {
+  assert.equal(
+    resolveCandidateMeasurementStatus({
+      analysisWindowsAttempted: 6,
+      analysisWindowsSucceeded: 6,
+      analysisWindowsDropped: 0,
+    }),
+    "partial",
+  );
+  assert.equal(
+    resolveCandidateMeasurementStatus({
+      analysisWindowsAttempted: 0,
+      analysisWindowsSucceeded: 0,
+      analysisWindowsDropped: 0,
+    }),
+    "measured",
+  );
+});
+
+test("unavailable candidate QC is described as unavailable instead of measured 100 percent risks", () => {
+  const summary = summarizeCandidateScore(
+    buildScore({
+      stability: 1,
+      pause: 1,
+      compression: 1,
+      echo: 1,
+      measurementStatus: "unavailable",
+      gateReasons: ["qc-unavailable"],
+    }),
+  );
+
+  assert.match(summary, /^QC unavailable/);
+  assert.match(summary, /gates qc-unavailable/);
+  assert.doesNotMatch(summary, /stability 100|pause 100|compression 100|echo 100/);
+});
+
+test("partial candidate QC remains explicitly labelled while preserving measured values", () => {
+  const summary = summarizeCandidateScore(
+    buildScore({
+      stability: 0.24,
+      pause: 0.17,
+      compression: 0.08,
+      echo: 0.11,
+      measurementStatus: "partial",
+    }),
+  );
+
+  assert.match(
+    summary,
+    /^QC partial risks \(lower is better\): stability 24 \/ pause 17 \/ compression 8 \/ echo 11/,
+  );
+});
+
+test("measured candidate QC explains that each displayed score is a lower-is-better risk", () => {
+  const summary = summarizeCandidateScore(
+    buildScore({
+      stability: 0.8,
+      pause: 0.31,
+      compression: 0.22,
+      echo: 0.57,
+      measurementStatus: "measured",
+    }),
+  );
+
+  assert.equal(
+    summary,
+    "QC risks (lower is better): stability 80 / pause 31 / compression 22 / echo 57",
+  );
 });

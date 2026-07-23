@@ -33,6 +33,12 @@ export const HIGH_VALUE_CORRECTIVE_ISSUE_TAGS = [
 ] as const satisfies readonly ReviewIssueTag[];
 
 const highValueCorrectiveIssueTagSet = new Set<ReviewIssueTag>(HIGH_VALUE_CORRECTIVE_ISSUE_TAGS);
+const nonAcousticCorrectiveDiagnosticSet = new Set([
+  "analysis-window-drop",
+  "analysis-window-retry",
+  "qc-unavailable",
+]);
+const nonAcousticCorrectiveFindingSet = new Set(["render-robustness"]);
 
 export const REVIEW_FEATURE_KEYS = [
   "baseline_total",
@@ -263,14 +269,28 @@ export type AutoReviewResult = {
 };
 
 export const shouldAttemptCorrectivePassForAssessment = (
-  assessment: Pick<AutoReviewCandidateAssessment, "failCount" | "warnCount" | "issueTags">,
+  assessment: Pick<AutoReviewCandidateAssessment, "failCount" | "warnCount" | "issueTags"> &
+    Partial<Pick<AutoReviewCandidateAssessment, "findings">>,
   gateReasons: readonly string[] = [],
-) =>
-  gateReasons.length > 0 ||
-  assessment.failCount > 0 ||
-  assessment.warnCount >= 2 ||
-  (assessment.warnCount === 1 &&
-    assessment.issueTags.some((tag) => highValueCorrectiveIssueTagSet.has(tag)));
+) => {
+  const correctiveFindings = assessment.findings?.filter(
+    (finding) => !nonAcousticCorrectiveFindingSet.has(finding.id),
+  );
+  const failCount = correctiveFindings
+    ? correctiveFindings.filter((finding) => finding.status === "fail").length
+    : assessment.failCount;
+  const warnCount = correctiveFindings
+    ? correctiveFindings.filter((finding) => finding.status === "warn").length
+    : assessment.warnCount;
+
+  return (
+    gateReasons.some((reason) => !nonAcousticCorrectiveDiagnosticSet.has(reason)) ||
+    failCount > 0 ||
+    warnCount >= 2 ||
+    (warnCount === 1 &&
+      assessment.issueTags.some((tag) => highValueCorrectiveIssueTagSet.has(tag)))
+  );
+};
 
 export const resolveCorrectiveMaxFilesPerBatch = (fileCount: number) => {
   const safeFileCount = Number.isFinite(fileCount) ? Math.max(0, fileCount) : 0;
@@ -720,9 +740,14 @@ const pushAssessmentCheck = (
   }
 };
 
-const summarizeAssessment = (assessment: AutoReviewCandidateAssessment) => {
+const summarizeAssessment = (
+  assessment: AutoReviewCandidateAssessment,
+  acousticQcAvailable: boolean,
+) => {
   const issueLead =
-    assessment.issueTags.length > 0
+    !acousticQcAvailable
+      ? "Acoustic QC unavailable; missing measurements were not treated as acoustic defects."
+      : assessment.issueTags.length > 0
       ? `Issues: ${assessment.issueTags.join(", ")}.`
       : "No significant technical defects detected.";
   return `${assessment.variantLabel}: ${assessment.failCount} fail, ${assessment.warnCount} warn, ${assessment.passCount} pass checks. ${issueLead}`;
@@ -792,6 +817,8 @@ const buildCandidateAssessment = (
     )}, confidence ${formatPercent(alignment.confidence)}.`,
   });
 
+  const findingCountBeforeAcousticChecks = findings.length;
+  const issueTagsBeforeAcousticChecks = new Set(issueTags);
   const instabilityDelta = safeNumber(delta?.instabilityScore);
   const sentenceJumpDelta = safeNumber(delta?.sentenceJumpScore);
   const lineSwing = safeNumber(qc?.lineSwingScore);
@@ -993,11 +1020,14 @@ const buildCandidateAssessment = (
       hasFiniteNumber(delta?.noiseContrastDb) ? ` (${formatSignedDb(delta.noiseContrastDb)} vs source)` : ""
     }.`,
   });
+  const applicableFindings = qc
+    ? findings
+    : findings.slice(0, findingCountBeforeAcousticChecks);
+  const applicableIssueTags = qc ? issueTags : issueTagsBeforeAcousticChecks;
 
-  pushAssessmentCheck(findings, issueTags, {
+  pushAssessmentCheck(applicableFindings, applicableIssueTags, {
     id: "render-robustness",
     label: "Render Robustness",
-    tag: "other",
     fail: candidate.renderMeta.degraded && candidate.ranking.gateReasons.length >= 2,
     warn: candidate.renderMeta.degraded || candidate.ranking.gateReasons.length > 0,
     failSeverity: "major",
@@ -1007,9 +1037,9 @@ const buildCandidateAssessment = (
     }.`,
   });
 
-  const passCount = findings.filter((finding) => finding.status === "pass").length;
-  const warnCount = findings.filter((finding) => finding.status === "warn").length;
-  const failCount = findings.filter((finding) => finding.status === "fail").length;
+  const passCount = applicableFindings.filter((finding) => finding.status === "pass").length;
+  const warnCount = applicableFindings.filter((finding) => finding.status === "warn").length;
+  const failCount = applicableFindings.filter((finding) => finding.status === "fail").length;
   const assessment: AutoReviewCandidateAssessment = {
     role: candidate.role,
     variantLabel: candidate.variantLabel,
@@ -1017,12 +1047,12 @@ const buildCandidateAssessment = (
     passCount,
     warnCount,
     failCount,
-    issueTags: Array.from(issueTags),
-    findings,
+    issueTags: Array.from(applicableIssueTags),
+    findings: applicableFindings,
     summary: "",
   };
   assessment.technicalRiskScore = buildAssessmentRiskScore(assessment, candidate.ranking);
-  assessment.summary = summarizeAssessment(assessment);
+  assessment.summary = summarizeAssessment(assessment, qc !== null);
   return assessment;
 };
 

@@ -17,6 +17,10 @@ const eslintConfig = defineConfig([
     ".audio-separator-models/**",
     "checkpoints/**",
     "_qctest/**",
+    // Local browser/render proof and private audio fixtures are not app source.
+    ".playwright-mcp/**",
+    "tasks/render-evidence/**",
+    "audio testing/**",
     // FFmpeg core bundles are third-party generated artifacts.
     "public/ffmpeg/**",
   ]),

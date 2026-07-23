@@ -23,10 +23,58 @@ export type CandidateScore = {
   compression: number;
   echo: number;
   total: number;
+  /** Whether the acoustic metrics were actually observed. Missing means measured for legacy callers. */
+  measurementStatus?: CandidateMeasurementStatus;
   hardGatePenalty?: number;
   learnedAdjustment?: number;
   rankingScore?: number;
   gateReasons?: string[];
+};
+
+export type CandidateMeasurementStatus = "measured" | "partial" | "unavailable";
+
+type CandidateMeasurementWindowSummary = Readonly<{
+  analysisWindowsAttempted?: number | null;
+  analysisWindowsSucceeded?: number | null;
+  analysisWindowsDropped?: number | null;
+}>;
+
+/**
+ * Whole-file measurements may describe the file as measured. Any distributed
+ * window plan is sampled evidence, even when every planned window succeeds,
+ * so it remains partial instead of gaining file-wide corrective authority.
+ */
+export const resolveCandidateMeasurementStatus = (
+  summary: CandidateMeasurementWindowSummary,
+): Exclude<CandidateMeasurementStatus, "unavailable"> => {
+  const hasSampledWindows = [
+    summary.analysisWindowsAttempted,
+    summary.analysisWindowsSucceeded,
+    summary.analysisWindowsDropped,
+  ].some((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+  return hasSampledWindows ? "partial" : "measured";
+};
+
+export const summarizeCandidateScore = (score: CandidateScore) => {
+  const rankingSuffix =
+    typeof score.rankingScore === "number" && Number.isFinite(score.rankingScore)
+      ? ` / rank ${score.rankingScore.toFixed(1)}`
+      : "";
+  const gateSuffix = score.gateReasons && score.gateReasons.length > 0
+    ? ` / gates ${score.gateReasons.join("+")}`
+    : "";
+
+  if (score.measurementStatus === "unavailable") {
+    return `QC unavailable${rankingSuffix}${gateSuffix}`;
+  }
+
+  const metrics = `stability ${(score.stability * 100).toFixed(0)} / pause ${(score.pause * 100).toFixed(
+    0,
+  )} / compression ${(score.compression * 100).toFixed(0)} / echo ${(score.echo * 100).toFixed(0)}`;
+  const riskLabel = score.measurementStatus === "partial"
+    ? "QC partial risks (lower is better): "
+    : "QC risks (lower is better): ";
+  return `${riskLabel}${metrics}${rankingSuffix}${gateSuffix}`;
 };
 
 export type CandidateRenderMeta = {

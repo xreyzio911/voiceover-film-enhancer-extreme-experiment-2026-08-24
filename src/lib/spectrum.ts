@@ -12,7 +12,11 @@
 
 export const SPECTRUM_BANDS_HZ = [60, 120, 250, 500, 1000, 2000, 4000, 8000] as const;
 export type SpectrumBandsHz = typeof SPECTRUM_BANDS_HZ;
-export const HOUSE_TONE_BLEND = 0.35;
+// Disabled until the fixed curve is re-derived from at least three vetted,
+// speech-gated clean references. The adaptive batch median remains active;
+// applying this unvalidated curve also stacked a bright 4-8 kHz pull on top
+// of the separate cinematic presence EQ.
+export const HOUSE_TONE_BLEND = 0;
 export const CINEMATIC_VO_REFERENCE_DB = [-28, -23, -21, -22, -23, -21.5, -20.5, -24] as const;
 
 export const DE_ESSER_PLACEMENTS = {
@@ -240,6 +244,29 @@ export const computeSibilanceScore = (bandDb: number[]): number => {
   const sib = (bandDb[6] + bandDb[7]) / 2;
   const ratio = sib - body; // positive => bright/sibilant
   return clamp((ratio + 1) / 9, 0, 1); // 0 at ratio=-1dB, 1 at ratio=+8dB
+};
+
+export type DeEsserCutsDb = {
+  mainCutDb: number;
+  secondaryCutDb: number;
+};
+
+/**
+ * Convert spectral sibilance evidence into conservative static-notch depths.
+ *
+ * Squaring the normalized score gives weak evidence very little authority
+ * while preserving a smooth, monotonic path to the existing safety caps.
+ * There is deliberately no engagement threshold: a score cannot cause a
+ * discontinuous jump in processing depth.
+ */
+export const resolveDeEsserCutsDb = (sibilanceScore: number): DeEsserCutsDb => {
+  const normalizedScore = Number.isFinite(sibilanceScore) ? clamp(sibilanceScore, 0, 1) : 0;
+  const evidenceWeight = normalizedScore * normalizedScore;
+  if (evidenceWeight === 0) return { mainCutDb: 0, secondaryCutDb: 0 };
+  return {
+    mainCutDb: -4 * evidenceWeight,
+    secondaryCutDb: -2.4 * evidenceWeight,
+  };
 };
 
 export type SpectrumTiltsDb = {

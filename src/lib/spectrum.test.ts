@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CINEMATIC_VO_REFERENCE_DB,
+  HOUSE_TONE_BLEND,
   computeLogBandSpectrumDb,
   computeSibilanceScore,
   computeToneMatchDeltaDb,
   deriveSpectrumTiltsDb,
+  resolveDeEsserCutsDb,
   resolveDeEsserBands,
   resolveSpectrumFrameBudget,
 } from "./spectrum.ts";
@@ -65,6 +67,59 @@ test("adaptive de-esser placement follows measured sibilance center", () => {
     mainHz: 6500,
     secondaryHz: 9000,
   });
+});
+
+test("de-esser depth grows continuously instead of jumping at the legacy 0.4 gate", () => {
+  const justBelow = resolveDeEsserCutsDb(0.3999);
+  const atLegacyBoundary = resolveDeEsserCutsDb(0.4);
+  const justAbove = resolveDeEsserCutsDb(0.4001);
+
+  assert.ok(justBelow.mainCutDb < 0, "sub-boundary evidence should fade in instead of being hard-gated");
+  assert.ok(atLegacyBoundary.mainCutDb > -1, "moderate evidence should not trigger the legacy -1.2 dB floor");
+  assert.ok(Math.abs(atLegacyBoundary.mainCutDb - justBelow.mainCutDb) < 0.01);
+  assert.ok(Math.abs(justAbove.mainCutDb - atLegacyBoundary.mainCutDb) < 0.01);
+});
+
+test("de-esser depth is subtle at weak evidence and bounded at strong evidence", () => {
+  const assertCuts = (score: number, expectedMain: number, expectedSecondary: number) => {
+    const cuts = resolveDeEsserCutsDb(score);
+    assert.ok(Math.abs(cuts.mainCutDb - expectedMain) < 1e-12, `${score}: main ${cuts.mainCutDb}`);
+    assert.ok(
+      Math.abs(cuts.secondaryCutDb - expectedSecondary) < 1e-12,
+      `${score}: secondary ${cuts.secondaryCutDb}`,
+    );
+  };
+
+  assert.deepEqual(resolveDeEsserCutsDb(0), { mainCutDb: 0, secondaryCutDb: 0 });
+  assertCuts(0.2, -0.16, -0.096);
+  assertCuts(0.4, -0.64, -0.384);
+  assertCuts(0.7, -1.96, -1.176);
+  assert.deepEqual(resolveDeEsserCutsDb(1), { mainCutDb: -4, secondaryCutDb: -2.4 });
+});
+
+test("de-esser depth sanitizes invalid scores and remains monotonic within its caps", () => {
+  assert.deepEqual(resolveDeEsserCutsDb(Number.NaN), { mainCutDb: 0, secondaryCutDb: 0 });
+  assert.deepEqual(resolveDeEsserCutsDb(-2), { mainCutDb: 0, secondaryCutDb: 0 });
+  assert.deepEqual(resolveDeEsserCutsDb(3), { mainCutDb: -4, secondaryCutDb: -2.4 });
+
+  const cuts = [0, 0.1, 0.25, 0.4, 0.6, 0.8, 1].map(resolveDeEsserCutsDb);
+  for (let index = 1; index < cuts.length; index += 1) {
+    assert.ok(cuts[index].mainCutDb <= cuts[index - 1].mainCutDb);
+    assert.ok(cuts[index].secondaryCutDb <= cuts[index - 1].secondaryCutDb);
+  }
+  assert.ok(cuts.every(({ mainCutDb }) => mainCutDb >= -4 && mainCutDb <= 0));
+  assert.ok(cuts.every(({ secondaryCutDb }) => secondaryCutDb >= -2.4 && secondaryCutDb <= 0));
+});
+
+test("production tone matching does not apply the unvalidated static house curve", () => {
+  const fileDb = [-28, -24, -21, -20, -22, -23, -27, -31];
+  const adaptiveBatchDb = [-27, -23, -20, -21, -22, -22, -25, -29];
+
+  assert.equal(HOUSE_TONE_BLEND, 0);
+  assert.deepEqual(
+    computeToneMatchDeltaDb(fileDb, adaptiveBatchDb, { houseBlend: HOUSE_TONE_BLEND }),
+    computeToneMatchDeltaDb(fileDb, adaptiveBatchDb, { houseBlend: 0 }),
+  );
 });
 
 test("speech-spectrum tilts are level-invariant and follow the measured tonal region", () => {

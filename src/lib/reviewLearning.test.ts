@@ -374,6 +374,71 @@ test("shouldAttemptCorrectivePassForAssessment uses fail, high-value WARN, multi
   assert.equal(shouldAttemptCorrectivePassForAssessment(buildAssessment({}), ["peak-violation"]), true);
 });
 
+test("shouldAttemptCorrectivePassForAssessment ignores measurement-availability diagnostics alone", () => {
+  const availabilityOnlyAssessment = {
+    failCount: 0,
+    warnCount: 1,
+    issueTags: [] as Array<"harsh_sibilance">,
+  };
+
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(availabilityOnlyAssessment, ["qc-unavailable"]),
+    false,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(availabilityOnlyAssessment, ["analysis-window-drop"]),
+    false,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(availabilityOnlyAssessment, [
+      "qc-unavailable",
+      "analysis-window-drop",
+    ]),
+    false,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(
+      {
+        failCount: 0,
+        warnCount: 2,
+        issueTags: ["other"],
+        findings: [
+          {
+            id: "noise-contrast",
+            label: "Speech To Noise Separation",
+            status: "warn",
+            severity: "minor",
+            detail: "One measured low-value warning.",
+          },
+          {
+            id: "render-robustness",
+            label: "Render Robustness",
+            status: "warn",
+            severity: "minor",
+            detail: "One analysis window was dropped.",
+          },
+        ],
+      },
+      ["analysis-window-drop"],
+    ),
+    false,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(
+      { ...availabilityOnlyAssessment, issueTags: ["harsh_sibilance"] },
+      ["qc-unavailable"],
+    ),
+    true,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(availabilityOnlyAssessment, [
+      "qc-unavailable",
+      "peak-violation",
+    ]),
+    true,
+  );
+});
+
 test("resolveCorrectiveMaxFilesPerBatch keeps a two-file floor and forty percent ceiling", () => {
   assert.equal(resolveCorrectiveMaxFilesPerBatch(1), 2);
   assert.equal(resolveCorrectiveMaxFilesPerBatch(4), 2);
@@ -512,6 +577,97 @@ test("autoReviewBundle flags technical defects and prefers the cleaner challenge
   assert.ok(auto.issueTags.includes("too_compressed"));
   assert.ok(auto.issueTags.includes("endings_damaged"));
   assert.match(auto.note, /Selected output verdict: FAIL/);
+});
+
+test("autoReviewBundle does not infer acoustic defects or correction from unavailable QC", () => {
+  const manifest = buildManifest("bundle-qc-unavailable");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  winner.qc = null;
+  winner.sourceComparison.qcDelta = null;
+  winner.renderMeta = buildMeta({
+    degraded: true,
+    degradeReasons: ["analysis-window-drop", "qc-unavailable"],
+    analysisWindowsAttempted: 4,
+    analysisWindowsSucceeded: 0,
+    analysisWindowsDropped: 4,
+  });
+  winner.ranking = scoreCandidateWithLearnedWeights({
+    baselineScore: winner.baselineScore,
+    candidateQc: null,
+    sourceQc: manifest.source.qc,
+    alignment: winner.sourceComparison.alignment,
+    meta: winner.renderMeta,
+  });
+
+  const auto = autoReviewBundle(manifest);
+  const acousticFindingIds = new Set([
+    "level-continuity",
+    "cold-open",
+    "pause-bed",
+    "dynamic-control",
+    "endings",
+    "end-edge-dip",
+    "sibilance",
+    "echo-room",
+    "clicks-artifacts",
+    "noise-contrast",
+  ]);
+
+  assert.deepEqual(auto.issueTags, []);
+  assert.equal(
+    auto.selectedAssessment.findings.some((finding) => acousticFindingIds.has(finding.id)),
+    false,
+  );
+  assert.match(auto.selectedAssessment.summary, /acoustic QC unavailable/i);
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(
+      auto.selectedAssessment,
+      winner.ranking.gateReasons,
+    ),
+    false,
+  );
+});
+
+test("autoReviewBundle treats a dropped analysis window as diagnostic when measured QC is clean", () => {
+  const manifest = buildManifest("bundle-analysis-window-drop");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  winner.qc = toReviewMetricSnapshot(manifest.source.qc);
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+  winner.renderMeta = buildMeta({
+    degraded: true,
+    degradeReasons: ["analysis-window-drop"],
+    analysisWindowsAttempted: 4,
+    analysisWindowsSucceeded: 3,
+    analysisWindowsDropped: 1,
+  });
+  winner.ranking = scoreCandidateWithLearnedWeights({
+    baselineScore: winner.baselineScore,
+    candidateQc: winner.qc,
+    sourceQc: manifest.source.qc,
+    alignment: winner.sourceComparison.alignment,
+    meta: winner.renderMeta,
+  });
+
+  const auto = autoReviewBundle(manifest);
+  const robustness = auto.selectedAssessment.findings.find(
+    (finding) => finding.id === "render-robustness",
+  );
+
+  assert.equal(robustness?.status, "warn");
+  assert.deepEqual(auto.issueTags, []);
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(
+      auto.selectedAssessment,
+      winner.ranking.gateReasons,
+    ),
+    false,
+  );
 });
 
 test("autoReviewBundle warns when rendered cold-open dip worsens versus source", () => {

@@ -651,7 +651,7 @@ describe("gainPlanner", () => {
       stdDev(leveledBodies) < 0.9,
       `already-consistent sparse dialogue should remain consistent: ${leveledBodies.map((v) => v.toFixed(1)).join(", ")}`,
     );
-    assert.equal(plan.speechSpikeFrameCount, 0, "body-relative spike guard should stand down on this sparse clean take");
+    assert.equal(plan.speechSpikeFrameCount, 0, "localized planner shaping must stay absent on this sparse clean take");
   });
 
   it("normalizes uneven sentences to within +/- 2 dB", () => {
@@ -1008,16 +1008,13 @@ describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
   });
 });
 
-describe("body-spike guard (within-sentence syllable peaks)", () => {
-  it("brings a 16 dB peak-above-body syllable down within ~10 dB of body without ducking unrelated frames", () => {
+describe("source-native within-sentence emphasis", () => {
+  it("preserves a below-ceiling stressed syllable for the source-relative delivery stage", () => {
     const sampleRate = 48000;
     const frameMs = 10;
     const samplesPerFrame = (sampleRate * frameMs) / 1000;
     // 2 s sentence body at -22 dB, with a 60 ms stressed syllable at frames
-    // 100..105 whose peak sits ~16 dB above body. Inject the elevation in
-    // BOTH the per-frame RMS AND the sample peaks so the body-spike guard's
-    // body-relative branch (rmsExcess + peakExcess) fires the same way it
-    // does on real material.
+    // 100..105 whose peak remains below the absolute ceiling.
     const totalFrames = 200;
     const samples = new Float32Array(totalFrames * samplesPerFrame);
     for (let i = 0; i < samples.length; i += 1) {
@@ -1046,7 +1043,6 @@ describe("body-spike guard (within-sentence syllable peaks)", () => {
       sampleRate,
       targetDb: -22,
       peakCeilingDb: -4,
-      // Realistic spiky-source instabilityHint — drives the spike guard.
       instabilityHint: 0.7,
     });
 
@@ -1058,14 +1054,14 @@ describe("body-spike guard (within-sentence syllable peaks)", () => {
       frameDb[50] + 20 * Math.log10(plan.gainCurve[50] + 1e-9);
     const spikeAboveBodyDb = appliedSpikeDb - appliedBodyDb;
 
-    // Source had ~15 dB syllable above body. With tightened guard
-    // (allowedRmsSpike ~2 dB + dip cap 9.7 dB) we should land below
-    // ~10 dB above body. Previously with cap 4.7 dB, the spike came out
-    // around 11 dB above body — visibly spiky.
+    // Natural emphasis is not evidence of a processing defect. The planner's
+    // small micro-ride may move it, but must not flatten it source-blind.
     assert.ok(
-      spikeAboveBodyDb < 10,
-      `spike should be tamed within 10 dB of body — got ${spikeAboveBodyDb.toFixed(2)} dB`,
+      spikeAboveBodyDb >= 11,
+      `source-native stress should remain clearly above body, got ${spikeAboveBodyDb.toFixed(2)} dB`,
     );
+    assert.equal(plan.speechSpikeFrameCount, 0);
+    assert.equal(plan.speechSpikeMaxReductionDb, 0);
 
     // Frames far from the spike are at body gain (no collateral ducking).
     const gainFar = 20 * Math.log10(plan.gainCurve[150] + 1e-9);
@@ -1210,6 +1206,31 @@ const synthesizeAdjacentWeakStrongLaneTake = (eventPeakDb: readonly [number, num
     centersSec,
     eventRadiusSamples: Math.round(eventRadiusSec * sampleRate),
   };
+};
+
+const synthesizeIsolatedEvidenceLaneTake = (eventPeakDb: readonly number[]) => {
+  const sampleRate = 48000;
+  const durationSec = 0.4;
+  const centersSec = [0.051, 0.101, 0.201, 0.301] as const;
+  const eventRadiusSec = 0.0004;
+  const samples = new Float32Array(Math.round(sampleRate * durationSec));
+  for (let index = 0; index < samples.length; index += 1) {
+    samples[index] = dbToLin(-20.2)
+      * Math.sin((2 * Math.PI * 220 * index) / sampleRate)
+      * Math.SQRT2;
+  }
+  for (const [eventIndex, centerSec] of centersSec.entries()) {
+    const centerSample = Math.round(centerSec * sampleRate);
+    const radiusSamples = Math.round(eventRadiusSec * sampleRate);
+    for (let index = centerSample - radiusSamples; index <= centerSample + radiusSamples; index += 1) {
+      const normalizedOffset = (index - centerSample) / radiusSamples;
+      const envelope = Math.cos((normalizedOffset * Math.PI) / 2) ** 2;
+      samples[index] = dbToLin(eventPeakDb[eventIndex] ?? -120)
+        * Math.sin((2 * Math.PI * 6000 * index) / sampleRate)
+        * envelope;
+    }
+  }
+  return { samples, sampleRate, centersSec };
 };
 
 const synthesizeFractionalBoundaryLaneTake = (
@@ -1515,6 +1536,279 @@ describe("full-rate rendered consonant peak tamer", () => {
     assert.ok(native.maxReductionDb <= 0.001, `native owner borrowed ${native.maxReductionDb.toFixed(6)} dB`);
   });
 
+  it("keeps an isolated 2 ms source-relative repair subtle instead of creating a broadband down-up hole", () => {
+    const source = synthesizeIsolatedEvidenceLaneTake([-4, -4, -4, -4]);
+    const rendered = synthesizeIsolatedEvidenceLaneTake([-4, 2, -4, -4]);
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+
+    const result = tameRenderedConsonantPeaks(rendered.samples, rendered.sampleRate, 10, {
+      reference,
+      maxReductionDb: 2.5,
+    });
+    const samplesPerEvidenceFrame = Math.round(
+      (rendered.sampleRate * RENDERED_CONSONANT_SOURCE_FRAME_MS) / 1000,
+    );
+    const targetFrame = Math.floor(
+      (rendered.centersSec[1] * 1000) / RENDERED_CONSONANT_SOURCE_FRAME_MS,
+    );
+    const targetFrameStart = targetFrame * samplesPerEvidenceFrame;
+    const targetFrameEnd = targetFrameStart + samplesPerEvidenceFrame - 1;
+    const target = maxSampleReductionDb(
+      rendered.samples,
+      result.samples,
+      targetFrameStart,
+      targetFrameEnd,
+    );
+
+    assert.equal(result.stats.referenceUsed, true);
+    assert.ok(target.maxReductionDb >= 0.4, `isolated processing growth still needs subtle repair, got ${target.maxReductionDb.toFixed(3)} dB`);
+    assert.ok(
+      target.maxReductionDb <= 0.75,
+      `one isolated 2 ms owner must not create a deep broadband hole, got ${target.maxReductionDb.toFixed(3)} dB`,
+    );
+    assert.deepEqual(
+      result.samples.slice(targetFrameStart - samplesPerEvidenceFrame, targetFrameStart),
+      rendered.samples.slice(targetFrameStart - samplesPerEvidenceFrame, targetFrameStart),
+      "the preceding native owner must remain sample-identical",
+    );
+    assert.deepEqual(
+      result.samples.slice(targetFrameEnd + 1, targetFrameEnd + 1 + samplesPerEvidenceFrame),
+      rendered.samples.slice(targetFrameEnd + 1, targetFrameEnd + 1 + samplesPerEvidenceFrame),
+      "the following native owner must remain sample-identical",
+    );
+  });
+
+  it("ramps repair depth across two adjacent 2 ms owners instead of opening a 4 ms depth cliff", () => {
+    const source = synthesizeAdjacentWeakStrongLaneTake([-4, -4]);
+    const rendered = synthesizeAdjacentWeakStrongLaneTake([2, 2]);
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+
+    const result = tameRenderedConsonantPeaks(rendered.samples, rendered.sampleRate, 10, {
+      reference,
+      maxReductionDb: 2.5,
+    });
+    const samplesPerEvidenceFrame = Math.round(
+      (rendered.sampleRate * RENDERED_CONSONANT_SOURCE_FRAME_MS) / 1000,
+    );
+    const firstOwnerFrame = Math.floor(
+      (rendered.centersSec[0] * 1000) / RENDERED_CONSONANT_SOURCE_FRAME_MS,
+    );
+    const firstOwnerStart = firstOwnerFrame * samplesPerEvidenceFrame;
+    const secondOwnerEnd = (firstOwnerFrame + 2) * samplesPerEvidenceFrame - 1;
+    const pair = maxSampleReductionDb(
+      rendered.samples,
+      result.samples,
+      firstOwnerStart,
+      secondOwnerEnd,
+    );
+
+    assert.equal(result.stats.referenceUsed, true);
+    assert.ok(
+      pair.maxReductionDb >= 0.8,
+      `two adjacent processing-grown owners should retain useful subtle repair, got ${pair.maxReductionDb.toFixed(3)} dB`,
+    );
+    assert.ok(
+      pair.maxReductionDb <= 1.75,
+      `two adjacent 2 ms owners must not jump to the full 2.5 dB depth, got ${pair.maxReductionDb.toFixed(3)} dB`,
+    );
+    assert.deepEqual(
+      result.samples.slice(firstOwnerStart - samplesPerEvidenceFrame, firstOwnerStart),
+      rendered.samples.slice(firstOwnerStart - samplesPerEvidenceFrame, firstOwnerStart),
+      "the preceding native owner must remain sample-identical",
+    );
+    assert.deepEqual(
+      result.samples.slice(secondOwnerEnd + 1, secondOwnerEnd + 1 + samplesPerEvidenceFrame),
+      rendered.samples.slice(secondOwnerEnd + 1, secondOwnerEnd + 1 + samplesPerEvidenceFrame),
+      "the following native owner must remain sample-identical",
+    );
+  });
+
+  it("crosses weak source-relative evidence continuously without a 0.4 dB engagement jump", () => {
+    const sampleRate = 48000;
+    const eventSec = 0.8;
+    const referenceSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec: 1.6,
+      bodyRmsDb: -20.2,
+      consonantPeakDb: -4,
+      consonantCentersSec: [eventSec],
+    });
+    const reference = buildRenderedConsonantReference(referenceSamples, sampleRate);
+    assert.ok(reference);
+
+    const measureRepair = (consonantPeakDb: number) => {
+      const renderedSamples = synthesizeVoicedFricativeTake({
+        sampleRate,
+        durationSec: 1.6,
+        bodyRmsDb: -20.2,
+        consonantPeakDb,
+        consonantCentersSec: [eventSec],
+      });
+      const result = tameRenderedConsonantPeaks(renderedSamples, sampleRate, 10, {
+        reference,
+        maxReductionDb: 2.5,
+      });
+      return peakDbNear(renderedSamples, sampleRate, eventSec, 8)
+        - peakDbNear(result.samples, sampleRate, eventSec, 8);
+    };
+
+    const lowerRepairDb = measureRepair(-2.12);
+    const upperRepairDb = measureRepair(-2.10);
+    assert.ok(
+      lowerRepairDb > 0,
+      `positive source-relative evidence must receive a continuous subtle correction, got ${lowerRepairDb.toFixed(4)} dB`,
+    );
+    assert.ok(
+      Math.abs(upperRepairDb - lowerRepairDb) < 0.08,
+      `a 0.02 dB input change must not cause a correction jump: ${lowerRepairDb.toFixed(4)} -> ${upperRepairDb.toFixed(4)} dB`,
+    );
+  });
+
+  it("crosses rendered-local contrast continuously instead of opening a 0.6 dB detector lane", () => {
+    const sampleRate = 48000;
+    const eventSec = 0.8;
+    const referenceSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec: 1.6,
+      bodyRmsDb: -20.2,
+      consonantPeakDb: -10.4,
+      consonantCentersSec: [eventSec],
+    });
+    const reference = buildRenderedConsonantReference(referenceSamples, sampleRate);
+    assert.ok(reference);
+
+    const measureRepair = (consonantPeakDb: number) => {
+      const renderedSamples = synthesizeVoicedFricativeTake({
+        sampleRate,
+        durationSec: 1.6,
+        bodyRmsDb: -20.2,
+        consonantPeakDb,
+        consonantCentersSec: [eventSec],
+      });
+      const result = tameRenderedConsonantPeaks(renderedSamples, sampleRate, 10, {
+        reference,
+        maxReductionDb: 2.5,
+      });
+      return peakDbNear(renderedSamples, sampleRate, eventSec, 8)
+        - peakDbNear(result.samples, sampleRate, eventSec, 8);
+    };
+
+    const lowerRepairDb = measureRepair(-8.3);
+    const upperRepairDb = measureRepair(-8.2);
+    assert.ok(
+      lowerRepairDb > 0,
+      `positive rendered contrast growth must enter continuously, got ${lowerRepairDb.toFixed(4)} dB`,
+    );
+    assert.ok(
+      Math.abs(upperRepairDb - lowerRepairDb) < 0.15,
+      `a 0.1 dB rendered change must not open a detector lane: ${lowerRepairDb.toFixed(4)} -> ${upperRepairDb.toFixed(4)} dB`,
+    );
+  });
+
+  it("scales source evidence continuously instead of switching on the weak-reference cap", () => {
+    const sampleRate = 48000;
+    const eventSec = 0.8;
+    const renderedSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec: 1.6,
+      bodyRmsDb: -20.2,
+      consonantPeakDb: -3.9,
+      consonantCentersSec: [eventSec],
+    });
+
+    const measureRepair = (sourcePeakDb: number) => {
+      const referenceSamples = synthesizeVoicedFricativeTake({
+        sampleRate,
+        durationSec: 1.6,
+        bodyRmsDb: -20.2,
+        consonantPeakDb: sourcePeakDb,
+        consonantCentersSec: [eventSec],
+      });
+      const reference = buildRenderedConsonantReference(referenceSamples, sampleRate);
+      assert.ok(reference);
+      const result = tameRenderedConsonantPeaks(renderedSamples, sampleRate, 10, {
+        reference,
+        maxReductionDb: 2.5,
+      });
+      return peakDbNear(renderedSamples, sampleRate, eventSec, 8)
+        - peakDbNear(result.samples, sampleRate, eventSec, 8);
+    };
+
+    const lowerRepairDb = measureRepair(-12.5);
+    const upperRepairDb = measureRepair(-12.0);
+    assert.ok(
+      lowerRepairDb > 0,
+      `weak but time-matched source evidence must enter continuously, got ${lowerRepairDb.toFixed(4)} dB`,
+    );
+    assert.ok(
+      Math.abs(upperRepairDb - lowerRepairDb) < 0.35,
+      `a 0.5 dB source change must not switch on a full weak lane: ${lowerRepairDb.toFixed(4)} -> ${upperRepairDb.toFixed(4)} dB`,
+    );
+  });
+
+  it("does not let epsilon nearer source evidence replace a trusted adjacent timing match", () => {
+    const sampleRate = 48_000;
+    const targetSec = 1;
+    const renderedSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec: 2.2,
+      bodyRmsDb: -20.2,
+      consonantPeakDb: -3.9,
+      consonantCentersSec: [0.3, 0.6, targetSec, 1.4, 1.8],
+    });
+    const baseReference = buildRenderedConsonantReference(renderedSamples, sampleRate);
+    assert.ok(baseReference);
+
+    const measureRepair = (nearestContrastDb: number) => {
+      const rmsDb = new Float32Array(baseReference.rmsDb);
+      const peakDb = new Float32Array(baseReference.peakDb);
+      const targetFrame = Math.round((targetSec * 1000) / baseReference.frameMs);
+      for (let frame = targetFrame - 12; frame <= targetFrame + 12; frame += 1) {
+        rmsDb[frame] = -20.2;
+        peakDb[frame] = -17.2;
+      }
+      peakDb[targetFrame] = -20.2 + nearestContrastDb;
+      peakDb[targetFrame + 1] = -10.2;
+      const reference = {
+        ...baseReference,
+        rmsDb,
+        peakDb,
+      };
+      const result = tameRenderedConsonantPeaks(renderedSamples, sampleRate, 10, {
+        reference,
+        maxReductionDb: 2.5,
+      });
+      const samplesPerEvidenceFrame = Math.round(
+        (sampleRate * baseReference.frameMs) / 1000,
+      );
+      const target = maxSampleReductionDb(
+        renderedSamples,
+        result.samples,
+        targetFrame * samplesPerEvidenceFrame,
+        (targetFrame + 1) * samplesPerEvidenceFrame - 1,
+      );
+      return {
+        referenceUsed: result.stats.referenceUsed,
+        targetReductionDb: target.maxReductionDb,
+      };
+    };
+
+    const atBoundary = measureRepair(4);
+    const justAbove = measureRepair(4.001);
+    assert.equal(atBoundary.referenceUsed, true);
+    assert.equal(justAbove.referenceUsed, true);
+    assert.ok(
+      Math.abs(justAbove.targetReductionDb - atBoundary.targetReductionDb) < 0.05,
+      `0.001 dB nearer evidence must not replace an adjacent match: ${atBoundary.targetReductionDb.toFixed(6)} -> ${justAbove.targetReductionDb.toFixed(6)} dB`,
+    );
+    assert.ok(
+      Math.max(atBoundary.targetReductionDb, justAbove.targetReductionDb) <= 0.75,
+      `adjacent-only evidence must remain a subtle timing allowance: ${atBoundary.targetReductionDb.toFixed(6)} / ${justAbove.targetReductionDb.toFixed(6)} dB`,
+    );
+  });
+
   it("uses rounded 44.1 kHz evidence boundaries when a strong lane precedes a weak lane", () => {
     const source = synthesizeFractionalBoundaryLaneTake([-4, -10.4]);
     const rendered = synthesizeFractionalBoundaryLaneTake([2, -3.9]);
@@ -1594,6 +1888,48 @@ describe("full-rate rendered consonant peak tamer", () => {
     assert.equal(result.stats.tamedFrameCount, 0);
     assert.equal(result.stats.maxReductionDb, 0);
     assert.deepEqual(result.samples, renderedSamples);
+  });
+
+  it("screens ordinary rendered frames before scanning the source match neighborhood", () => {
+    const sampleRate = 48000;
+    const durationSec = 6;
+    const eventCentersSec = [0.55, 1.42, 2.86, 4.73];
+    const renderedSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec,
+      bodyRmsDb: -12,
+      consonantPeakDb: [-1, -4, -2, -5],
+      consonantCentersSec: eventCentersSec,
+    });
+    const reference = buildRenderedConsonantReference(renderedSamples, sampleRate);
+    assert.ok(reference);
+
+    let referenceIndexReads = 0;
+    const countReads = (values: Float32Array) => new Proxy(values, {
+      get(target, property) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          referenceIndexReads += 1;
+        }
+        return Reflect.get(target, property, target);
+      },
+    });
+    const instrumentedReference = {
+      ...reference,
+      rmsDb: countReads(reference.rmsDb),
+      peakDb: countReads(reference.peakDb),
+    };
+
+    const result = tameRenderedConsonantPeaks(renderedSamples, sampleRate, 10, {
+      reference: instrumentedReference,
+    });
+
+    assert.equal(result.stats.referenceUsed, true);
+    assert.equal(result.stats.tamedFrameCount, 0);
+    assert.deepEqual(result.samples, renderedSamples);
+    assert.ok(
+      referenceIndexReads < 1_000_000,
+      `ordinary frames should not trigger source-neighborhood scans; observed ${referenceIndexReads.toLocaleString()} indexed reads`,
+    );
   });
 
   it("matches a native consonant across sample rates within a 20 ms timing neighborhood", () => {
@@ -1713,9 +2049,16 @@ describe("full-rate rendered consonant peak tamer", () => {
         && Math.abs(result.stats.referenceLagMs) <= 60,
       `diagnostics should report the automatically inferred ~45 ms reference lag, got ${String(result.stats.referenceLagMs)}`,
     );
-    assert.equal(result.stats.tamedFrameCount, 0, "automatic alignment must preserve source-native articulation");
-    assert.equal(result.stats.maxReductionDb, 0);
-    assert.deepEqual(result.samples, renderedSamples);
+    const nativeReductionDb = peakDbNear(renderedSamples, sampleRate, 0.845, 8)
+      - peakDbNear(result.samples, sampleRate, 0.845, 8);
+    assert.ok(
+      result.stats.tamedFrameCount <= 1 && result.stats.maxReductionDb < 0.01,
+      `alignment rounding may enter continuously but must remain below 0.01 dB, got ${result.stats.tamedFrameCount} frame(s) / ${result.stats.maxReductionDb.toFixed(4)} dB`,
+    );
+    assert.ok(
+      nativeReductionDb < 0.01,
+      `automatic alignment must preserve native articulation perceptually, got ${nativeReductionDb.toFixed(4)} dB`,
+    );
   });
 
   it("automatically repairs a 3.8 dB contrast increase after 45 ms of render latency", () => {
@@ -1768,7 +2111,10 @@ describe("full-rate rendered consonant peak tamer", () => {
     const nativeAnchorReductionDb = peakDbNear(renderedSamples, sampleRate, renderedAnchorSec)
       - peakDbNear(result.samples, sampleRate, renderedAnchorSec);
 
-    assert.ok(targetReductionDb >= 0.4, "the latency-shifted render-created consonant contrast must still be repaired");
+    assert.ok(
+      targetReductionDb >= 0.4,
+      `the latency-shifted render-created consonant contrast must still be repaired, got ${targetReductionDb.toFixed(3)} dB`,
+    );
     assert.ok(targetReductionDb <= 2.5, `latency-aware repair must stay subtle, got ${targetReductionDb.toFixed(2)} dB`);
     assert.ok(nativeAnchorReductionDb < 0.1, `the aligned native consonant anchor must stay intact, got ${nativeAnchorReductionDb.toFixed(2)} dB reduction`);
   });
@@ -2033,7 +2379,7 @@ describe("full-rate rendered consonant peak tamer", () => {
 });
 
 describe("localized peak guard", () => {
-  it("dips only around the plosive frame, not the whole sentence body", () => {
+  it("does not turn a peak-only sample into a broadband body-volume hole", () => {
     const sampleRate = 48000;
     const frameMs = 10;
     const samplesPerFrame = (sampleRate * frameMs) / 1000; // 480
@@ -2079,20 +2425,39 @@ describe("localized peak guard", () => {
       `body frames far from the plosive should be at 0 dB: ${gainFarA.toFixed(2)} / ${gainFarB.toFixed(2)}`,
     );
 
-    // 2. The plosive frame itself is dipped meaningfully (at least 1 dB).
+    // 2. A sample peak without matching frame-energy growth must not make the
+    // ordinary speech body dive and recover. Peak limiting/click repair can
+    // address the sample itself without turning it into a broadband hole.
     assert.ok(
-      gainAtPlosive < gainFarA - 1,
-      `plosive frame should be dipped (got ${gainAtPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+      gainAtPlosive >= gainFarA - 0.75,
+      `peak-only evidence must not create a body-volume hole (got ${gainAtPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
     );
 
-    // 3. The dip is LOCALIZED — by 5 frames away we're back near body gain.
+    // 3. Ordinary shoulder frames must receive the same protection. This
+    // catches a wide cosine valley even when its center is later smoothed.
+    const deepestShoulderGainDb = Math.min(
+      ...Array.from(plan.gainCurve.slice(96, 105), (gain) => 20 * Math.log10(gain + 1e-9)),
+    );
     assert.ok(
-      Math.abs(gainNearPlosive - gainFarA) < 1.5,
-      `dip should be localized — 50 ms away we should be near body gain (got ${gainNearPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+      deepestShoulderGainDb >= gainFarA - 0.75,
+      `flat source body must stay stable through the peak shoulder (deepest ${deepestShoulderGainDb.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+    );
+
+    assert.ok(
+      Math.abs(gainNearPlosive - gainFarA) < 0.3,
+      `50 ms away should remain body gain (got ${gainNearPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+    );
+    assert.ok(
+      plan.speechSpikeMaxReductionDb <= 0.61,
+      `diagnostics must report the applied envelope-capped reduction, got ${plan.speechSpikeMaxReductionDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      (plan.runs[0]?.peakReducedDb ?? 0) >= -0.61,
+      `run diagnostics must not retain the pre-cap request, got ${(plan.runs[0]?.peakReducedDb ?? 0).toFixed(2)} dB`,
     );
   });
 
-  it("tames isolated body-speech spikes below the absolute peak ceiling", () => {
+  it("defers below-ceiling body-speech peaks to source-relative delivery", () => {
     const sampleRate = 16000;
     const frameMs = 10;
     const samplesPerFrame = (sampleRate * frameMs) / 1000;
@@ -2113,29 +2478,87 @@ describe("localized peak guard", () => {
     for (let frame = 0; frame < totalFrames; frame += 1) paintFrame(frame, -22);
     for (let frame = 120; frame < 124; frame += 1) paintFrame(frame, -10);
 
-    const plan = planGainCurve({
+    const baseInput = {
       frameDb,
       speechRuns: [{ startFrame: 0, endFrame: totalFrames }],
       noiseFloorDb: -75,
       speechThresholdDb: -58,
       pauseNoiseRisk: 0.05,
       frameMs,
-      samples,
       sampleRate,
       targetDb: -22,
       peakCeilingDb: -3,
       instabilityHint: 1,
       speechSpikeTaming: 1,
-    });
+    };
+    const baselinePlan = planGainCurve({ ...baseInput, samples, peakCeilingDb: 0 });
+    const plan = planGainCurve({ ...baseInput, samples });
 
-    const bodyGainDb = 20 * Math.log10(plan.gainCurve[80] + 1e-9);
-    const spikeGainDb = 20 * Math.log10(plan.gainCurve[121] + 1e-9);
-    const afterGainDb = 20 * Math.log10(plan.gainCurve[138] + 1e-9);
+    assert.equal(plan.speechSpikeFrameCount, 0);
+    assert.equal(plan.speechSpikeMaxReductionDb, 0);
+    for (let frame = 116; frame <= 128; frame += 1) {
+      const gainDb = 20 * Math.log10(plan.gainCurve[frame] + 1e-9);
+      const baselineGainDb = 20 * Math.log10(baselinePlan.gainCurve[frame] + 1e-9);
+      assert.ok(
+        Math.abs(gainDb - baselineGainDb) < 0.05,
+        `below-ceiling source emphasis must not receive a sample-driven dip at frame ${frame}: ${gainDb.toFixed(2)} vs ${baselineGainDb.toFixed(2)} dB`,
+      );
+    }
+  });
 
-    assert.ok(plan.speechSpikeFrameCount >= 4, `expected body-speech spike frames, got ${plan.speechSpikeFrameCount}`);
-    assert.ok(plan.speechSpikeMaxReductionDb >= 3.5, `expected meaningful local dip, got ${plan.speechSpikeMaxReductionDb.toFixed(2)} dB`);
-    assert.ok(spikeGainDb < bodyGainDb - 3, `spike should be dipped below body gain: ${spikeGainDb.toFixed(2)} vs ${bodyGainDb.toFixed(2)} dB`);
-    assert.ok(Math.abs(afterGainDb - bodyGainDb) < 1, `nearby dialogue body should recover: ${afterGainDb.toFixed(2)} vs ${bodyGainDb.toFixed(2)} dB`);
+  it("preserves an ordinary mid-word bridge between real hot speech frames", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 260;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    const frameDb = new Array<number>(totalFrames).fill(-22);
+    const paintFrame = (frame: number, rmsDb: number) => {
+      frameDb[frame] = rmsDb;
+      const amplitude = dbToLin(rmsDb) * Math.SQRT2;
+      const start = frame * samplesPerFrame;
+      for (let offset = 0; offset < samplesPerFrame; offset += 1) {
+        const sampleIndex = start + offset;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * 260 * sampleIndex) / sampleRate) * amplitude;
+      }
+    };
+    for (let frame = 0; frame < totalFrames; frame += 1) paintFrame(frame, -22);
+    for (const frame of [120, 121, 123, 124]) paintFrame(frame, -10);
+
+    const baseInput = {
+      frameDb,
+      speechRuns: [{ startFrame: 0, endFrame: totalFrames }],
+      noiseFloorDb: -75,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.05,
+      frameMs,
+      sampleRate,
+      targetDb: -22,
+      peakCeilingDb: -3,
+      instabilityHint: 1,
+      speechSpikeTaming: 1,
+    };
+    const baselinePlan = planGainCurve({ ...baseInput, samples, peakCeilingDb: 0 });
+    const plan = planGainCurve({ ...baseInput, samples });
+
+    const baselineBridgeGainDb = 20 * Math.log10(baselinePlan.gainCurve[122] + 1e-9);
+    const bridgeGainDb = 20 * Math.log10(plan.gainCurve[122] + 1e-9);
+    const hotGainDb = Math.min(
+      20 * Math.log10(plan.gainCurve[120] + 1e-9),
+      20 * Math.log10(plan.gainCurve[123] + 1e-9),
+    );
+    const baselineHotGainDb = Math.min(
+      20 * Math.log10(baselinePlan.gainCurve[120] + 1e-9),
+      20 * Math.log10(baselinePlan.gainCurve[123] + 1e-9),
+    );
+    assert.ok(
+      bridgeGainDb >= baselineBridgeGainDb - 0.75,
+      `peak evidence must not turn the normal bridge into an added gain hole: ${bridgeGainDb.toFixed(2)} vs ${baselineBridgeGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      Math.abs(hotGainDb - baselineHotGainDb) < 0.05,
+      `below-ceiling hot frames must not receive source-blind taming: ${hotGainDb.toFixed(2)} vs ${baselineHotGainDb.toFixed(2)} dB`,
+    );
   });
 
   it("does not flatten sustained loud dialogue as a spike cluster", () => {
@@ -2603,7 +3026,7 @@ describe("ramp placement", () => {
     );
   });
 
-  it("does not run the body-relative spike guard over the final 150 ms of a speech run", () => {
+  it("preserves a louder below-ceiling final syllable without a run-edge dip", () => {
     const totalFrames = 180;
     const run = { startFrame: 20, endFrame: 150 };
     const tailStart = run.endFrame - 15;
@@ -2646,7 +3069,7 @@ describe("ramp placement", () => {
 
     assert.ok(
       worstTailDipDb < 1,
-      `run-edge spike guard should stand down at the tail; worst dip ${worstTailDipDb.toFixed(2)} dB`,
+      `below-ceiling source emphasis should remain stable at the tail; worst dip ${worstTailDipDb.toFixed(2)} dB`,
     );
   });
 });

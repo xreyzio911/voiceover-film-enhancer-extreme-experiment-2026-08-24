@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { analyzeFrameAudio, buildSpeechMask } from "./audioQc.ts";
+import { analyzeFloatSamples, analyzeFrameAudio, buildSpeechMask } from "./audioQc.ts";
 
 const FRAME_MS = 10;
 const SAMPLE_RATE = 16000;
@@ -14,6 +14,23 @@ type Section = {
 };
 
 const ampFromDb = (db: number) => Math.pow(10, db / 20);
+
+const buildContinuousSignal = (
+  durationSec: number,
+  sampleAt: (timeSec: number) => number,
+  sampleRate = SAMPLE_RATE,
+) => {
+  const samples = new Float32Array(Math.round(durationSec * sampleRate));
+  const fadeSamples = Math.round(sampleRate * 0.025);
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const edgeDistance = Math.min(index, samples.length - 1 - index);
+    const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+    samples[index] = sampleAt(index / sampleRate) * fade;
+  }
+
+  return samples;
+};
 
 const analyzeSections = (sections: Section[]) => {
   const frameDb: number[] = [];
@@ -430,6 +447,576 @@ test("click scoring still rises for repeated isolated non-speech clicks", () => 
   const clicky = analyzeSections(clickBursts);
 
   assert.ok(clicky.clickScore > 0.12);
+});
+
+test("sample click scoring ignores a smooth high-frequency voiced signal", () => {
+  const samples = buildContinuousSignal(
+    4,
+    (timeSec) => Math.sin(2 * Math.PI * 1800 * timeSec) * 0.24,
+  );
+
+  const analysis = analyzeFloatSamples(samples, SAMPLE_RATE);
+
+  assert.ok(
+    analysis.clickScore < 0.08,
+    `smooth 1.8 kHz content should not look clicky, got ${analysis.clickScore.toFixed(3)}`,
+  );
+});
+
+test("sample click scoring ignores sustained fricative-like high-frequency energy", () => {
+  const samples = buildContinuousSignal(4, (timeSec) => {
+    const slowEnvelope = 0.72 + Math.sin(2 * Math.PI * 3.1 * timeSec) * 0.18;
+    const fricative =
+      Math.sin(2 * Math.PI * 2700 * timeSec + 0.2) * 0.065 +
+      Math.sin(2 * Math.PI * 3850 * timeSec + 1.1) * 0.05 +
+      Math.sin(2 * Math.PI * 5370 * timeSec + 2.3) * 0.035;
+    return fricative * slowEnvelope;
+  });
+
+  const analysis = analyzeFloatSamples(samples, SAMPLE_RATE);
+
+  assert.ok(
+    analysis.clickScore < 0.08,
+    `continuous fricative energy should not look clicky, got ${analysis.clickScore.toFixed(3)}`,
+  );
+});
+
+test("sample click scoring ignores periodic glottal-like voiced edges", () => {
+  const sampleRate = 48000;
+  const durationSec = 4;
+  const fundamentalHz = 100;
+  const spectralTilt = 1.25;
+  const maxHarmonicHz = 12000;
+  const harmonicCount = maxHarmonicHz / fundamentalHz;
+  const scale = 0.12;
+  const fadeSamples = Math.round(sampleRate * 0.025);
+  const normalization = Array.from(
+    { length: harmonicCount },
+    (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+  ).reduce((sum, value) => sum + value, 0);
+  const samples = new Float32Array(sampleRate * durationSec);
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const timeSec = index / sampleRate;
+    let value = 0;
+    for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+      value +=
+        Math.sin(2 * Math.PI * fundamentalHz * harmonic * timeSec) /
+        Math.pow(harmonic, spectralTilt);
+    }
+    const edgeDistance = Math.min(index, samples.length - 1 - index);
+    const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+    samples[index] = (scale * value * fade) / normalization;
+  }
+
+  const analysis = analyzeFloatSamples(samples, sampleRate);
+
+  assert.ok(
+    analysis.clickScore < 0.08,
+    `periodic voiced edges should not look clicky, got ${analysis.clickScore.toFixed(3)}`,
+  );
+});
+
+test("sample click scoring ignores smooth low-pitch voiced burst onsets", () => {
+  const sampleRate = 16000;
+  const totalDurationSec = 4;
+  const fundamentalHz = 60;
+  const spectralTilt = 1.25;
+  const maxHarmonicHz = Math.min(12000, sampleRate * 0.44);
+  const harmonicCount = Math.floor(maxHarmonicHz / fundamentalHz);
+  const scale = 0.12;
+  const burstStartsSec = [0.35, 1.35, 2.35];
+  const burstDurationSec = 0.55;
+  const attackSec = 0.02;
+  const releaseSec = attackSec;
+  const normalization = Array.from(
+    { length: harmonicCount },
+    (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+  ).reduce((sum, value) => sum + value, 0);
+  const samples = new Float32Array(sampleRate * totalDurationSec);
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const timeSec = index / sampleRate;
+    let value = 0;
+    for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+      value +=
+        Math.sin(2 * Math.PI * fundamentalHz * harmonic * timeSec) /
+        Math.pow(harmonic, spectralTilt);
+    }
+
+    let envelope = 0;
+    for (const startSec of burstStartsSec) {
+      const relativeSec = timeSec - startSec;
+      if (relativeSec < 0 || relativeSec > burstDurationSec) continue;
+      if (relativeSec < attackSec) {
+        envelope = 0.5 - 0.5 * Math.cos((Math.PI * relativeSec) / attackSec);
+      } else if (relativeSec > burstDurationSec - releaseSec) {
+        envelope =
+          0.5 -
+          0.5 * Math.cos((Math.PI * (burstDurationSec - relativeSec)) / releaseSec);
+      } else {
+        envelope = 1;
+      }
+      break;
+    }
+
+    samples[index] = (scale * value * envelope) / normalization;
+  }
+
+  const analysis = analyzeFloatSamples(samples, sampleRate);
+  assert.ok(
+    analysis.clickScore < 0.08,
+    `smooth low-pitch voice onsets should not look clicky, got ${analysis.clickScore.toFixed(3)}`,
+  );
+});
+
+test("sample click scoring ignores phase-continuous voiced pitch changes", () => {
+  const sampleRate = 16000;
+  const durationSec = 4;
+  const transitionSec = 2;
+  const spectralTilt = 1.25;
+  const scale = 0.18;
+
+  for (const destinationHz of [150, 200, 250, 300]) {
+    for (const initialPhase of [0.2, 0.982]) {
+      const sourceHz = 100;
+      const harmonicCount = Math.floor(
+        Math.min(12000, sampleRate * 0.44) / Math.max(sourceHz, destinationHz),
+      );
+      const normalization = Array.from(
+        { length: harmonicCount },
+        (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+      ).reduce((sum, value) => sum + value, 0);
+      const samples = new Float32Array(sampleRate * durationSec);
+      const fadeSamples = Math.round(sampleRate * 0.025);
+
+      for (let index = 0; index < samples.length; index += 1) {
+        const timeSec = index / sampleRate;
+        const fundamentalCycles =
+          timeSec < transitionSec
+            ? sourceHz * timeSec
+            : sourceHz * transitionSec + destinationHz * (timeSec - transitionSec);
+        let value = 0;
+        for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+          value +=
+            Math.sin(
+              2 * Math.PI * harmonic * fundamentalCycles + harmonic * initialPhase,
+            ) / Math.pow(harmonic, spectralTilt);
+        }
+        const edgeDistance = Math.min(index, samples.length - 1 - index);
+        const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+        samples[index] = (scale * value * fade) / normalization;
+      }
+
+      const boundaryIndex = Math.round(transitionSec * sampleRate);
+      const boundaryJump = Math.abs(
+        (samples[boundaryIndex] ?? 0) - (samples[boundaryIndex - 1] ?? 0),
+      );
+      assert.ok(
+        boundaryJump < 0.02,
+        `${sourceHz}->${destinationHz} Hz fixture must remain sample-continuous, got ${boundaryJump}`,
+      );
+
+      const analysis = analyzeFloatSamples(samples, sampleRate);
+      assert.ok(
+        analysis.clickScore < 0.08,
+        `${sourceHz}->${destinationHz} Hz continuous pitch change should not look clicky, got ${analysis.clickScore.toFixed(3)}`,
+      );
+    }
+  }
+});
+
+test("sample click scoring ignores an accented multi-sample voiced closure", () => {
+  for (const sampleRate of [16000, 48000]) {
+    const samples = buildContinuousSignal(
+      4,
+      (timeSec) => Math.sin(2 * Math.PI * 115 * timeSec) * 0.025,
+      sampleRate,
+    );
+    const pitchPeriod = Math.round(sampleRate / 100);
+    const firstLobeEnd = Math.max(1, Math.round(sampleRate * 0.0005));
+    const secondLobeEnd = Math.max(firstLobeEnd + 1, Math.round(sampleRate * 0.0009));
+
+    for (let start = pitchPeriod; start + secondLobeEnd < samples.length; start += pitchPeriod) {
+      const isAccentedClosure = Math.abs(start / sampleRate - 2) < 0.005;
+      const amplitude = isAccentedClosure ? 0.12 : 0.04;
+      for (let offset = 0; offset < secondLobeEnd; offset += 1) {
+        const lobe = offset < firstLobeEnd ? amplitude : amplitude / 3;
+        samples[start + offset] = (samples[start + offset] ?? 0) + lobe;
+      }
+    }
+
+    const analysis = analyzeFloatSamples(samples, sampleRate);
+    assert.ok(
+      analysis.clickScore < 0.08,
+      `${sampleRate} Hz accented voiced closure should stay below click warning, got ${analysis.clickScore.toFixed(3)}`,
+    );
+  }
+});
+
+test("sample click scoring detects hard splice steps inside periodic voiced energy across rates", () => {
+  for (const sampleRate of [16000, 48000]) {
+    const durationSec = 4;
+    const fundamentalHz = 100;
+    const spectralTilt = 1.25;
+    const maxHarmonicHz = Math.min(12000, sampleRate * 0.44);
+    const harmonicCount = Math.floor(maxHarmonicHz / fundamentalHz);
+    const scale = 0.12;
+    const step = 0.12;
+    const fadeSamples = Math.round(sampleRate * 0.025);
+    const normalization = Array.from(
+      { length: harmonicCount },
+      (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+    ).reduce((sum, value) => sum + value, 0);
+    const edgeIndices = [1, 2, 3].map(
+      (second) => second * sampleRate + Math.round(sampleRate * 0.005),
+    );
+    const samples = new Float32Array(sampleRate * durationSec);
+
+    for (let index = 0; index < samples.length; index += 1) {
+      const timeSec = index / sampleRate;
+      let value = 0;
+      for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+        value +=
+          Math.sin(2 * Math.PI * fundamentalHz * harmonic * timeSec) /
+          Math.pow(harmonic, spectralTilt);
+      }
+      let offset = 0;
+      if (index >= edgeIndices[0]) offset = step;
+      if (index >= edgeIndices[1]) offset = 0;
+      if (index >= edgeIndices[2]) offset = step;
+
+      const edgeDistance = Math.min(index, samples.length - 1 - index);
+      const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+      samples[index] = ((scale * value) / normalization + offset) * fade;
+    }
+
+    const spliceJumps = edgeIndices.map((index) =>
+      Math.abs((samples[index] ?? 0) - (samples[index - 1] ?? 0)),
+    );
+    assert.ok(
+      spliceJumps.every((jump) => jump > 0.11),
+      `${sampleRate} Hz fixture must retain its hard splice steps: ${spliceJumps.join(", ")}`,
+    );
+
+    const analysis = analyzeFloatSamples(samples, sampleRate);
+    assert.ok(
+      analysis.clickScore > 0.12,
+      `${sampleRate} Hz voiced hard splices should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+    );
+  }
+});
+
+test("sample click scoring detects voiced hard splices across 16 kHz pitch and phase", () => {
+  const sampleRate = 16000;
+  const durationSec = 4;
+  const spectralTilt = 1.25;
+  const scale = 0.12;
+  const step = 0.12;
+  const fadeSamples = Math.round(sampleRate * 0.025);
+
+  for (const fundamentalHz of [100, 220]) {
+    const harmonicCount = Math.floor(
+      Math.min(12000, sampleRate * 0.44) / fundamentalHz,
+    );
+    const normalization = Array.from(
+      { length: harmonicCount },
+      (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+    ).reduce((sum, value) => sum + value, 0);
+    const baseSamples = new Float32Array(sampleRate * durationSec);
+
+    for (let index = 0; index < baseSamples.length; index += 1) {
+      const timeSec = index / sampleRate;
+      let value = 0;
+      for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+        value +=
+          Math.sin(2 * Math.PI * fundamentalHz * harmonic * timeSec) /
+          Math.pow(harmonic, spectralTilt);
+      }
+      const edgeDistance = Math.min(index, baseSamples.length - 1 - index);
+      const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+      baseSamples[index] = ((scale * value) / normalization) * fade;
+    }
+
+    let audiblePhaseCount = 0;
+    for (let phaseOffsetMs = 0; phaseOffsetMs <= 9; phaseOffsetMs += 1) {
+      const edgeIndices = [1, 2, 3].map(
+        (second) => second * sampleRate + Math.round((sampleRate * phaseOffsetMs) / 1000),
+      );
+      const samples = baseSamples.slice();
+      for (let index = edgeIndices[0]; index < samples.length; index += 1) {
+        let offset = step;
+        if (index >= edgeIndices[1]) offset = 0;
+        if (index >= edgeIndices[2]) offset = step;
+        const edgeDistance = Math.min(index, samples.length - 1 - index);
+        const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+        samples[index] = (samples[index] ?? 0) + offset * fade;
+      }
+
+      const spliceJumps = edgeIndices.map((index) =>
+        Math.abs((samples[index] ?? 0) - (samples[index - 1] ?? 0)),
+      );
+      if (!spliceJumps.every((jump) => jump > 0.11)) continue;
+      audiblePhaseCount += 1;
+      const analysis = analyzeFloatSamples(samples, sampleRate);
+      assert.ok(
+        analysis.clickScore > 0.12,
+        `${fundamentalHz} Hz voice at ${phaseOffsetMs} ms phase should detect hard splices, got ${analysis.clickScore.toFixed(3)}`,
+      );
+    }
+    assert.ok(
+      audiblePhaseCount >= 8,
+      `${fundamentalHz} Hz fixture should cover most pitch phases, got ${audiblePhaseCount}`,
+    );
+  }
+});
+
+test("sample click scoring detects high-pitch voiced splices across common rates and phases", () => {
+  const durationSec = 4;
+  const fundamentalHz = 320;
+  const spectralTilt = 1.25;
+  const scale = 0.12;
+  const step = 0.12;
+
+  for (const sampleRate of [16000, 44100]) {
+    const fadeSamples = Math.round(sampleRate * 0.025);
+    const harmonicCount = Math.floor(
+      Math.min(12000, sampleRate * 0.44) / fundamentalHz,
+    );
+    const normalization = Array.from(
+      { length: harmonicCount },
+      (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+    ).reduce((sum, value) => sum + value, 0);
+    const baseSamples = new Float32Array(sampleRate * durationSec);
+
+    for (let index = 0; index < baseSamples.length; index += 1) {
+      const timeSec = index / sampleRate;
+      let value = 0;
+      for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+        value +=
+          Math.sin(2 * Math.PI * fundamentalHz * harmonic * timeSec) /
+          Math.pow(harmonic, spectralTilt);
+      }
+      const edgeDistance = Math.min(index, baseSamples.length - 1 - index);
+      const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+      baseSamples[index] = ((scale * value) / normalization) * fade;
+    }
+
+    for (const phaseOffsetMs of [3, 6, 7, 9]) {
+      const edgeIndices = [1, 2, 3].map(
+        (second) =>
+          second * sampleRate + Math.round((sampleRate * phaseOffsetMs) / 1000),
+      );
+      const samples = baseSamples.slice();
+      for (let index = edgeIndices[0]; index < samples.length; index += 1) {
+        let offset = step;
+        if (index >= edgeIndices[1]) offset = 0;
+        if (index >= edgeIndices[2]) offset = step;
+        const edgeDistance = Math.min(index, samples.length - 1 - index);
+        const fade = Math.min(1, edgeDistance / Math.max(fadeSamples, 1));
+        samples[index] = (samples[index] ?? 0) + offset * fade;
+      }
+
+      const spliceJumps = edgeIndices.map((index) =>
+        Math.abs((samples[index] ?? 0) - (samples[index - 1] ?? 0)),
+      );
+      assert.ok(
+        spliceJumps.every((jump) => jump > 0.11),
+        `${sampleRate} Hz/${phaseOffsetMs} ms fixture must retain its hard splice steps: ${spliceJumps.join(", ")}`,
+      );
+      const analysis = analyzeFloatSamples(samples, sampleRate);
+      assert.ok(
+        analysis.clickScore > 0.12,
+        `${sampleRate} Hz/${phaseOffsetMs} ms high-pitch splices should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+      );
+    }
+  }
+});
+
+test("sample click scoring detects zero-mean phase splices in periodic voice", () => {
+  const sampleRate = 16000;
+  const durationSec = 4;
+  const spectralTilt = 1.25;
+  const phases = [0, 1.2, -1, 2];
+  const scenarios = [
+    { fundamentalHz: 100, boundaryOffsetMs: 1 },
+    { fundamentalHz: 150, boundaryOffsetMs: 3 },
+    { fundamentalHz: 220, boundaryOffsetMs: 2 },
+    { fundamentalHz: 320, boundaryOffsetMs: 4 },
+  ];
+
+  for (const scenario of scenarios) {
+    const harmonicCount = Math.floor(
+      Math.min(12000, sampleRate * 0.44) / scenario.fundamentalHz,
+    );
+    const normalization = Array.from(
+      { length: harmonicCount },
+      (_, index) => 1 / Math.pow(index + 1, spectralTilt),
+    ).reduce((sum, value) => sum + value, 0);
+    const scale = 0.36 / normalization;
+    const boundaries = [1, 2, 3].map(
+      (second) =>
+        second * sampleRate +
+        Math.round((sampleRate * scenario.boundaryOffsetMs) / 1000),
+    );
+    const samples = new Float32Array(sampleRate * durationSec);
+
+    for (let index = 0; index < samples.length; index += 1) {
+      const timeSec = index / sampleRate;
+      const segment =
+        index < boundaries[0]
+          ? 0
+          : index < boundaries[1]
+            ? 1
+            : index < boundaries[2]
+              ? 2
+              : 3;
+      let value = 0;
+      for (let harmonic = 1; harmonic <= harmonicCount; harmonic += 1) {
+        value +=
+          Math.sin(
+            2 * Math.PI * scenario.fundamentalHz * harmonic * timeSec +
+              harmonic * (phases[segment] ?? 0),
+          ) / Math.pow(harmonic, spectralTilt);
+      }
+      samples[index] = value * scale;
+    }
+
+    const jumps = boundaries.map((index) =>
+      Math.abs((samples[index] ?? 0) - (samples[index - 1] ?? 0)),
+    );
+    assert.ok(
+      jumps.filter((jump) => jump > 0.08).length >= 2,
+      `${scenario.fundamentalHz} Hz fixture must contain at least two audible phase seams: ${jumps.join(", ")}`,
+    );
+    const analysis = analyzeFloatSamples(samples, sampleRate);
+    assert.ok(
+      analysis.clickScore > 0.12,
+      `${scenario.fundamentalHz} Hz zero-mean phase seams should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+    );
+  }
+});
+
+test("sample click scoring detects isolated discontinuities across recording levels and rates", () => {
+  const scenarios = [
+    { sampleRate: 16000, bodyGain: 0.03, clickGain: 0.22 },
+    { sampleRate: 48000, bodyGain: 0.18, clickGain: 0.82 },
+  ];
+
+  for (const scenario of scenarios) {
+    const samples = buildContinuousSignal(
+      4,
+      (timeSec) =>
+        Math.sin(2 * Math.PI * 190 * timeSec) * scenario.bodyGain +
+        Math.sin(2 * Math.PI * 430 * timeSec + 0.4) * scenario.bodyGain * 0.38,
+      scenario.sampleRate,
+    );
+    const clickSpacing = Math.round(scenario.sampleRate * 0.32);
+    let clickIndex = 0;
+    for (
+      let index = Math.round(scenario.sampleRate * 0.48);
+      index < samples.length - 2;
+      index += clickSpacing
+    ) {
+      samples[index] = clickIndex % 2 === 0 ? scenario.clickGain : -scenario.clickGain;
+      clickIndex += 1;
+    }
+
+    const analysis = analyzeFloatSamples(samples, scenario.sampleRate);
+
+    assert.ok(
+      analysis.clickScore > 0.12,
+      `${scenario.sampleRate} Hz isolated discontinuities should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+    );
+  }
+});
+
+test("sample click scoring detects isolated short pops wider than one sample", () => {
+  for (const sampleRate of [16000, 48000]) {
+    for (const pulseMs of [1, 2, 4]) {
+      const samples = buildContinuousSignal(
+        4,
+        (timeSec) => Math.sin(2 * Math.PI * 180 * timeSec) * 0.035,
+        sampleRate,
+      );
+      const clickSpacing = Math.round(sampleRate * 0.36);
+      const pulseSamples = Math.round((sampleRate * pulseMs) / 1000);
+      let clickIndex = 0;
+      for (
+        let index = Math.round(sampleRate * 0.48);
+        index + pulseSamples < samples.length;
+        index += clickSpacing
+      ) {
+        samples.fill(clickIndex % 2 === 0 ? 0.34 : -0.34, index, index + pulseSamples);
+        clickIndex += 1;
+      }
+
+      const analysis = analyzeFloatSamples(samples, sampleRate);
+
+      assert.ok(
+        analysis.clickScore > 0.12,
+        `${pulseMs} ms pops at ${sampleRate} Hz should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+      );
+    }
+  }
+});
+
+test("sample click scoring detects isolated plateau pops beyond the rapid-return window", () => {
+  for (const sampleRate of [16000, 48000]) {
+    for (const pulseMs of [5, 10, 20, 29]) {
+      const samples = buildContinuousSignal(
+        4,
+        (timeSec) => Math.sin(2 * Math.PI * 180 * timeSec) * 0.04,
+        sampleRate,
+      );
+      const pulseSamples = Math.round((sampleRate * pulseMs) / 1000);
+      for (const startSec of [0.7, 1.7, 2.7]) {
+        const start = Math.round(startSec * sampleRate);
+        for (let index = start; index < start + pulseSamples; index += 1) {
+          samples[index] = (samples[index] ?? 0) + 0.18;
+        }
+      }
+
+      const analysis = analyzeFloatSamples(samples, sampleRate);
+      assert.ok(
+        analysis.clickScore > 0.12,
+        `${pulseMs} ms plateau pops at ${sampleRate} Hz should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+      );
+    }
+  }
+});
+
+test("sample click scoring detects isolated hard splice steps without a rapid return", () => {
+  for (const sampleRate of [16000, 48000]) {
+    const phaseBySecond = [0, 1.2, -1, 2];
+    const samples = buildContinuousSignal(
+      4,
+      (timeSec) => {
+        const segment = Math.min(phaseBySecond.length - 1, Math.floor(timeSec));
+        const phase = phaseBySecond[segment] ?? 0;
+        return (
+          Math.sin(2 * Math.PI * 190 * timeSec + phase) * 0.12 +
+          Math.sin(2 * Math.PI * 430 * timeSec + phase * 0.37) * 0.04
+        );
+      },
+      sampleRate,
+    );
+    const spliceJumps = [1, 2, 3].map((second) => {
+      const index = Math.round(second * sampleRate);
+      return Math.abs((samples[index] ?? 0) - (samples[index - 1] ?? 0));
+    });
+    assert.ok(
+      spliceJumps.every((jump) => jump > 0.08),
+      `${sampleRate} Hz fixture must contain three audible hard-splice jumps: ${spliceJumps.join(", ")}`,
+    );
+
+    const analysis = analyzeFloatSamples(samples, sampleRate);
+
+    assert.ok(
+      analysis.clickScore > 0.12,
+      `${sampleRate} Hz one-sided hard splices should remain detectable, got ${analysis.clickScore.toFixed(3)}`,
+    );
+  }
 });
 
 test("line swing scoring rises for high-low-high speech contours", () => {

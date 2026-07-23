@@ -40,8 +40,10 @@ import {
   buildRenderRiskProfile,
   compareCandidateScores,
   isHealthySegmentedRender,
+  resolveCandidateMeasurementStatus,
   resolveNextAudibilityFallbackIndex,
   selectQcUnavailableFallbackCandidate,
+  summarizeCandidateScore,
   type CandidateRenderMeta,
   type CandidateScore,
   type DegradeReason,
@@ -75,11 +77,23 @@ import {
   deriveSpectrumTiltsDb,
   HOUSE_TONE_BLEND,
   resolveDeEsserBands,
+  resolveDeEsserCutsDb,
   SPECTRUM_BANDS_HZ,
 } from "../lib/spectrum";
 import { buildFinalPolishFilter } from "../lib/finalPolishFilter";
 import { planBatchLoudnessAlignment } from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
+import {
+  estimateCanonicalMonoFloat32WavBytes,
+  inspectMonoFloat32Wav,
+  shouldUseBoundedWavQc,
+  sliceMonoFloat32Wav,
+} from "../lib/boundedWavWindow";
+import {
+  createNativeConsonantReferenceAccumulator,
+  isConsonantReferenceBandwidthCompatible,
+  type NativeConsonantReferenceAccumulator,
+} from "../lib/nativeConsonantReference";
 import { tameCanonicalMonoFloat32WavBlobInChunks } from "../lib/chunkedConsonantTamer";
 import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlob";
 import { estimateVoZipBytes, planVoZipExportParts } from "../lib/downloadPolicy";
@@ -178,6 +192,14 @@ const ENVELOPE_FRAME_MS = 10;
 const DISTRIBUTED_ANALYSIS_THRESHOLD_SECONDS = ANALYSIS_SAMPLE_SECONDS + 30;
 const DISTRIBUTED_ANALYSIS_WINDOW_SECONDS = 30;
 const DISTRIBUTED_ANALYSIS_TARGET_COUNT = 6;
+// Memory-routing boundary, not an audio-quality gate. Large app-rendered
+// pcm_f32 WAVs are QC'd through small exact byte windows so a missing metric
+// cannot become a WASM out-of-memory failure or fake 100% risk score.
+const BOUNDED_CANDIDATE_QC_MIN_SECONDS = 600;
+const BOUNDED_CANDIDATE_QC_MIN_BYTES = 96 * 1024 * 1024;
+const BOUNDED_CANDIDATE_QC_MIN_COMBINED_BYTES = 112 * 1024 * 1024;
+const BOUNDED_CANDIDATE_QC_WINDOW_SECONDS = 30;
+const BOUNDED_CANDIDATE_QC_TARGET_COUNT = 6;
 const MIX_SEGMENT_SECONDS = 75;
 const MIX_SEGMENT_MIN_DURATION_SECONDS = 105;
 const LONG_SPARSE_DURATION_SECONDS = 480;
@@ -1915,7 +1937,6 @@ const summarizeFailureReason = (error: unknown) => {
   const PLANNER_APPLY_CHUNK_SECONDS_LONG = 60;
   const PLANNER_APPLY_RETRY_CHUNK_SECONDS: Array<number | null> = [null, 60, 30, 15];
   const LONG_FILE_DURATION_SECONDS = 600; // 10 min
-  const LONG_CANDIDATE_QC_SAFE_SECONDS = 1200; // 20 min
 
   /**
    * Overlap between consecutive render chunks/segments, consumed by a
@@ -1940,6 +1961,14 @@ const summarizeFailureReason = (error: unknown) => {
   const AUDIBILITY_GUARD_FRAME_MS = 20;
   const AUDIBILITY_GUARD_MAX_DURATION_SECONDS = 1800;
 
+  type PlannerRangeReferenceCapture = Readonly<{
+    referenceAccumulator: NativeConsonantReferenceAccumulator;
+    /** Unique source span; excludes any duplicated crossfade look-ahead. */
+    uniqueDurationSec: number;
+    /** Only the final range may end at the actual decoder tail. */
+    allowTrailingShortfall?: boolean;
+  }>;
+
   /**
    * Decode a time range of `inputName` to mono Float32 at `PLANNER_APPLY_SAMPLE_RATE`,
    * multiply the samples by the slice of the planner's gain curve that covers
@@ -1953,8 +1982,10 @@ const summarizeFailureReason = (error: unknown) => {
     plan: PlannedGain,
     startSec: number,
     durationSec: number,
+    referenceCapture?: PlannerRangeReferenceCapture,
   ) => {
     const rawName = `${outputName}.raw.wav`;
+    let referenceError: string | null = null;
     resetLogBuffer();
     await execOrThrow(
       ffmpeg,
@@ -1967,9 +1998,9 @@ const summarizeFailureReason = (error: unknown) => {
         "1",
         "-y",
         "-ss",
-        startSec.toFixed(3),
+        startSec.toFixed(6),
         "-t",
-        durationSec.toFixed(3),
+        durationSec.toFixed(6),
         "-i",
         inputName,
         "-ac",
@@ -1986,6 +2017,28 @@ const summarizeFailureReason = (error: unknown) => {
       const bytes = await readVirtualFileBytes(ffmpeg, rawName);
       const decoded = decodeWav(bytes);
       const samples = decoded.samples;
+
+      if (referenceCapture) {
+        const sourceStartSample = Math.round(startSec * PLANNER_APPLY_SAMPLE_RATE);
+        const requestedUniqueEndSample = sourceStartSample + Math.round(
+          referenceCapture.uniqueDurationSec * PLANNER_APPLY_SAMPLE_RATE,
+        );
+        const decodedEndSample = sourceStartSample + samples.length;
+        const uniqueEndSample = referenceCapture.allowTrailingShortfall
+          ? Math.min(requestedUniqueEndSample, decodedEndSample)
+          : requestedUniqueEndSample;
+        try {
+          referenceCapture.referenceAccumulator.append({
+            samples,
+            sourceStartSample,
+            uniqueEndSample,
+          });
+        } catch (error) {
+          // The optional reference must fail open without changing the audio
+          // render; the compact planner evidence remains available.
+          referenceError = describeError(error);
+        }
+      }
 
       // Slice the gain curve to just the frames covering [startSec, startSec+durationSec).
       const frameStart = Math.max(0, Math.floor((startSec * 1000) / plan.frameMs));
@@ -2009,6 +2062,7 @@ const summarizeFailureReason = (error: unknown) => {
     } finally {
       await safeDeleteFile(ffmpeg, rawName);
     }
+    return { referenceError };
   };
 
   /**
@@ -2024,16 +2078,43 @@ const summarizeFailureReason = (error: unknown) => {
     outputName: string,
     plan: PlannedGain,
     chunkSecondsOverride?: number | null,
-  ) => {
+  ): Promise<RenderedConsonantReference | null> => {
     const total = plan.durationSec;
+    const totalSampleCount = Math.max(1, Math.round(total * PLANNER_APPLY_SAMPLE_RATE));
+    const createReferenceAccumulator = () => createNativeConsonantReferenceAccumulator({
+      sampleRate: PLANNER_APPLY_SAMPLE_RATE,
+      totalSampleCount,
+    });
+    const finalizeReference = (
+      referenceAccumulator: NativeConsonantReferenceAccumulator,
+      referenceError: string | null,
+    ) => {
+      if (referenceError) {
+        appendLog(`[FinalPeakTamer] ${sanitizeBase(inputName)}: native planner reference fallback (${referenceError}).`);
+        return null;
+      }
+      try {
+        return referenceAccumulator.finalize({ allowTrailingShortfall: true });
+      } catch (error) {
+        appendLog(
+          `[FinalPeakTamer] ${sanitizeBase(inputName)}: native planner reference incomplete (${describeError(error)}).`,
+        );
+        return null;
+      }
+    };
     const chunkSeconds =
       chunkSecondsOverride ??
       (total >= LONG_FILE_DURATION_SECONDS
         ? PLANNER_APPLY_CHUNK_SECONDS_LONG
         : PLANNER_APPLY_CHUNK_SECONDS_DEFAULT);
     if (total <= chunkSeconds) {
-      await levelInputRange(ffmpeg, inputName, outputName, plan, 0, total);
-      return;
+      const referenceAccumulator = createReferenceAccumulator();
+      const rangeResult = await levelInputRange(ffmpeg, inputName, outputName, plan, 0, total, {
+        referenceAccumulator,
+        uniqueDurationSec: total,
+        allowTrailingShortfall: true,
+      });
+      return finalizeReference(referenceAccumulator, rangeResult.referenceError);
     }
 
     // Plan native (non-overlapping) chunk boundaries, then extend each
@@ -2053,6 +2134,8 @@ const summarizeFailureReason = (error: unknown) => {
     }
 
     const chunkNames: string[] = [];
+    const referenceAccumulator = createReferenceAccumulator();
+    let referenceError: string | null = null;
     try {
       for (let index = 0; index < nativeStarts.length; index += 1) {
         const isLast = index === nativeStarts.length - 1;
@@ -2061,7 +2144,12 @@ const summarizeFailureReason = (error: unknown) => {
           ? nativeSpans[index]
           : Math.min(nativeSpans[index] + CHUNK_CROSSFADE_SECONDS, total - start);
         const chunkName = `${sanitizeBase(outputName)}_chunk_${index}.wav`;
-        await levelInputRange(ffmpeg, inputName, chunkName, plan, start, span);
+        const rangeResult = await levelInputRange(ffmpeg, inputName, chunkName, plan, start, span, {
+          referenceAccumulator,
+          uniqueDurationSec: nativeSpans[index],
+          allowTrailingShortfall: isLast,
+        });
+        referenceError ??= rangeResult.referenceError;
         chunkNames.push(chunkName);
       }
 
@@ -2073,6 +2161,7 @@ const summarizeFailureReason = (error: unknown) => {
         "Planner apply crossfade",
       );
       await logDurationDelta(ffmpeg, "Planner apply crossfade", total, outputName);
+      return finalizeReference(referenceAccumulator, referenceError);
     } finally {
       for (const name of chunkNames) {
         await safeDeleteFile(ffmpeg, name);
@@ -2698,6 +2787,7 @@ const summarizeFailureReason = (error: unknown) => {
     );
     if (speechBandMedians.every((value): value is number => value !== null)) {
       aggregated.speechBandSpectrumDb = speechBandMedians;
+      aggregated.sibilanceScore = computeSibilanceScore(speechBandMedians);
     }
 
     for (const key of Object.keys(baseAnalysis) as Array<keyof FileAnalysis>) {
@@ -2928,6 +3018,105 @@ const summarizeFailureReason = (error: unknown) => {
 
     return { analysis: baseAnalysis, ffmpeg };
   };
+
+  const analyzeRenderedPcmWindows = async (
+    ffmpeg: FFmpeg,
+    inputBytes: Uint8Array,
+    inputName: string,
+    durationSeconds: number,
+    speechSpans: SpeechSpan[] = [],
+    silenceSpans: SilenceSpan[] = [],
+  ): Promise<{ analysis: FileAnalysis | null; ffmpeg: FFmpeg }> => {
+    const wavInfo = inspectMonoFloat32Wav(inputBytes);
+    const effectiveDurationSec = Math.min(durationSeconds, wavInfo.durationSec);
+    const windows = selectDistributedAnalysisWindowsWithConfig(
+      speechSpans,
+      effectiveDurationSec,
+      BOUNDED_CANDIDATE_QC_WINDOW_SECONDS,
+      BOUNDED_CANDIDATE_QC_TARGET_COUNT,
+    );
+    if (windows.length === 0) {
+      throw new Error("bounded candidate QC could not plan any analysis windows");
+    }
+
+    appendLog(
+      `[CandidateQC] ${sanitizeBase(inputName)}: bounded pcm_f32 window analysis (${windows.length} x ${BOUNDED_CANDIDATE_QC_WINDOW_SECONDS}s; full render removed from WASM before QC).`,
+    );
+    // inputBytes is retained by the caller as the deliverable. Removing the
+    // duplicate full WAV from WASM before analysis is what avoids Arthur's
+    // prior memory fault; retries below restore only one small exact window.
+    await safeDeleteFile(ffmpeg, inputName);
+
+    const windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }> = [];
+    let windowRetryCount = 0;
+    let windowDropCount = 0;
+    for (let windowIndex = 0; windowIndex < windows.length; windowIndex += 1) {
+      const window = windows[windowIndex];
+      const boundedWindow = sliceMonoFloat32Wav(inputBytes, window.startSec, window.durationSec);
+      const windowName = `${sanitizeBase(inputName)}_bounded_qc_${windowIndex}.wav`;
+      let completed = false;
+      for (let attempt = 0; attempt < 2 && !completed; attempt += 1) {
+        try {
+          // @ffmpeg/ffmpeg may transfer (and therefore detach) the supplied
+          // ArrayBuffer even when the command subsequently fails. Give every
+          // attempt its own copy so a fresh-worker retry retains exact bytes.
+          await ffmpeg.writeFile(windowName, cloneBytes(boundedWindow.bytes));
+          const analysis = await analyzeFileWindow(ffmpeg, windowName, 0, boundedWindow.durationSec);
+          const speechCoverage = clamp((window.occupancyPct ?? analysis.speechDutyCyclePct ?? 0) / 100, 0, 1);
+          const confidence = clamp(analysis.analysisConfidence ?? 0.25, 0, 1);
+          const roomPenalty = clamp(1 - (analysis.roomScore ?? 0), 0, 1);
+          const weight = clamp(speechCoverage * 0.55 + confidence * 0.35 + roomPenalty * 0.1, 0.05, 1);
+          windowAnalyses.push({ analysis, weight });
+          completed = true;
+        } catch (error) {
+          appendLog(
+            `[CandidateQC] Bounded window fallback (${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s${
+              attempt > 0 ? ` retry ${attempt}` : ""
+            }): ${describeError(error)}.`,
+          );
+          if (attempt === 0 && shouldResetFfmpegForError(error)) {
+            windowRetryCount += 1;
+            ffmpeg = await refreshFfmpeg(
+              `bounded candidate QC retry on ${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s`,
+            );
+            continue;
+          }
+          windowDropCount += 1;
+          break;
+        } finally {
+          await safeDeleteFile(ffmpeg, windowName);
+        }
+      }
+    }
+
+    if (windowAnalyses.length === 0) {
+      appendLog(`[CandidateQC] ${sanitizeBase(inputName)}: bounded QC unavailable (0/${windows.length} windows measured).`);
+      return { analysis: null, ffmpeg };
+    }
+    const speechStats = speechSpans.length > 0
+      ? computeSpeechMapStats(speechSpans, silenceSpans, effectiveDurationSec)
+      : undefined;
+    const analysis = aggregateWindowAnalyses(windowAnalyses[0].analysis, windowAnalyses, speechStats);
+    analysis.analysisWindowCount = windowAnalyses.length;
+    analysis.analysisWindowsAttempted = windows.length;
+    analysis.analysisWindowsSucceeded = windowAnalyses.length;
+    analysis.analysisWindowsDropped = windowDropCount;
+    analysis.analysisWindowRetryCount = windowRetryCount;
+    return { analysis, ffmpeg };
+  };
+
+  const shouldUseBoundedCandidateQc = (
+    durationSeconds: number,
+    renderedByteLength: number,
+    companionByteLength: number,
+  ) => shouldUseBoundedWavQc({
+    durationSec: durationSeconds,
+    renderedBytes: renderedByteLength,
+    companionBytes: companionByteLength,
+    minDurationSec: BOUNDED_CANDIDATE_QC_MIN_SECONDS,
+    minRenderedBytes: BOUNDED_CANDIDATE_QC_MIN_BYTES,
+    minCombinedBytes: BOUNDED_CANDIDATE_QC_MIN_COMBINED_BYTES,
+  });
 
   const buildBatchReference = (analyses: FileAnalysis[]): BatchReference | null => {
     const lowTilts: number[] = [];
@@ -4047,18 +4236,16 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push("equalizer=f=10000:width_type=q:width=0.7:g=-0.5"); // take glassy edge off
     }
 
-    // De-esser — narrow notches at the two main sibilance bands, scaled by
-    // the measured sibilance score. We keep this linear (no sidechain graph)
-    // to stay inside the `-af` / comma-joined filter chain. Depth caps at
-    // -4 dB so we never dull a voice that is only lightly bright.
+    // De-esser — narrow notches at the two measured sibilance bands. A
+    // quadratic evidence curve fades continuously from zero instead of
+    // jumping on at the legacy 0.4 threshold; weak or uncertain evidence has
+    // very little authority while the existing -4/-2.4 dB caps remain intact.
     const sibilanceScore = profile?.sibilanceScore ?? 0;
-    if (!minimalStabilityChain && !sourceSafeMode && sibilanceScore >= 0.4) {
-      const depthNorm = clamp((sibilanceScore - 0.4) / 0.6, 0, 1);
-      const mainCut = -clamp(1.2 + depthNorm * 2.8, 1.2, 4);
-      const secondaryCut = -clamp(0.6 + depthNorm * 1.8, 0.6, 2.4);
+    const { mainCutDb, secondaryCutDb } = resolveDeEsserCutsDb(sibilanceScore);
+    if (!minimalStabilityChain && !sourceSafeMode && (mainCutDb < 0 || secondaryCutDb < 0)) {
       const deEsserBands = resolveDeEsserBands(profile?.bandSpectrumDb ?? []);
-      filters.push(`equalizer=f=${deEsserBands.mainHz}:width_type=q:width=1.4:g=${mainCut.toFixed(2)}`);
-      filters.push(`equalizer=f=${deEsserBands.secondaryHz}:width_type=q:width=1.2:g=${secondaryCut.toFixed(2)}`);
+      filters.push(`equalizer=f=${deEsserBands.mainHz}:width_type=q:width=1.4:g=${mainCutDb.toFixed(2)}`);
+      filters.push(`equalizer=f=${deEsserBands.secondaryHz}:width_type=q:width=1.2:g=${secondaryCutDb.toFixed(2)}`);
     }
 
     const thresholdBase = parseFloat(levelerSettings.compressor.threshold.replace("dB", ""));
@@ -5549,6 +5736,19 @@ const summarizeFailureReason = (error: unknown) => {
         appendLog(`[FinalPeakTamer] ${entry.name}: final source-relative residual skipped (reference unavailable).`);
         continue;
       }
+      if (
+        !isConsonantReferenceBandwidthCompatible(
+          sourceReference.sampleRate,
+          PLANNER_APPLY_SAMPLE_RATE,
+        )
+      ) {
+        appendLog(
+          `[FinalPeakTamer] ${entry.name}: final source-relative residual skipped (reference bandwidth ${(sourceReference.sampleRate / 1000).toFixed(
+            1,
+          )} kHz cannot represent the ${PLANNER_APPLY_SAMPLE_RATE / 1000} kHz delivery; original bytes kept).`,
+        );
+        continue;
+      }
 
       const byteLength = Math.max(entry.size, entry.blob.size);
       try {
@@ -5559,9 +5759,14 @@ const summarizeFailureReason = (error: unknown) => {
             sourceReference,
             { maxReductionDb: FINAL_CONSONANT_RESIDUAL_MAX_REDUCTION_DB },
           );
+          const referenceCoverage = `source match ${chunkedResult.stats.referenceUsedChunkCount}/${
+            chunkedResult.stats.processedChunkCount
+          } used, ${chunkedResult.stats.referenceRejectedChunkCount} rejected, min confidence ${chunkedResult.stats.minimumReferenceConfidence.toFixed(
+            2,
+          )}`;
           if (chunkedResult.blob === entry.blob) {
             appendLog(
-              `[FinalPeakTamer] ${entry.name}: bounded final delivery scan found no processing-added consonant contrast (${chunkedResult.stats.processedChunkCount} chunks).`,
+              `[FinalPeakTamer] ${entry.name}: bounded final delivery scan found no processing-added consonant contrast (${referenceCoverage}).`,
             );
             continue;
           }
@@ -5571,7 +5776,7 @@ const summarizeFailureReason = (error: unknown) => {
               chunkedResult.stats.tamedFrameCount === 1 ? "" : "s"
             } across ${chunkedResult.stats.processedChunkCount} chunks (max ${chunkedResult.stats.maxReductionDb.toFixed(
               1,
-            )} dB, source lag ${formatSigned(chunkedResult.stats.referenceLagMs, 0)} ms).`,
+            )} dB, source lag ${formatSigned(chunkedResult.stats.referenceLagMs, 0)} ms, ${referenceCoverage}).`,
           );
         } else {
           const result = await applyFinalConsonantPeakPolish(
@@ -5744,6 +5949,8 @@ const summarizeFailureReason = (error: unknown) => {
     }
   };
 
+  const LONG_FORM_REFERENCE_DECODE_SECONDS = 60;
+
   const buildConsonantReferenceForInputRange = async (
     ffmpeg: FFmpeg,
     inputName: string,
@@ -5751,51 +5958,79 @@ const summarizeFailureReason = (error: unknown) => {
     durationSec: number,
     context: string,
   ): Promise<RenderedConsonantReference | null> => {
-    const rawName = `${sanitizeBase(inputName)}_${sanitizeBase(context)}_consonant_ref.f32`;
     try {
-      resetLogBuffer();
-      await execOrThrow(
-        ffmpeg,
-        [
-          "-hide_banner",
-          "-nostdin",
-          "-threads",
-          "1",
-          "-filter_threads",
-          "1",
-          "-y",
-          "-ss",
-          startSec.toFixed(3),
-          "-t",
-          durationSec.toFixed(3),
-          "-i",
-          inputName,
-          "-ac",
-          "1",
-          "-ar",
-          `${GAIN_PLANNER_ANALYSIS_SAMPLE_RATE}`,
-          "-f",
-          "f32le",
-          rawName,
-        ],
-        `Consonant source reference ${context}`,
-      );
-      const bytes = await readVirtualFileBytes(ffmpeg, rawName);
-      const samples = new Float32Array(
-        bytes.buffer,
-        bytes.byteOffset,
-        Math.floor(bytes.byteLength / Float32Array.BYTES_PER_ELEMENT),
-      );
-      return buildRenderedConsonantReference(
-        samples,
-        GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
-        RENDERED_CONSONANT_SOURCE_FRAME_MS,
-      );
+      const totalSampleCount = Math.max(1, Math.round(durationSec * PLANNER_APPLY_SAMPLE_RATE));
+      const referenceStartSample = Math.max(0, Math.round(startSec * PLANNER_APPLY_SAMPLE_RATE));
+      const referenceAccumulator = createNativeConsonantReferenceAccumulator({
+        sampleRate: PLANNER_APPLY_SAMPLE_RATE,
+        totalSampleCount,
+        referenceStartSample,
+      });
+      const maxSubrangeSamples = LONG_FORM_REFERENCE_DECODE_SECONDS * PLANNER_APPLY_SAMPLE_RATE;
+      let cursorSample = 0;
+      let subrangeIndex = 0;
+      while (cursorSample < totalSampleCount) {
+        const subrangeSampleCount = Math.min(maxSubrangeSamples, totalSampleCount - cursorSample);
+        const isFinalSubrange = cursorSample + subrangeSampleCount >= totalSampleCount;
+        const cursorSec = cursorSample / PLANNER_APPLY_SAMPLE_RATE;
+        const subrangeDurationSec = subrangeSampleCount / PLANNER_APPLY_SAMPLE_RATE;
+        const rawName = `${sanitizeBase(inputName)}_${sanitizeBase(context)}_consonant_ref_${subrangeIndex}.f32`;
+        try {
+          resetLogBuffer();
+          await execOrThrow(
+            ffmpeg,
+            [
+              "-hide_banner",
+              "-nostdin",
+              "-threads",
+              "1",
+              "-filter_threads",
+              "1",
+              "-y",
+              "-ss",
+              (startSec + cursorSec).toFixed(6),
+              "-t",
+              subrangeDurationSec.toFixed(6),
+              "-i",
+              inputName,
+              "-ac",
+              "1",
+              "-ar",
+              `${PLANNER_APPLY_SAMPLE_RATE}`,
+              "-f",
+              "f32le",
+              rawName,
+            ],
+            `Consonant source reference ${context} ${subrangeIndex + 1}`,
+          );
+          const bytes = await readVirtualFileBytes(ffmpeg, rawName);
+          const decodedSampleCount = Math.floor(bytes.byteLength / Float32Array.BYTES_PER_ELEMENT);
+          if (decodedSampleCount < subrangeSampleCount && !isFinalSubrange) {
+            throw new Error(
+              `native reference subrange returned ${decodedSampleCount}/${subrangeSampleCount} samples`,
+            );
+          }
+          if (decodedSampleCount <= 0) {
+            throw new Error("native reference final subrange contained no decoded samples");
+          }
+          const samples = new Float32Array(bytes.buffer, bytes.byteOffset, decodedSampleCount);
+          const sourceStartSample = referenceStartSample + cursorSample;
+          const uniqueSampleCount = Math.min(decodedSampleCount, subrangeSampleCount);
+          referenceAccumulator.append({
+            samples,
+            sourceStartSample,
+            uniqueEndSample: sourceStartSample + uniqueSampleCount,
+          });
+        } finally {
+          await safeDeleteFile(ffmpeg, rawName);
+        }
+        cursorSample += subrangeSampleCount;
+        subrangeIndex += 1;
+      }
+      return referenceAccumulator.finalize({ allowTrailingShortfall: true });
     } catch (error) {
       appendLog(`[FinalPeakTamer] ${context}: source-relative reference unavailable (${describeError(error)}).`);
       return null;
-    } finally {
-      await safeDeleteFile(ffmpeg, rawName);
     }
   };
 
@@ -6181,6 +6416,7 @@ const summarizeFailureReason = (error: unknown) => {
     leveledInputName: string | null;
     leveledReady: boolean;
     applyChunkSeconds: number | null;
+    nativeSourceConsonantReference: RenderedConsonantReference | null;
   };
 
   const analysisLooksSpeechBearing = (analysis: FileAnalysis | undefined, durationSeconds: number | null) => {
@@ -6201,6 +6437,7 @@ const summarizeFailureReason = (error: unknown) => {
       leveledInputName: null,
       leveledReady: false,
       applyChunkSeconds: null,
+      nativeSourceConsonantReference: null,
     };
     if (!getActiveAudioReviewControls().gainPlannerEnabled) return context;
 
@@ -6216,10 +6453,6 @@ const summarizeFailureReason = (error: unknown) => {
     const breathNote =
       plan.breathRunCount > 0
         ? `, ${plan.breathRunCount} breath/transient run${plan.breathRunCount === 1 ? "" : "s"} tamed`
-        : "";
-    const speechSpikeNote =
-      plan.speechSpikeFrameCount > 0
-        ? `, ${plan.speechSpikeFrameCount} speech-spike frame${plan.speechSpikeFrameCount === 1 ? "" : "s"} tamed (max ${plan.speechSpikeMaxReductionDb.toFixed(1)} dB)`
         : "";
     const sustainedLoudNote =
       plan.sustainedLoudClusterCount > 0
@@ -6242,7 +6475,7 @@ const summarizeFailureReason = (error: unknown) => {
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
+      )} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
     );
 
     context.plan = plan;
@@ -6296,6 +6529,7 @@ const summarizeFailureReason = (error: unknown) => {
         compression: 1,
         echo: 1,
         total: 1111,
+        measurementStatus: "unavailable",
       };
     }
 
@@ -6323,17 +6557,9 @@ const summarizeFailureReason = (error: unknown) => {
       breathSpike * 0.24 +
       clamp(((analysis.pauseNoiseFloorDb ?? -120) + 62) / 18, 0, 1) * 0.18;
     const total = stability * 1000 + pause * 100 + compression * 10 + echo;
-    return { stability, pause, compression, echo, total };
+    const measurementStatus = resolveCandidateMeasurementStatus(analysis);
+    return { stability, pause, compression, echo, total, measurementStatus };
   };
-
-  const summarizeCandidateScore = (score: CandidateScore) =>
-    `stability ${(score.stability * 100).toFixed(0)} / pause ${(score.pause * 100).toFixed(0)} / compression ${(
-      score.compression * 100
-    ).toFixed(0)} / echo ${(score.echo * 100).toFixed(0)}${
-      typeof score.rankingScore === "number" && Number.isFinite(score.rankingScore)
-        ? ` / rank ${score.rankingScore.toFixed(1)}`
-        : ""
-    }${score.gateReasons && score.gateReasons.length > 0 ? ` / gates ${score.gateReasons.join("+")}` : ""}`;
 
   const countUsableSpeechPauseBoundaries = (silenceSpans: SilenceSpan[]) => {
     let usableCount = 0;
@@ -6565,10 +6791,6 @@ const summarizeFailureReason = (error: unknown) => {
           const breathNote = plan.breathRunCount > 0
             ? `, ${plan.breathRunCount} breath/transient run${plan.breathRunCount === 1 ? "" : "s"} tamed`
             : "";
-          const speechSpikeNote =
-            plan.speechSpikeFrameCount > 0
-              ? `, ${plan.speechSpikeFrameCount} speech-spike frame${plan.speechSpikeFrameCount === 1 ? "" : "s"} tamed (max ${plan.speechSpikeMaxReductionDb.toFixed(1)} dB)`
-              : "";
           const sustainedLoudNote =
             plan.sustainedLoudClusterCount > 0
               ? `, ${plan.sustainedLoudClusterCount} sustained-loud cluster${plan.sustainedLoudClusterCount === 1 ? "" : "s"} tamed (max ${plan.sustainedLoudMaxReductionDb.toFixed(1)} dB)`
@@ -6586,7 +6808,7 @@ const summarizeFailureReason = (error: unknown) => {
               ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
               : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);
@@ -6625,11 +6847,18 @@ const summarizeFailureReason = (error: unknown) => {
           if (retryChunkSeconds !== null) {
             appendLog(`[Planner] ${job.base}: retrying apply with ${retryChunkSeconds}s chunks.`);
           }
-          await applyPlannerToFullInput(ffmpeg, job.inputName, leveledInputName, plan, retryChunkSeconds);
+          const nativeSourceConsonantReference = await applyPlannerToFullInput(
+            ffmpeg,
+            job.inputName,
+            leveledInputName,
+            plan,
+            retryChunkSeconds,
+          );
           leveledReady = true;
           if (plannerContext) {
             plannerContext.leveledReady = true;
             plannerContext.applyChunkSeconds = retryChunkSeconds;
+            plannerContext.nativeSourceConsonantReference = nativeSourceConsonantReference;
           }
           return leveledInputName;
         } catch (error) {
@@ -7199,7 +7428,7 @@ const summarizeFailureReason = (error: unknown) => {
                 roomScore ?? 0
               ).toFixed(2)}), noise ${profile.noiseRisk} (${(profile.noiseFloorDb ?? -70).toFixed(
                 1
-              )} dB; adaptive-NR ${adaptiveNoiseReductionLabel}), instability ${(
+              )} dB; adaptive-NR ${adaptiveNoiseReductionLabel}), QC risks (lower is better): instability ${(
                 profile.instabilityScore * 100
               ).toFixed(0)}%, line swing ${(profile.lineSwingScore * 100).toFixed(0)}%, sentence jump ${(
                 profile.sentenceJumpScore * 100
@@ -7221,7 +7450,7 @@ const summarizeFailureReason = (error: unknown) => {
                     : profile.useSpeechAlignedSegmentation
                       ? "speech-aligned"
                       : "off"
-              }, clicks ${(
+              }, click artifacts risk ${(
                 profile.clickScore * 100
               ).toFixed(0)}%, conf ${(
                 fileAnalysis?.analysisConfidence ?? 0
@@ -7286,14 +7515,18 @@ const summarizeFailureReason = (error: unknown) => {
           } else {
           const sourceQcSnapshot = toReviewMetricSnapshot(fileAnalysis);
           const candidateQcSafeDurationSeconds = fileDurationForVariants ?? longFormDurationSeconds;
-          const useLongCandidateMemoryPolicy = candidateQcSafeDurationSeconds >= LONG_CANDIDATE_QC_SAFE_SECONDS;
+          const useBoundedSourceReviewMemory = shouldUseBoundedCandidateQc(
+            candidateQcSafeDurationSeconds,
+            estimateCanonicalMonoFloat32WavBytes(candidateQcSafeDurationSeconds),
+            job.file.size,
+          );
           let sourceDecodedForReview: DecodedMonoAudio | null = null;
           let sourceConsonantReference: RenderedConsonantReference | null = null;
-          if (useLongCandidateMemoryPolicy) {
+          if (useBoundedSourceReviewMemory) {
             appendLog(
-              `[ReviewBundle] ${job.base}: skipped full-file JS review decode for ${candidateQcSafeDurationSeconds.toFixed(
+              `[ReviewBundle] ${job.base}: skipped full-file JS source review decode for ${candidateQcSafeDurationSeconds.toFixed(
                 0,
-              )}s long file to protect memory.`,
+              )}s bounded-memory route.`,
             );
           } else {
             try {
@@ -7386,13 +7619,28 @@ const summarizeFailureReason = (error: unknown) => {
                 plannerContext,
               );
               ffmpeg = renderResult.ffmpeg;
+              if (
+                plannerContext.nativeSourceConsonantReference &&
+                sourceConsonantReference !== plannerContext.nativeSourceConsonantReference
+              ) {
+                sourceConsonantReference = plannerContext.nativeSourceConsonantReference;
+                consonantReferencesByOutputKey.set(job.base, plannerContext.nativeSourceConsonantReference);
+                appendLog(
+                  `[FinalPeakTamer] ${job.base}: upgraded final-delivery reference to native ${plannerContext.nativeSourceConsonantReference.sampleRate / 1000} kHz planner-apply evidence.`,
+                );
+              }
               attemptedCandidates += 1;
               const candidateBytes = await readVirtualFileBytes(ffmpeg, candidateName);
+              const useBoundedCandidateReviewMemory = shouldUseBoundedCandidateQc(
+                candidateQcSafeDurationSeconds,
+                candidateBytes.byteLength,
+                job.file.size,
+              );
 
               let candidateAnalysis: FileAnalysis | null = null;
               let candidateMeta = renderResult.meta;
               let candidateQcUnavailable = false;
-              if (useLongCandidateMemoryPolicy && candidateQcMemoryFailed) {
+              if (useBoundedCandidateReviewMemory && candidateQcMemoryFailed) {
                 candidateQcUnavailable = true;
                 appendLog(
                   `[CandidateQC] ${job.base}/${candidateLabel}: skipped after previous long-file QC memory failure; using render-metadata fallback.`,
@@ -7403,11 +7651,23 @@ const summarizeFailureReason = (error: unknown) => {
                   degradeReasons: Array.from(new Set([...candidateMeta.degradeReasons, "qc-unavailable"])),
                 };
               } else {
+                const candidateAnalysisFfmpeg = ffmpeg;
                 try {
-                  const candidateAnalysisFfmpeg = ffmpeg;
-                  const analysisResult = await analyzeFile(ffmpeg, candidateName, [job.inputName]);
+                  const analysisResult = useBoundedCandidateReviewMemory
+                    ? await analyzeRenderedPcmWindows(
+                        ffmpeg,
+                        candidateBytes,
+                        candidateName,
+                        candidateQcSafeDurationSeconds,
+                        speechRenderPlan?.speechSpans ?? [],
+                        speechRenderPlan?.silenceSpans ?? [],
+                      )
+                    : await analyzeFile(ffmpeg, candidateName, [job.inputName]);
                   ffmpeg = analysisResult.ffmpeg;
                   candidateAnalysis = analysisResult.analysis;
+                  if (!candidateAnalysis) {
+                    throw new Error("bounded candidate QC returned no measured windows");
+                  }
                   const degradeReasons = [...candidateMeta.degradeReasons];
                   if ((candidateAnalysis.analysisWindowRetryCount ?? 0) > 0) {
                     degradeReasons.push("analysis-window-retry");
@@ -7423,13 +7683,11 @@ const summarizeFailureReason = (error: unknown) => {
                     analysisWindowsSucceeded: candidateAnalysis.analysisWindowsSucceeded ?? 0,
                     analysisWindowsDropped: candidateAnalysis.analysisWindowsDropped ?? 0,
                   };
-                  if (ffmpeg !== candidateAnalysisFfmpeg) {
-                    await writeJobInput(ffmpeg, job);
-                  }
+                  if (ffmpeg !== candidateAnalysisFfmpeg) await writeJobInput(ffmpeg, job);
                 } catch (error) {
                   candidateQcUnavailable = true;
                   const shouldRefreshForQcError = shouldResetFfmpegForError(error);
-                  if (useLongCandidateMemoryPolicy && (shouldRefreshForQcError || isRecoverableFailure(error))) {
+                  if (useBoundedCandidateReviewMemory && (shouldRefreshForQcError || isRecoverableFailure(error))) {
                     candidateQcMemoryFailed = true;
                   }
                   appendLog(
@@ -7444,17 +7702,19 @@ const summarizeFailureReason = (error: unknown) => {
                       new Set([...candidateMeta.degradeReasons, "analysis-window-drop", "qc-unavailable"]),
                     ),
                   };
+                  let candidateWorkerChanged = ffmpeg !== candidateAnalysisFfmpeg;
                   if (shouldRefreshForQcError) {
                     ffmpeg = await refreshFfmpeg(`candidate QC on ${job.base}`);
-                    await writeJobInput(ffmpeg, job);
+                    candidateWorkerChanged = true;
                   }
+                  if (candidateWorkerChanged) await writeJobInput(ffmpeg, job);
                 }
               }
 
               const candidateBaselineScore = buildCandidateScore(candidateAnalysis);
               const candidateQcSnapshot = toReviewMetricSnapshot(candidateAnalysis);
               let candidateDecodedForReview: DecodedMonoAudio | null = null;
-              if (!useLongCandidateMemoryPolicy) {
+              if (!useBoundedCandidateReviewMemory) {
                 try {
                   candidateDecodedForReview = decodeWavToMono(candidateBytes);
                 } catch (error) {
@@ -7465,7 +7725,7 @@ const summarizeFailureReason = (error: unknown) => {
                   );
                 }
               }
-              const alignment = useLongCandidateMemoryPolicy
+              const alignment = useBoundedCandidateReviewMemory
                 ? buildDurationOnlyAlignmentMetrics(
                     fileDurationForVariants,
                     estimatePcmF32MonoWavSeconds(candidateBytes.byteLength),
@@ -7537,7 +7797,7 @@ const summarizeFailureReason = (error: unknown) => {
               );
               await safeDeleteFile(ffmpeg, candidateName);
               if (
-                useLongCandidateMemoryPolicy &&
+                useBoundedCandidateReviewMemory &&
                 candidateQcUnavailable &&
                 candidateQcMemoryFailed &&
                 !candidateHasRenderDegrade
@@ -7659,14 +7919,33 @@ const summarizeFailureReason = (error: unknown) => {
           ): Promise<CandidateReviewArtifact> => {
             let renderedAnalysis: FileAnalysis | null = null;
             let renderedMeta = meta;
+            let restoreRenderedBytesAfterQc = false;
+            const analysisFfmpeg = ffmpeg;
+            const useBoundedRenderedReviewMemory = shouldUseBoundedCandidateQc(
+              candidateQcSafeDurationSeconds,
+              bytes.byteLength,
+              job.file.size,
+            );
             try {
-              const analysisFfmpeg = ffmpeg;
-              const analysisResult = await analyzeFile(ffmpeg, renderedName, [job.inputName]);
+              restoreRenderedBytesAfterQc = useBoundedRenderedReviewMemory;
+              const analysisResult = useBoundedRenderedReviewMemory
+                ? await analyzeRenderedPcmWindows(
+                    ffmpeg,
+                    bytes,
+                    renderedName,
+                    candidateQcSafeDurationSeconds,
+                    speechRenderPlan?.speechSpans ?? [],
+                    speechRenderPlan?.silenceSpans ?? [],
+                  )
+                : await analyzeFile(ffmpeg, renderedName, [job.inputName]);
               ffmpeg = analysisResult.ffmpeg;
               renderedAnalysis = analysisResult.analysis;
+              if (!renderedAnalysis) {
+                throw new Error("bounded rendered QC returned no measured windows");
+              }
               if (ffmpeg !== analysisFfmpeg) {
                 await writeJobInput(ffmpeg, job);
-                await ffmpeg.writeFile(renderedName, cloneBytes(bytes));
+                restoreRenderedBytesAfterQc = true;
               }
             } catch (error) {
               appendLog(`[Corrective] ${job.base}/${label}: QC fallback (${describeError(error)}).`);
@@ -7678,6 +7957,13 @@ const summarizeFailureReason = (error: unknown) => {
               if (shouldResetFfmpegForError(error)) {
                 ffmpeg = await refreshFfmpeg(`corrective QC on ${job.base}`);
                 await writeJobInput(ffmpeg, job);
+                restoreRenderedBytesAfterQc = true;
+              } else if (ffmpeg !== analysisFfmpeg) {
+                await writeJobInput(ffmpeg, job);
+                restoreRenderedBytesAfterQc = true;
+              }
+            } finally {
+              if (restoreRenderedBytesAfterQc) {
                 await ffmpeg.writeFile(renderedName, cloneBytes(bytes));
               }
             }
@@ -7685,14 +7971,14 @@ const summarizeFailureReason = (error: unknown) => {
             const baselineScore = buildCandidateScore(renderedAnalysis);
             const qcSnapshot = toReviewMetricSnapshot(renderedAnalysis);
             let renderedDecodedForReview: DecodedMonoAudio | null = null;
-            if (!useLongCandidateMemoryPolicy) {
+            if (!useBoundedRenderedReviewMemory) {
               try {
                 renderedDecodedForReview = decodeWavToMono(bytes);
               } catch (error) {
                 appendLog(`[Corrective] ${job.base}/${label}: alignment fallback (${describeError(error)}).`);
               }
             }
-            const alignment = useLongCandidateMemoryPolicy
+            const alignment = useBoundedRenderedReviewMemory
               ? buildDurationOnlyAlignmentMetrics(fileDurationForVariants, estimatePcmF32MonoWavSeconds(bytes.byteLength))
               : sourceDecodedForReview && renderedDecodedForReview
                 ? estimateAlignmentMetrics(
@@ -7826,12 +8112,14 @@ const summarizeFailureReason = (error: unknown) => {
             const correctiveTriggerSummary = `fail ${postAutoReview.selectedAssessment.failCount}, warn ${
               postAutoReview.selectedAssessment.warnCount
             }, tags ${postAutoReview.issueTags.join(", ") || "none"}, gates ${hardGateReasons.join(", ") || "none"}`;
+            const hasFileScopedCorrectiveEvidence =
+              selectedPostPolishArtifact.baselineScore.measurementStatus === "measured";
             const shouldTryCorrective =
-              candidateQcSafeDurationSeconds < LONG_CANDIDATE_QC_SAFE_SECONDS && correctiveTriggered;
+              correctiveTriggered && hasFileScopedCorrectiveEvidence;
 
-            if (correctiveTriggered && candidateQcSafeDurationSeconds >= LONG_CANDIDATE_QC_SAFE_SECONDS) {
+            if (correctiveTriggered && !hasFileScopedCorrectiveEvidence) {
               appendLog(
-                `[Corrective] ${job.base}: skipped for long-file QC safety (${correctiveTriggerSummary}).`,
+                `[Corrective] ${job.base}: sampled QC remains advisory; original render kept instead of applying a file-wide retry (${correctiveTriggerSummary}).`,
               );
             } else if (shouldTryCorrective && correctiveRenderAttempts >= correctiveRenderBudget) {
               appendLog(

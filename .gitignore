@@ -18,6 +18,7 @@
 /coverage
 /.playwright-mcp/
 /tasks/render-evidence/
+/audio testing/
 __pycache__/
 *.pyc
 

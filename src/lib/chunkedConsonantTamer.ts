@@ -5,6 +5,7 @@ import {
 
 const DEFAULT_CORE_CHUNK_DURATION_SEC = 60;
 const MIN_CONTEXT_DURATION_MS = 500;
+const CHUNK_BOUNDARY_RECONCILIATION_DURATION_MS = 2;
 const DEFAULT_MAX_HEADER_BYTES = 64 * 1024;
 const FLOAT32_BYTES = 4;
 const MIN_WAV_HEADER_BYTES = 44;
@@ -70,6 +71,12 @@ type ReplacementSpan = Readonly<{
   startSample: number;
   endSample: number;
   bytes: Uint8Array;
+}>;
+
+type PendingAcceptedBoundary = Readonly<{
+  originalSamples: Float32Array;
+  tamedSamples: Float32Array;
+  startSample: number;
 }>;
 
 const bytesAsBlobPart = (bytes: Uint8Array): ArrayBuffer => {
@@ -305,6 +312,36 @@ const encodeFloat32LittleEndian = (samples: Float32Array, start: number, end: nu
   return bytes;
 };
 
+const relaxTamedTowardSeamGain = (
+  original: number,
+  tamed: number,
+  seamGain: number,
+  seamWeight: number,
+) => {
+  if (seamWeight <= 0 || Math.abs(original) <= 1e-8) return tamed;
+  const existingGain = Math.max(0, Math.min(1, Math.abs(tamed / original)));
+  const targetGain = Math.max(existingGain, Math.min(1, seamGain));
+  if (targetGain <= existingGain) return tamed;
+  const phase = Math.min(1, seamWeight);
+  const weight = 0.5 - 0.5 * Math.cos(Math.PI * phase);
+  return original * (existingGain + (targetGain - existingGain) * weight);
+};
+
+const resolveBoundaryProcessingGain = (
+  originalSamples: Float32Array,
+  tamedSamples: Float32Array,
+  fromEnd: boolean,
+) => {
+  for (let offset = 0; offset < originalSamples.length; offset += 1) {
+    const index = fromEnd ? originalSamples.length - 1 - offset : offset;
+    const original = originalSamples[index] ?? 0;
+    if (Math.abs(original) <= 1e-6) continue;
+    const tamed = tamedSamples[index] ?? original;
+    return Math.max(0, Math.min(1, Math.abs(tamed / original)));
+  }
+  return 1;
+};
+
 const median = (values: readonly number[]) => {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((left, right) => left - right);
@@ -419,10 +456,89 @@ export const tameCanonicalMonoFloat32WavBlobInChunks = async (
   let maxReductionDb = 0;
   let maxReadBytes = Math.min(wavBlob.size, validatedOptions.maxHeaderBytes);
   let lastChangedGlobalFrame = -1;
+  let lastChangedSpanEndSample = -1;
+  let previousReferenceUsed: boolean | null = null;
+  let pendingAcceptedBoundary: PendingAcceptedBoundary | null = null;
   const frameStartSample = (frame: number) => Math.min(
     wav.sampleCount,
     Math.round(frame * samplesPerFrame),
   );
+  const appendChangedSampleRange = (
+    originalSamples: Float32Array,
+    outputSamples: Float32Array,
+    startIndex: number,
+    endIndex: number,
+    globalSampleOffset: number,
+  ) => {
+    let localIndex = startIndex;
+    while (localIndex < endIndex) {
+      if (Object.is(originalSamples[localIndex], outputSamples[localIndex])) {
+        localIndex += 1;
+        continue;
+      }
+      const spanStart = localIndex;
+      while (
+        localIndex < endIndex &&
+        !Object.is(originalSamples[localIndex], outputSamples[localIndex])
+      ) {
+        const before = Math.abs(originalSamples[localIndex]);
+        const after = Math.abs(outputSamples[localIndex]);
+        if (before > 0 && after > 0 && after < before) {
+          maxReductionDb = Math.max(maxReductionDb, 20 * Math.log10(before / after));
+        }
+        const globalSample = globalSampleOffset + localIndex;
+        const globalFrame = Math.max(
+          0,
+          Math.min(
+            expectedFrameCount - 1,
+            Math.ceil((globalSample + 0.5) / samplesPerFrame) - 1,
+          ),
+        );
+        if (globalFrame !== lastChangedGlobalFrame) {
+          changedFrameCount += 1;
+          lastChangedGlobalFrame = globalFrame;
+        }
+        localIndex += 1;
+      }
+      const globalStartSample = globalSampleOffset + spanStart;
+      const globalEndSample = globalSampleOffset + localIndex;
+      replacements.push({
+        startSample: globalStartSample,
+        endSample: globalEndSample,
+        bytes: encodeFloat32LittleEndian(outputSamples, spanStart, localIndex),
+      });
+      changedSampleCount += globalEndSample - globalStartSample;
+      if (globalStartSample !== lastChangedSpanEndSample) changedSpanCount += 1;
+      lastChangedSpanEndSample = globalEndSample;
+    }
+  };
+  const appendPendingAcceptedBoundary = (
+    boundary: PendingAcceptedBoundary,
+    seamGain: number | null,
+  ) => {
+    let outputSamples = boundary.tamedSamples;
+    if (seamGain !== null) {
+      outputSamples = new Float32Array(boundary.tamedSamples.length);
+      for (let index = 0; index < outputSamples.length; index += 1) {
+        const seamWeight = outputSamples.length === 1
+          ? 1
+          : index / (outputSamples.length - 1);
+        outputSamples[index] = relaxTamedTowardSeamGain(
+          boundary.originalSamples[index],
+          boundary.tamedSamples[index],
+          seamGain,
+          seamWeight,
+        );
+      }
+    }
+    appendChangedSampleRange(
+      boundary.originalSamples,
+      outputSamples,
+      0,
+      outputSamples.length,
+      boundary.startSample,
+    );
+  };
 
   for (let coreStartFrame = 0; coreStartFrame < expectedFrameCount; coreStartFrame += coreFrameCount) {
     const coreEndFrame = Math.min(expectedFrameCount, coreStartFrame + coreFrameCount);
@@ -461,7 +577,12 @@ export const tameCanonicalMonoFloat32WavBlobInChunks = async (
       : 0;
     referenceConfidenceValues.push(referenceConfidence);
     if (!referenceUsed) {
+      if (pendingAcceptedBoundary) {
+        appendPendingAcceptedBoundary(pendingAcceptedBoundary, 1);
+        pendingAcceptedBoundary = null;
+      }
       referenceRejectedChunkCount += 1;
+      previousReferenceUsed = false;
       continue;
     }
     referenceUsedChunkCount += 1;
@@ -469,46 +590,101 @@ export const tameCanonicalMonoFloat32WavBlobInChunks = async (
 
     const localCoreStart = coreStartSample - readStartSample;
     const localCoreEnd = coreEndSample - readStartSample;
-    let localIndex = localCoreStart;
-    while (localIndex < localCoreEnd) {
-      if (Object.is(samples[localIndex], tamed.samples[localIndex])) {
-        localIndex += 1;
-        continue;
-      }
-      const spanStart = localIndex;
-      while (
-        localIndex < localCoreEnd &&
-        !Object.is(samples[localIndex], tamed.samples[localIndex])
-      ) {
-        const before = Math.abs(samples[localIndex]);
-        const after = Math.abs(tamed.samples[localIndex]);
-        if (before > 0 && after > 0 && after < before) {
-          maxReductionDb = Math.max(maxReductionDb, 20 * Math.log10(before / after));
-        }
-        const globalSample = readStartSample + localIndex;
-        const globalFrame = Math.max(
-          0,
-          Math.min(
-            expectedFrameCount - 1,
-            Math.ceil((globalSample + 0.5) / samplesPerFrame) - 1,
-          ),
-        );
-        if (globalFrame !== lastChangedGlobalFrame) {
-          changedFrameCount += 1;
-          lastChangedGlobalFrame = globalFrame;
-        }
-        localIndex += 1;
-      }
-      const globalStartSample = readStartSample + spanStart;
-      const globalEndSample = readStartSample + localIndex;
-      replacements.push({
-        startSample: globalStartSample,
-        endSample: globalEndSample,
-        bytes: encodeFloat32LittleEndian(tamed.samples, spanStart, localIndex),
-      });
-      changedSampleCount += globalEndSample - globalStartSample;
-      changedSpanCount += 1;
+    const coreSampleCount = localCoreEnd - localCoreStart;
+    const taperSampleCount = Math.min(
+      coreSampleCount,
+      Math.max(
+        1,
+        Math.round((wav.sampleRate * CHUNK_BOUNDARY_RECONCILIATION_DURATION_MS) / 1000),
+      ),
+    );
+    const pendingStart = localCoreEnd - taperSampleCount;
+    const startTaperEnd = Math.min(localCoreStart + taperSampleCount, localCoreEnd);
+    const originalStartBoundarySamples = samples.slice(localCoreStart, startTaperEnd);
+    const tamedStartBoundarySamples = tamed.samples.slice(localCoreStart, startTaperEnd);
+    let startSeamGain = previousReferenceUsed === false ? 1 : null;
+    if (pendingAcceptedBoundary) {
+      const previousEdgeGain = resolveBoundaryProcessingGain(
+        pendingAcceptedBoundary.originalSamples,
+        pendingAcceptedBoundary.tamedSamples,
+        true,
+      );
+      const currentEdgeGain = resolveBoundaryProcessingGain(
+        originalStartBoundarySamples,
+        tamedStartBoundarySamples,
+        false,
+      );
+      const gainsDiverge = Math.abs(previousEdgeGain - currentEdgeGain) > 1e-6;
+      // Meet at the less-attenuated decision. Reconciliation can only relax
+      // an authorized dip; it never manufactures extra processing at a seam.
+      const commonSeamGain = gainsDiverge
+        ? Math.max(previousEdgeGain, currentEdgeGain)
+        : null;
+      appendPendingAcceptedBoundary(pendingAcceptedBoundary, commonSeamGain);
+      pendingAcceptedBoundary = null;
+      startSeamGain = commonSeamGain;
     }
+    let immediateStart = localCoreStart;
+    if (startSeamGain !== null && immediateStart < pendingStart) {
+      const immediateTaperEnd = Math.min(startTaperEnd, pendingStart);
+      const originalStartWindow = samples.slice(localCoreStart, immediateTaperEnd);
+      const tamedStartWindow = tamed.samples.slice(localCoreStart, immediateTaperEnd);
+      for (let index = 0; index < tamedStartWindow.length; index += 1) {
+        const seamWeight = taperSampleCount === 1
+          ? 1
+          : 1 - index / (taperSampleCount - 1);
+        tamedStartWindow[index] = relaxTamedTowardSeamGain(
+          originalStartWindow[index],
+          tamedStartWindow[index],
+          startSeamGain,
+          seamWeight,
+        );
+      }
+      appendChangedSampleRange(
+        originalStartWindow,
+        tamedStartWindow,
+        0,
+        tamedStartWindow.length,
+        coreStartSample,
+      );
+      immediateStart = immediateTaperEnd;
+    }
+    appendChangedSampleRange(
+      samples,
+      tamed.samples,
+      immediateStart,
+      pendingStart,
+      readStartSample,
+    );
+
+    // The next core's actual edge gain is needed to reconcile independent
+    // alignment decisions. Retain only 2 ms instead of the padded core.
+    const originalBoundarySamples = samples.slice(pendingStart, localCoreEnd);
+    const tamedBoundarySamples = tamed.samples.slice(pendingStart, localCoreEnd);
+    if (startSeamGain !== null) {
+      for (let index = 0; index < tamedBoundarySamples.length; index += 1) {
+        const coreOffset = pendingStart + index - localCoreStart;
+        if (coreOffset >= taperSampleCount) break;
+        const seamWeight = taperSampleCount === 1
+          ? 1
+          : 1 - coreOffset / (taperSampleCount - 1);
+        tamedBoundarySamples[index] = relaxTamedTowardSeamGain(
+          originalBoundarySamples[index],
+          tamedBoundarySamples[index],
+          startSeamGain,
+          seamWeight,
+        );
+      }
+    }
+    pendingAcceptedBoundary = {
+      originalSamples: originalBoundarySamples,
+      tamedSamples: tamedBoundarySamples,
+      startSample: readStartSample + pendingStart,
+    };
+    previousReferenceUsed = true;
+  }
+  if (pendingAcceptedBoundary) {
+    appendPendingAcceptedBoundary(pendingAcceptedBoundary, null);
   }
 
   const stats: ChunkedConsonantTamerStats = {

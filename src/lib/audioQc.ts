@@ -1,5 +1,7 @@
 "use client";
 
+import { countAdaptiveSampleClickDiscontinuities } from "./sampleClickDetector.ts";
+
 export const AUDIO_QC_FRAME_MS = 10;
 const AUDIO_QC_FLOOR_DB = -120;
 const COLD_OPEN_HEAD_MS = 2500;
@@ -126,6 +128,21 @@ const smoothSeries = (values: number[], radius = 1) =>
     }
     return sum / Math.max(end - start + 1, 1);
   });
+
+const neighborMean = (values: number[], index: number, radius: number) => {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(values.length - 1, index + radius);
+  let sum = 0;
+  let count = 0;
+
+  for (let cursor = start; cursor <= end; cursor += 1) {
+    if (cursor === index) continue;
+    sum += values[cursor] ?? 0;
+    count += 1;
+  }
+
+  return count > 0 ? sum / count : values[index] ?? 0;
+};
 
 const finalizeMaskRuns = (
   mask: boolean[],
@@ -658,16 +675,27 @@ export const analyzeFrameAudio = (
   let nonSpeechFrames = 0;
   let speechClickFrames = 0;
   let pauseClickFrames = 0;
+  const peakFrameDb = framePeak.map((peak) => toDb(peak + 1e-12));
+  const clickContrastRadius = Math.max(2, Math.round(60 / Math.max(frameMs, 1)));
 
   const speechContextFrames = Math.round(0.35 / (frameMs / 1000));
   for (let frame = 0; frame < frameCount; frame += 1) {
     const crestDb = toDb((framePeak[frame] + 1e-9) / (frameRms[frame] + 1e-9));
-    const peakFrameDb = toDb(framePeak[frame] + 1e-12);
+    const currentPeakFrameDb = peakFrameDb[frame] ?? AUDIO_QC_FLOOR_DB;
+    const sharpnessContrastDb =
+      frameSharpness[frame] - neighborMean(frameSharpness, frame, clickContrastRadius);
+    const peakContrastDb = currentPeakFrameDb - neighborMean(peakFrameDb, frame, clickContrastRadius);
     if (speechMask[frame]) {
       activeSpeechFrames += 1;
       speechDb.push(frameDb[frame]);
       speechCrest.push(crestDb);
-      if ((crestDb > 24 && peakFrameDb > -8) || (frameSharpness[frame] > -24 && peakFrameDb > -16)) {
+      if (
+        (crestDb > 24 && currentPeakFrameDb > -8 && peakContrastDb > 7 && sharpnessContrastDb > 4) ||
+        (frameSharpness[frame] > -24 &&
+          currentPeakFrameDb > -16 &&
+          sharpnessContrastDb > 8 &&
+          peakContrastDb > 4)
+      ) {
         speechClickFrames += 1;
       }
       continue;
@@ -675,7 +703,13 @@ export const analyzeFrameAudio = (
 
     nonSpeechFrames += 1;
     pauseDb.push(frameDb[frame]);
-    if ((crestDb > 18 && peakFrameDb > -24) || (frameSharpness[frame] > -28 && peakFrameDb > -30)) {
+    if (
+      (crestDb > 18 && currentPeakFrameDb > -24 && peakContrastDb > 6 && sharpnessContrastDb > 4) ||
+      (frameSharpness[frame] > -28 &&
+        currentPeakFrameDb > -30 &&
+        sharpnessContrastDb > 8 &&
+        peakContrastDb > 3)
+    ) {
       pauseClickFrames += 1;
     }
 
@@ -686,7 +720,7 @@ export const analyzeFrameAudio = (
         nearSpeechNoiseDb.push(frameDb[frame]);
         nearSpeechPauseFrames.push({
           db: frameDb[frame],
-          peakDb: peakFrameDb,
+          peakDb: currentPeakFrameDb,
           crestDb,
           sharpnessDb: frameSharpness[frame],
         });
@@ -1037,9 +1071,6 @@ export const analyzeFloatSamples = (
 
   let globalPeak = 0;
   let clipCount = 0;
-  let sampleSpikeCount = 0;
-  const refractorySamples = Math.max(1, Math.round(sampleRate * 0.004));
-  let lastSpikeIndex = -refractorySamples;
 
   for (let frame = 0; frame < frameCount; frame += 1) {
     const start = frame * frameSize;
@@ -1066,16 +1097,13 @@ export const analyzeFloatSamples = (
     frameSharpness[frame] = toDb(Math.sqrt(sharpEnergy / frameSize) + 1e-12);
   }
 
-  for (let index = 1; index < samples.length; index += 1) {
-    const current = samples[index] ?? 0;
-    const previous = samples[index - 1] ?? 0;
-    const diff = Math.abs(current - previous);
-    if (diff < 0.09) continue;
-    if (Math.abs(current) < 0.015) continue;
-    if (index - lastSpikeIndex < refractorySamples) continue;
-    sampleSpikeCount += 1;
-    lastSpikeIndex = index;
-  }
+  const { count: sampleSpikeCount } = countAdaptiveSampleClickDiscontinuities({
+    samples,
+    sampleRate,
+    frameSize,
+    frameRms,
+    frameSharpness,
+  });
 
   return analyzeFrameAudio(frameRms, framePeak, frameDb, frameSharpness, {
     sampleRate,

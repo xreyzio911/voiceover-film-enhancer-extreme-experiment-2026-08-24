@@ -189,6 +189,128 @@ const synthesizeFractionalBoundaryLaneTake = (
   return { samples, sampleRate };
 };
 
+const synthesizeBoundaryVerdictDivergenceTake = (
+  eventPeakDb: number,
+  acceptedSide: "before" | "after" = "before",
+) => {
+  const sampleRate = 16_000;
+  const durationSec = acceptedSide === "before" ? 61 : 62;
+  const boundarySec = 60;
+  const samples = new Float32Array(sampleRate * durationSec);
+  for (let index = 0; index < samples.length; index += 1) {
+    samples[index] = dbToLin(-20.2)
+      * Math.sin((2 * Math.PI * 220 * index) / sampleRate)
+      * Math.SQRT2;
+  }
+
+  const uniqueCentersSec = acceptedSide === "before"
+    ? [
+        1.013, 2.731, 4.927, 7.441, 10.357,
+        13.889, 17.123, 20.741, 24.389, 27.911,
+        31.667, 35.291, 39.113, 42.781, 46.627,
+        50.219, 53.843, 56.497, 58.091, 59.101,
+      ]
+    : [
+        60.713, 60.761, 60.827, 60.899, 60.947,
+        61.019, 61.087, 61.151, 61.217, 61.289,
+        61.337, 61.411, 61.477, 61.549, 61.613,
+        61.681, 61.747, 61.819, 61.883, 61.947,
+      ];
+  const periodicStartMs = acceptedSide === "before" ? 59_520 : 59_460;
+  const periodicCenterCount = acceptedSide === "before" ? 50 : 35;
+  const periodicCentersSec = Array.from(
+    { length: periodicCenterCount },
+    (_unused, index) => (periodicStartMs + index * 30) / 1000,
+  );
+  const eventRadiusSamples = Math.max(1, Math.round(sampleRate * 0.0008));
+  const targetPeak = dbToLin(eventPeakDb);
+  for (const centerSec of [...uniqueCentersSec, ...periodicCentersSec]) {
+    const centerSample = Math.round(centerSec * sampleRate);
+    const start = Math.max(0, centerSample - eventRadiusSamples);
+    const end = Math.min(samples.length, centerSample + eventRadiusSamples + 1);
+    const burst = new Float32Array(end - start);
+    let burstPeak = 0;
+    for (let index = start; index < end; index += 1) {
+      const normalizedOffset = (index - centerSample) / eventRadiusSamples;
+      const envelope = Math.cos((normalizedOffset * Math.PI) / 2) ** 2;
+      const value = Math.sin(
+        (2 * Math.PI * 6000 * index) / sampleRate + 0.41,
+      ) * envelope;
+      burst[index - start] = value;
+      burstPeak = Math.max(burstPeak, Math.abs(value));
+    }
+    const scale = targetPeak / Math.max(1e-9, burstPeak);
+    for (let index = start; index < end; index += 1) {
+      samples[index] = (burst[index - start] ?? 0) * scale;
+    }
+  }
+
+  return {
+    samples,
+    sampleRate,
+    boundarySample: boundarySec * sampleRate,
+  };
+};
+
+const synthesizeAcceptedBoundaryLagDivergenceTake = (
+  eventPeakDb: number,
+  rendered: boolean,
+) => {
+  const sampleRate = 16_000;
+  const durationSec = 62;
+  const boundarySample = 60 * sampleRate;
+  const samples = new Float32Array(sampleRate * durationSec);
+  for (let index = 0; index < samples.length; index += 1) {
+    samples[index] = dbToLin(-20.2)
+      * Math.sin((2 * Math.PI * 220 * index) / sampleRate)
+      * Math.SQRT2;
+  }
+
+  const firstSourceCentersSec = [
+    1.013, 2.731, 4.927, 7.441, 10.357,
+    13.889, 17.123, 20.741, 24.389, 27.911,
+    31.667, 35.291, 39.113, 42.781, 46.627,
+    50.219, 53.843, 56.497, 58.091,
+  ];
+  const secondSourceCentersSec = [
+    60.713, 60.761, 60.827, 60.899, 60.947,
+    61.019, 61.087, 61.151, 61.217, 61.289,
+    61.337, 61.411, 61.477, 61.549, 61.613,
+    61.681, 61.747, 61.819, 61.883, 61.947,
+  ];
+  const centersSec = rendered
+    ? [
+        ...firstSourceCentersSec.map((center) => center + 0.01),
+        60,
+        ...secondSourceCentersSec.map((center) => center + 0.04),
+      ]
+    : [...firstSourceCentersSec, 59.99, ...secondSourceCentersSec];
+  const eventRadiusSamples = Math.max(1, Math.round(sampleRate * 0.0008));
+  const targetPeak = dbToLin(eventPeakDb);
+  for (const centerSec of centersSec) {
+    const centerSample = Math.round(centerSec * sampleRate);
+    const start = Math.max(0, centerSample - eventRadiusSamples);
+    const end = Math.min(samples.length, centerSample + eventRadiusSamples + 1);
+    const burst = new Float32Array(end - start);
+    let burstPeak = 0;
+    for (let index = start; index < end; index += 1) {
+      const normalizedOffset = (index - centerSample) / eventRadiusSamples;
+      const envelope = Math.cos((normalizedOffset * Math.PI) / 2) ** 2;
+      const value = Math.sin(
+        (2 * Math.PI * 6000 * index) / sampleRate + 0.41,
+      ) * envelope;
+      burst[index - start] = value;
+      burstPeak = Math.max(burstPeak, Math.abs(value));
+    }
+    const scale = targetPeak / Math.max(1e-9, burstPeak);
+    for (let index = start; index < end; index += 1) {
+      samples[index] = (burst[index - start] ?? 0) * scale;
+    }
+  }
+
+  return { samples, sampleRate, boundarySample };
+};
+
 const maxSampleReductionDb = (
   before: Float32Array,
   after: Float32Array,
@@ -423,6 +545,173 @@ describe("chunked mono float WAV consonant tamer", () => {
         );
       }
     }
+  });
+
+  it("smoothly returns an accepted chunk to the original at a rejected-chunk boundary", async () => {
+    const source = synthesizeBoundaryVerdictDivergenceTake(-10.4);
+    const rendered = synthesizeBoundaryVerdictDivergenceTake(-3.9);
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+    const input = makeCanonicalBlob(rendered.samples, rendered.sampleRate);
+
+    const result = await tameCanonicalMonoFloat32WavBlobInChunks(input, reference);
+    const decoded = decodeWav(await result.blob.arrayBuffer());
+    const finalAcceptedSample = source.boundarySample - 1;
+    const finalAcceptedReductionDb = 20 * Math.log10(
+      Math.abs(rendered.samples[finalAcceptedSample] ?? 0)
+        / Math.max(Math.abs(decoded.samples[finalAcceptedSample] ?? 0), 1e-12),
+    );
+    let retainedTaperReductionDb = 0;
+    let maximumAdjacentReductionStepDb = 0;
+    let previousReductionDb: number | null = null;
+    const taperWindowSamples = Math.round(source.sampleRate * 0.002);
+    for (
+      let index = source.boundarySample - taperWindowSamples;
+      index <= source.boundarySample;
+      index += 1
+    ) {
+      const before = Math.abs(rendered.samples[index] ?? 0);
+      const after = Math.abs(decoded.samples[index] ?? 0);
+      if (before <= 1e-6 || after <= 1e-12) continue;
+      const reductionDb = 20 * Math.log10(before / after);
+      retainedTaperReductionDb = Math.max(retainedTaperReductionDb, reductionDb);
+      if (previousReductionDb !== null) {
+        maximumAdjacentReductionStepDb = Math.max(
+          maximumAdjacentReductionStepDb,
+          Math.abs(reductionDb - previousReductionDb),
+        );
+      }
+      previousReductionDb = reductionDb;
+    }
+
+    assert.equal(result.stats.processedChunkCount, 2);
+    assert.equal(result.stats.referenceUsedChunkCount, 1);
+    assert.equal(result.stats.referenceRejectedChunkCount, 1);
+    assert.ok(
+      retainedTaperReductionDb >= 0.2,
+      "the accepted chunk should retain a short, non-destructive attenuation taper",
+    );
+    assert.ok(
+      maximumAdjacentReductionStepDb <= 0.15,
+      `boundary attenuation must change smoothly, got a ${maximumAdjacentReductionStepDb.toFixed(3)} dB sample step`,
+    );
+    assert.ok(
+      finalAcceptedReductionDb <= 0.001,
+      `accepted-side attenuation must reach zero at the seam, got ${finalAcceptedReductionDb.toFixed(3)} dB`,
+    );
+    assert.deepEqual(
+      decoded.samples.slice(source.boundarySample),
+      rendered.samples.slice(source.boundarySample),
+      "the rejected chunk must remain sample-identical to the input",
+    );
+    assert.ok(result.stats.maxReductionDb <= 1.251);
+    assert.equal(decoded.samples.length, rendered.samples.length);
+    assert.equal(result.blob.size, input.size);
+  });
+
+  it("smoothly leaves the original for an accepted chunk after a rejected chunk", async () => {
+    const source = synthesizeBoundaryVerdictDivergenceTake(-10.4, "after");
+    const rendered = synthesizeBoundaryVerdictDivergenceTake(-3.9, "after");
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+    const input = makeCanonicalBlob(rendered.samples, rendered.sampleRate);
+
+    const result = await tameCanonicalMonoFloat32WavBlobInChunks(input, reference);
+    const decoded = decodeWav(await result.blob.arrayBuffer());
+    const firstAcceptedReductionDb = 20 * Math.log10(
+      Math.abs(rendered.samples[source.boundarySample] ?? 0)
+        / Math.max(Math.abs(decoded.samples[source.boundarySample] ?? 0), 1e-12),
+    );
+    let retainedTaperReductionDb = 0;
+    let maximumAdjacentReductionStepDb = 0;
+    let previousReductionDb: number | null = null;
+    const taperWindowSamples = Math.round(source.sampleRate * 0.002);
+    for (
+      let index = source.boundarySample - 1;
+      index <= source.boundarySample + taperWindowSamples;
+      index += 1
+    ) {
+      const before = Math.abs(rendered.samples[index] ?? 0);
+      const after = Math.abs(decoded.samples[index] ?? 0);
+      if (before <= 1e-6 || after <= 1e-12) continue;
+      const reductionDb = 20 * Math.log10(before / after);
+      retainedTaperReductionDb = Math.max(retainedTaperReductionDb, reductionDb);
+      if (previousReductionDb !== null) {
+        maximumAdjacentReductionStepDb = Math.max(
+          maximumAdjacentReductionStepDb,
+          Math.abs(reductionDb - previousReductionDb),
+        );
+      }
+      previousReductionDb = reductionDb;
+    }
+
+    assert.equal(result.stats.processedChunkCount, 2);
+    assert.equal(result.stats.referenceUsedChunkCount, 1);
+    assert.equal(result.stats.referenceRejectedChunkCount, 1);
+    assert.deepEqual(
+      decoded.samples.slice(0, source.boundarySample),
+      rendered.samples.slice(0, source.boundarySample),
+      "the preceding rejected chunk must remain sample-identical to the input",
+    );
+    assert.ok(
+      firstAcceptedReductionDb <= 0.001,
+      `accepted-side attenuation must start at zero, got ${firstAcceptedReductionDb.toFixed(3)} dB`,
+    );
+    assert.ok(
+      retainedTaperReductionDb >= 0.2,
+      "the accepted chunk should ease into its authorized attenuation",
+    );
+    assert.ok(
+      maximumAdjacentReductionStepDb <= 0.15,
+      `boundary attenuation must change smoothly, got a ${maximumAdjacentReductionStepDb.toFixed(3)} dB sample step`,
+    );
+    assert.ok(result.stats.maxReductionDb <= 1.251);
+    assert.equal(decoded.samples.length, rendered.samples.length);
+    assert.equal(result.blob.size, input.size);
+  });
+
+  it("reconciles differing accepted-chunk lags without a one-sample attenuation seam", async () => {
+    const source = synthesizeAcceptedBoundaryLagDivergenceTake(-10.4, false);
+    const rendered = synthesizeAcceptedBoundaryLagDivergenceTake(-3.9, true);
+    const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
+    assert.ok(reference);
+    const input = makeCanonicalBlob(rendered.samples, rendered.sampleRate);
+
+    const result = await tameCanonicalMonoFloat32WavBlobInChunks(input, reference);
+    const decoded = decodeWav(await result.blob.arrayBuffer());
+    const taperWindowSamples = Math.round(source.sampleRate * 0.002);
+    let previousReductionDb: number | null = null;
+    let maximumAdjacentReductionStepDb = 0;
+    for (
+      let index = source.boundarySample - taperWindowSamples;
+      index <= source.boundarySample + taperWindowSamples;
+      index += 1
+    ) {
+      const before = Math.abs(rendered.samples[index] ?? 0);
+      const after = Math.abs(decoded.samples[index] ?? 0);
+      assert.ok(after <= before + 1e-7, "seam reconciliation must never amplify above the render");
+      if (before <= 1e-6 || after <= 1e-12) continue;
+      const reductionDb = 20 * Math.log10(before / after);
+      if (previousReductionDb !== null) {
+        maximumAdjacentReductionStepDb = Math.max(
+          maximumAdjacentReductionStepDb,
+          Math.abs(reductionDb - previousReductionDb),
+        );
+      }
+      previousReductionDb = reductionDb;
+    }
+
+    assert.equal(result.stats.processedChunkCount, 2);
+    assert.equal(result.stats.referenceUsedChunkCount, 2);
+    assert.equal(result.stats.referenceRejectedChunkCount, 0);
+    assert.ok(result.stats.referenceLagMs >= 20 && result.stats.referenceLagMs <= 30);
+    assert.ok(
+      maximumAdjacentReductionStepDb <= 0.15,
+      `accepted-chunk attenuation must remain smooth, got a ${maximumAdjacentReductionStepDb.toFixed(3)} dB sample step`,
+    );
+    assert.ok(result.stats.maxReductionDb <= 1.251);
+    assert.equal(decoded.samples.length, rendered.samples.length);
+    assert.equal(result.blob.size, input.size);
   });
 
   it("accepts FFmpeg extensible float WAV and preserves its exact prefix and legal suffix", async () => {

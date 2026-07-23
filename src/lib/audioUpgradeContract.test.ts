@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const voLevelerSource = readFileSync(new URL("../components/VoLeveler.tsx", import.meta.url), "utf8");
+const qcReportLabSource = readFileSync(
+  new URL("../components/QcReportLab.tsx", import.meta.url),
+  "utf8",
+);
 const chunkedConsonantTamerSource = readFileSync(
   new URL("./chunkedConsonantTamer.ts", import.meta.url),
   "utf8",
@@ -27,6 +31,38 @@ const assertMarkersInOrder = (source: string, markers: string[]) => {
     cursor = index + marker.length;
   }
 };
+
+test("adaptive diagnostics identify percentage scores as lower-is-better risks", () => {
+  assert.match(voLevelerSource, /QC risks \(lower is better\): instability/);
+  assert.match(voLevelerSource, /click artifacts risk/);
+});
+
+test("QC Lab explains risk direction instead of showing ambiguous percentage scores", () => {
+  assert.match(qcReportLabSource, /Percentages are risk scores — lower is better\./);
+  assert.match(qcReportLabSource, />Instability risk</);
+  assert.match(qcReportLabSource, />Click artifacts risk</);
+  assert.match(qcReportLabSource, />Echo risk</);
+});
+
+test("QC Lab large-WAV path uses the shared adaptive click detector", () => {
+  const streamingQcBlock = textBetween(
+    qcReportLabSource,
+    "const analyzePcmWavStreaming = async",
+    "const createEmptyReviewDraft =",
+  );
+
+  assertMarkersInOrder(streamingQcBlock, [
+    "const analyzedFrames =",
+    "countAdaptiveSampleClickDiscontinuitiesBounded({",
+    "loadSamples: async (startSample, endSample)",
+    "clickDetection.count,",
+  ]);
+  assert.doesNotMatch(
+    streamingQcBlock,
+    /diff\s*>=\s*0\.09[\s\S]{0,80}abs\s*>=\s*0\.015/,
+    "large WAVs must not fall back to the obsolete fixed-difference click rule",
+  );
+});
 
 test("final app polish uses the isolated linear filter instead of rerunning the mix chain", () => {
   const finalPolishBlock = sourceBetween(
@@ -59,6 +95,32 @@ test("speech-only spectrum drives tone, tilts, and de-essing without changing th
   assert.match(adaptiveProfileBlock, /bandSpectrumDb: deEsserSpectrumDb/);
 });
 
+test("distributed speech spectra recompute de-esser depth from the aggregated evidence", () => {
+  const aggregationBlock = sourceBetween(
+    "const aggregateWindowAnalyses = (",
+    "type AnalysisOptions =",
+  );
+
+  assertMarkersInOrder(aggregationBlock, [
+    "const speechBandMedians =",
+    "aggregated.speechBandSpectrumDb = speechBandMedians",
+    "aggregated.sibilanceScore = computeSibilanceScore(speechBandMedians)",
+  ]);
+});
+
+test("de-esser depth follows a continuous evidence curve without the legacy engagement gate", () => {
+  const mixFilterBlock = sourceBetween(
+    "const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions)",
+    "const runMixReady = async",
+  );
+
+  assert.match(mixFilterBlock, /resolveDeEsserCutsDb\(sibilanceScore\)/);
+  assert.match(mixFilterBlock, /mainCutDb\.toFixed\(2\)/);
+  assert.match(mixFilterBlock, /secondaryCutDb\.toFixed\(2\)/);
+  assert.doesNotMatch(mixFilterBlock, /sibilanceScore\s*>=\s*0\.4/);
+  assert.doesNotMatch(mixFilterBlock, /1\.2 \+ depthNorm/);
+});
+
 test("audibility recovery aligns measured DSP latency before judging speech loss", () => {
   const guardBlock = sourceBetween(
     "const assertRenderedAudibility = async",
@@ -80,7 +142,7 @@ test("audibility recovery aligns measured DSP latency before judging speech loss
   );
 });
 
-test("normal output variants keep their source key for the one final source-relative sweep", () => {
+test("normal output variants upgrade planner evidence to a native-rate source reference", () => {
   const plannedGainBlock = sourceBetween(
     "type PlannedGain = {",
     "const planGainForInput = async",
@@ -110,12 +172,12 @@ test("normal output variants keep their source key for the one final source-rela
   assert.match(
     processFilesBlock,
     /if \(!sourceConsonantReference && plannerContext\.plan\?\.sourceConsonantReference\)[\s\S]*?consonantReferencesByOutputKey\.set\(job\.base, plannerContext\.plan\.sourceConsonantReference\)/,
-    "20-80 minute files must reuse the compact 16 kHz planner reference when full-rate review decode is skipped",
+    "the compact planner reference remains a fail-open fallback until native planner-apply evidence exists",
   );
-  assert.equal(
-    voLevelerSource.match(/RENDERED_CONSONANT_SOURCE_FRAME_MS/g)?.length ?? 0,
-    4,
-    "all three production source-reference builders must use the 2 ms event-local evidence resolution",
+  assert.match(
+    processFilesBlock,
+    /plannerContext\.nativeSourceConsonantReference[\s\S]*?consonantReferencesByOutputKey\.set\(job\.base, plannerContext\.nativeSourceConsonantReference\)/,
+    "native 48 kHz evidence collected during planner apply must replace the 16 kHz fallback",
   );
   assert.doesNotMatch(
     voLevelerSource,
@@ -125,6 +187,49 @@ test("normal output variants keep their source key for the one final source-rela
   assert.ok(
     (processFilesBlock.match(/sourceBase: job\.base/g)?.length ?? 0) >= 4,
     "clean, blend, and loudness outputs must retain the source lookup key",
+  );
+});
+
+test("final consonant residual fails open when fallback evidence lacks delivery bandwidth", () => {
+  const finalResidualBlock = sourceBetween(
+    "const applyFinalConsonantResidualToOutputs = async",
+    "const buildFinalReviewBundles = async",
+  );
+
+  assertMarkersInOrder(finalResidualBlock, [
+    "if (!sourceReference)",
+    "isConsonantReferenceBandwidthCompatible(",
+    "sourceReference.sampleRate",
+    "PLANNER_APPLY_SAMPLE_RATE",
+    "tameCanonicalMonoFloat32WavBlobInChunks(",
+  ]);
+  assert.match(finalResidualBlock, /reference bandwidth[\s\S]*original bytes kept/);
+});
+
+test("planner apply accumulates native reference frames while excluding duplicated crossfade tails", () => {
+  const levelInputRangeBlock = sourceBetween(
+    "const levelInputRange = async",
+    "const applyPlannerToFullInput = async",
+  );
+  const plannerApplyBlock = sourceBetween(
+    "const applyPlannerToFullInput = async",
+    "const emptyEnvelopeMetrics =",
+  );
+
+  assert.match(levelInputRangeBlock, /sourceStartSample/);
+  assert.match(levelInputRangeBlock, /uniqueEndSample/);
+  assert.match(levelInputRangeBlock, /referenceAccumulator\.append/);
+  assertMarkersInOrder(plannerApplyBlock, [
+    "createNativeConsonantReferenceAccumulator({",
+    "sampleRate: PLANNER_APPLY_SAMPLE_RATE",
+    "nativeSpans[index]",
+    "uniqueDurationSec",
+    "finalizeReference(referenceAccumulator",
+  ]);
+  assert.doesNotMatch(
+    plannerApplyBlock,
+    /sampleRate:\s*GAIN_PLANNER_ANALYSIS_SAMPLE_RATE/,
+    "planner-apply references must not inherit the 16 kHz analysis domain",
   );
 });
 
@@ -150,6 +255,138 @@ test("long-form output variants retain each chunk-local source reference for fin
   assert.ok(
     (longFormBlock.match(/sourceBase: job\.base/g)?.length ?? 0) >= 4,
     "long-form output metadata must retain the parent source key",
+  );
+});
+
+test("long-form references use bounded native-rate subranges instead of one 16 kHz part decode", () => {
+  const referenceBuilderBlock = sourceBetween(
+    "const buildConsonantReferenceForInputRange = async",
+    "const renderLongFormSafeMode = async",
+  );
+
+  assert.match(referenceBuilderBlock, /createNativeConsonantReferenceAccumulator\(/);
+  assert.match(referenceBuilderBlock, /PLANNER_APPLY_SAMPLE_RATE/);
+  assert.match(referenceBuilderBlock, /LONG_FORM_REFERENCE_DECODE_SECONDS/);
+  assert.match(referenceBuilderBlock, /while \(cursorSample < totalSampleCount/);
+  assert.doesNotMatch(referenceBuilderBlock, /GAIN_PLANNER_ANALYSIS_SAMPLE_RATE/);
+});
+
+test("large rendered-candidate QC analyzes bounded WAV windows without restoring whole files after retry", () => {
+  const boundedQcBlock = sourceBetween(
+    "const analyzeRenderedPcmWindows = async",
+    "const buildBatchReference =",
+  );
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assertMarkersInOrder(boundedQcBlock, [
+    "inspectMonoFloat32Wav(inputBytes)",
+    "selectDistributedAnalysisWindowsWithConfig(",
+    "await safeDeleteFile(ffmpeg, inputName)",
+    "sliceMonoFloat32Wav(inputBytes",
+    "await analyzeFileWindow(ffmpeg, windowName, 0",
+    "aggregateWindowAnalyses(",
+  ]);
+  assert.doesNotMatch(
+    boundedQcBlock,
+    /restoreRecoveryInputs|ensureRecoveryInputBytes/,
+    "a small-window retry must not rehydrate 100-200 MB source and render WAVs",
+  );
+  assert.match(
+    boundedQcBlock,
+    /ffmpeg\.writeFile\(windowName, cloneBytes\(boundedWindow\.bytes\)\)/,
+    "each worker attempt needs its own transferable copy so a failed write cannot detach the retry bytes",
+  );
+  assert.match(processFilesBlock, /shouldUseBoundedCandidateQc[\s\S]*?analyzeRenderedPcmWindows\(/);
+});
+
+test("bounded QC and JavaScript review decodes share the same memory route", () => {
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+  const artifactBuilderBlock = sourceBetween(
+    "const buildArtifactForRenderedMix = async",
+    "const buildSingleWinnerManifest =",
+  );
+
+  assert.doesNotMatch(processFilesBlock, /LONG_CANDIDATE_QC_SAFE_SECONDS/);
+  assert.match(
+    processFilesBlock,
+    /const useBoundedSourceReviewMemory = shouldUseBoundedCandidateQc\([\s\S]*?estimateCanonicalMonoFloat32WavBytes\(candidateQcSafeDurationSeconds\)[\s\S]*?job\.file\.size[\s\S]*?\)/,
+    "the source must not be fully decoded when its projected render already belongs on the bounded route",
+  );
+  assert.match(
+    processFilesBlock,
+    /const useBoundedCandidateReviewMemory = shouldUseBoundedCandidateQc\([\s\S]*?candidateBytes\.byteLength[\s\S]*?job\.file\.size[\s\S]*?\)/,
+  );
+  assert.match(
+    processFilesBlock,
+    /if \(!useBoundedCandidateReviewMemory\)[\s\S]*?candidateDecodedForReview = decodeWavToMono\(candidateBytes\)/,
+  );
+  assert.match(
+    processFilesBlock,
+    /if \(useBoundedCandidateReviewMemory && \(shouldRefreshForQcError \|\| isRecoverableFailure\(error\)\)\)[\s\S]*?candidateQcMemoryFailed = true/,
+  );
+  assert.match(
+    processFilesBlock,
+    /const alignment = useBoundedCandidateReviewMemory[\s\S]*?buildDurationOnlyAlignmentMetrics\(/,
+  );
+  assert.match(
+    artifactBuilderBlock,
+    /const useBoundedRenderedReviewMemory = shouldUseBoundedCandidateQc\([\s\S]*?bytes\.byteLength[\s\S]*?job\.file\.size[\s\S]*?\)/,
+  );
+  assert.match(
+    artifactBuilderBlock,
+    /if \(!useBoundedRenderedReviewMemory\)[\s\S]*?renderedDecodedForReview = decodeWavToMono\(bytes\)/,
+  );
+  assert.match(
+    artifactBuilderBlock,
+    /const alignment = useBoundedRenderedReviewMemory[\s\S]*?buildDurationOnlyAlignmentMetrics\(/,
+  );
+});
+
+test("bounded post-render QC restores exact selected bytes even when window analysis fails", () => {
+  const artifactBuilderBlock = sourceBetween(
+    "const buildArtifactForRenderedMix = async",
+    "const buildSingleWinnerManifest =",
+  );
+
+  assertMarkersInOrder(artifactBuilderBlock, [
+    "let restoreRenderedBytesAfterQc = false",
+    "restoreRenderedBytesAfterQc = useBoundedRenderedReviewMemory",
+    "} finally {",
+    "if (restoreRenderedBytesAfterQc)",
+    "await ffmpeg.writeFile(renderedName, cloneBytes(bytes))",
+  ]);
+});
+
+test("sampled candidate QC stays advisory instead of authorizing a file-wide corrective retry", () => {
+  const scoreBuilderBlock = sourceBetween(
+    "const buildCandidateScore = (analysis: FileAnalysis | null)",
+    "const countUsableSpeechPauseBoundaries =",
+  );
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assert.match(scoreBuilderBlock, /resolveCandidateMeasurementStatus\(/);
+  assert.match(
+    processFilesBlock,
+    /const hasFileScopedCorrectiveEvidence[\s\S]*?measurementStatus === "measured"/,
+  );
+  assert.match(
+    processFilesBlock,
+    /const shouldTryCorrective =[\s\S]*?correctiveTriggered[\s\S]*?hasFileScopedCorrectiveEvidence/,
+  );
+  assert.match(processFilesBlock, /sampled QC remains advisory; original render kept/);
+  assert.doesNotMatch(
+    processFilesBlock,
+    /analysisWindowsSucceeded[\s\S]{0,100}>= 3/,
+    "a successful sample count must not be promoted to file-wide evidence",
   );
 });
 

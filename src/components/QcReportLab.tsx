@@ -10,6 +10,12 @@ import {
   toDb,
   type AudioQcMetrics,
 } from "../lib/audioQc";
+import { countAdaptiveSampleClickDiscontinuitiesBounded } from "../lib/sampleClickDetector";
+import {
+  createWavSampleReader,
+  decodePcmWavMonoRange,
+  parseWavHeader,
+} from "../lib/qcWavStreaming";
 import {
   REVIEW_WEIGHT_STORAGE_KEY,
   REVIEW_BUNDLE_SCHEMA_VERSION,
@@ -29,7 +35,6 @@ import styles from "./QcReportLab.module.css";
 
 const QC_STREAMING_WAV_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const QC_WAV_STREAM_CHUNK_BYTES = 4 * 1024 * 1024;
-const QC_WAV_HEADER_SCAN_BYTES = 8 * 1024 * 1024;
 
 type LabMode = "analyze" | "review";
 
@@ -62,18 +67,6 @@ type QcComparison = {
   deltaNoiseContrast: number;
   deltaClick: number;
   deltaEcho: number;
-};
-
-type ParsedWavInfo = {
-  channels: number;
-  sampleRate: number;
-  bitsPerSample: number;
-  audioFormat: number;
-  blockAlign: number;
-  dataOffset: number;
-  dataBytes: number;
-  totalFrames: number;
-  durationSec: number;
 };
 
 type ReviewDecisionDraft = {
@@ -182,134 +175,6 @@ const buildComparisons = (reports: QcReport[]) => {
   }
 
   return comparisons.sort((a, b) => b.before.overallRisk - a.before.overallRisk);
-};
-
-const readFourCC = (view: DataView, offset: number) =>
-  String.fromCharCode(
-    view.getUint8(offset),
-    view.getUint8(offset + 1),
-    view.getUint8(offset + 2),
-    view.getUint8(offset + 3),
-  );
-
-const parseWavHeader = async (file: File): Promise<ParsedWavInfo> => {
-  const headerScanBytes = Math.min(file.size, QC_WAV_HEADER_SCAN_BYTES);
-  const headerBuffer = await file.slice(0, headerScanBytes).arrayBuffer();
-  const view = new DataView(headerBuffer);
-
-  if (view.byteLength < 12) {
-    throw new Error("WAV header is too small.");
-  }
-  const riff = readFourCC(view, 0);
-  const wave = readFourCC(view, 8);
-  if (riff !== "RIFF" || wave !== "WAVE") {
-    throw new Error("Unsupported WAV container (expected RIFF/WAVE).");
-  }
-
-  let offset = 12;
-  let channels: number | null = null;
-  let sampleRate: number | null = null;
-  let bitsPerSample: number | null = null;
-  let audioFormat: number | null = null;
-  let blockAlign: number | null = null;
-  let dataOffset: number | null = null;
-  let dataBytes: number | null = null;
-
-  while (offset + 8 <= view.byteLength) {
-    const chunkId = readFourCC(view, offset);
-    const chunkSize = view.getUint32(offset + 4, true);
-    const chunkDataOffset = offset + 8;
-    const nextOffset = chunkDataOffset + chunkSize + (chunkSize % 2);
-
-    if (chunkId === "fmt " && chunkDataOffset + Math.min(chunkSize, 40) <= view.byteLength) {
-      const rawFormat = view.getUint16(chunkDataOffset, true);
-      const parsedChannels = view.getUint16(chunkDataOffset + 2, true);
-      const parsedSampleRate = view.getUint32(chunkDataOffset + 4, true);
-      const parsedBlockAlign = view.getUint16(chunkDataOffset + 12, true);
-      const parsedBitsPerSample = view.getUint16(chunkDataOffset + 14, true);
-
-      let normalizedFormat = rawFormat;
-      if (rawFormat === 0xfffe && chunkSize >= 40 && chunkDataOffset + 40 <= view.byteLength) {
-        normalizedFormat = view.getUint16(chunkDataOffset + 24, true);
-      }
-
-      channels = parsedChannels;
-      sampleRate = parsedSampleRate;
-      blockAlign = parsedBlockAlign;
-      bitsPerSample = parsedBitsPerSample;
-      audioFormat = normalizedFormat;
-    } else if (chunkId === "data") {
-      dataOffset = chunkDataOffset;
-      dataBytes = Math.min(chunkSize, Math.max(0, file.size - chunkDataOffset));
-      break;
-    }
-
-    if (nextOffset <= offset) break;
-    offset = nextOffset;
-  }
-
-  if (channels === null || sampleRate === null || bitsPerSample === null || audioFormat === null || blockAlign === null) {
-    throw new Error("WAV fmt chunk not found or incomplete.");
-  }
-  if (dataOffset === null || dataBytes === null) {
-    throw new Error("WAV data chunk not found in header scan.");
-  }
-  if (channels <= 0 || sampleRate <= 0 || blockAlign <= 0) {
-    throw new Error("Invalid WAV format values.");
-  }
-
-  const bytesPerSample = blockAlign / channels;
-  if (!Number.isInteger(bytesPerSample) || bytesPerSample <= 0) {
-    throw new Error("Unsupported WAV block alignment.");
-  }
-
-  const supported =
-    (audioFormat === 1 && [8, 16, 24, 32].includes(bitsPerSample)) ||
-    (audioFormat === 3 && [32, 64].includes(bitsPerSample));
-  if (!supported) {
-    throw new Error(`Unsupported WAV sample format (format ${audioFormat}, ${bitsPerSample}-bit).`);
-  }
-
-  const totalFrames = Math.floor(dataBytes / blockAlign);
-  const durationSec = totalFrames / sampleRate;
-  return {
-    channels,
-    sampleRate,
-    bitsPerSample,
-    audioFormat,
-    blockAlign,
-    dataOffset,
-    dataBytes,
-    totalFrames,
-    durationSec,
-  };
-};
-
-const createWavSampleReader = (view: DataView, audioFormat: number, bitsPerSample: number) => {
-  if (audioFormat === 3 && bitsPerSample === 32) {
-    return (byteOffset: number) => view.getFloat32(byteOffset, true);
-  }
-  if (audioFormat === 3 && bitsPerSample === 64) {
-    return (byteOffset: number) => view.getFloat64(byteOffset, true);
-  }
-  if (audioFormat === 1 && bitsPerSample === 8) {
-    return (byteOffset: number) => (view.getUint8(byteOffset) - 128) / 128;
-  }
-  if (audioFormat === 1 && bitsPerSample === 16) {
-    return (byteOffset: number) => view.getInt16(byteOffset, true) / 32768;
-  }
-  if (audioFormat === 1 && bitsPerSample === 24) {
-    return (byteOffset: number) => {
-      let value =
-        view.getUint8(byteOffset) | (view.getUint8(byteOffset + 1) << 8) | (view.getUint8(byteOffset + 2) << 16);
-      if (value & 0x800000) value |= ~0xffffff;
-      return value / 8388608;
-    };
-  }
-  if (audioFormat === 1 && bitsPerSample === 32) {
-    return (byteOffset: number) => view.getInt32(byteOffset, true) / 2147483648;
-  }
-  throw new Error(`Unsupported WAV reader (format ${audioFormat}, ${bitsPerSample}-bit).`);
 };
 
 const decodeToMono = async (file: File, audioContext: AudioContext) => {
@@ -481,11 +346,6 @@ const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
   let globalPeak = 0;
   let clipCount = 0;
   let monoSampleCount = 0;
-  let sampleSpikeCount = 0;
-  const refractorySamples = Math.max(1, Math.round(wav.sampleRate * 0.004));
-  let lastSpikeIndex = -refractorySamples;
-  let prevMonoSample = 0;
-  let hasPrevMonoSample = false;
 
   let frameWriteIndex = 0;
   let frameFill = 0;
@@ -520,16 +380,6 @@ const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
       const abs = Math.abs(mono);
       if (abs > globalPeak) globalPeak = abs;
       if (abs >= 0.995) clipCount += 1;
-
-      if (hasPrevMonoSample) {
-        const diff = Math.abs(mono - prevMonoSample);
-        if (diff >= 0.09 && abs >= 0.015 && monoSampleCount - lastSpikeIndex >= refractorySamples) {
-          sampleSpikeCount += 1;
-          lastSpikeIndex = monoSampleCount;
-        }
-      }
-      prevMonoSample = mono;
-      hasPrevMonoSample = true;
 
       if (frameWriteIndex < frameCount) {
         frameBuffer[frameFill] = mono;
@@ -566,6 +416,28 @@ const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
   }
 
   const analyzedFrames = Math.min(frameWriteIndex, frameCount);
+  const analyzedFrameRms = frameRms.slice(0, analyzedFrames);
+  const analyzedFramePeak = framePeak.slice(0, analyzedFrames);
+  const analyzedFrameDb = frameDb.slice(0, analyzedFrames);
+  const analyzedFrameSharpness = frameSharpness.slice(0, analyzedFrames);
+  const byteBoundedCoreSamples = Math.max(
+    frameSize,
+    Math.floor(QC_WAV_STREAM_CHUNK_BYTES / wav.blockAlign),
+  );
+  const alignedCoreSamples = Math.max(
+    frameSize,
+    Math.floor(byteBoundedCoreSamples / frameSize) * frameSize,
+  );
+  const clickDetection = await countAdaptiveSampleClickDiscontinuitiesBounded({
+    totalSamples: wav.totalFrames,
+    sampleRate: wav.sampleRate,
+    frameSize,
+    frameRms: analyzedFrameRms,
+    frameSharpness: analyzedFrameSharpness,
+    alignedCoreSamples,
+    loadSamples: async (startSample, endSample) =>
+      decodePcmWavMonoRange(file, wav, startSample, endSample),
+  });
   const durationSec = wav.durationSec;
   const peakDb = toDb(globalPeak + 1e-12);
   const clipPct = (clipCount / Math.max(monoSampleCount, 1)) * 100;
@@ -573,15 +445,15 @@ const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
   return analyzeFrameFeatures(
     file.name,
     file.size,
-    frameRms.slice(0, analyzedFrames),
-    framePeak.slice(0, analyzedFrames),
-    frameDb.slice(0, analyzedFrames),
-    frameSharpness.slice(0, analyzedFrames),
+    analyzedFrameRms,
+    analyzedFramePeak,
+    analyzedFrameDb,
+    analyzedFrameSharpness,
     wav.sampleRate,
     durationSec,
     peakDb,
     clipPct,
-    sampleSpikeCount,
+    clickDetection.count,
   );
 };
 
@@ -1010,10 +882,10 @@ export default function QcReportLab() {
                 <span>{comparisons.filter((pair) => pair.deltaRisk > 0.05).length} regressed pair(s)</span>
               </div>
               <div className={styles.badges}>
-                <span className={styles.badge}>Instability</span>
-                <span className={styles.badge}>Onset / Sag / End Fade</span>
+                <span className={styles.badge}>Instability risk</span>
+                <span className={styles.badge}>Onset / sag / end-fade risks</span>
                 <span className={styles.badge}>Noise lift risk</span>
-                <span className={styles.badge}>Clicks + Echo</span>
+                <span className={styles.badge}>Click + echo risks</span>
                 <span className={styles.badge}>Compression risk</span>
               </div>
               <p className={styles.footerNote}>
@@ -1167,13 +1039,14 @@ export default function QcReportLab() {
                       <div className={styles.errorText}>{report.error ?? "Analysis failed."}</div>
                     ) : (
                       <>
+                        <p className={styles.muted}>Percentages are risk scores — lower is better.</p>
                         <div className={styles.metricGrid}>
                           <div className={styles.metric}>
                             <span>Overall risk</span>
                             <strong>{Math.round(report.overallRisk * 100)}%</strong>
                           </div>
                           <div className={styles.metric}>
-                            <span>Instability</span>
+                            <span>Instability risk</span>
                             <strong>{Math.round(report.instabilityScore * 100)}%</strong>
                           </div>
                           <div className={styles.metric}>
@@ -1205,11 +1078,11 @@ export default function QcReportLab() {
                             <strong>{Math.round(report.pauseNoiseRisk * 100)}%</strong>
                           </div>
                           <div className={styles.metric}>
-                            <span>Click score</span>
+                            <span>Click artifacts risk</span>
                             <strong>{Math.round(report.clickScore * 100)}%</strong>
                           </div>
                           <div className={styles.metric}>
-                            <span>Echo score</span>
+                            <span>Echo risk</span>
                             <strong>{Math.round(report.echoScore * 100)}%</strong>
                           </div>
                           <div className={styles.metric}>

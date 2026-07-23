@@ -71,10 +71,9 @@ export type GainPlannerInput = {
    */
   instabilityHint?: number;
   /**
-   * 0..1 strength for isolated spike control inside normal dialogue runs.
-   * This is separate from breath/transient handling: it catches one-off hot
-   * syllables/plosives that live inside a sentence body without fading the
-   * sentence start/end or flattening sustained loud delivery.
+   * 0..1 strength for the uniform residual correction of a whole body-speech
+   * run that remains materially hot after planning. This does not authorize
+   * source-blind localized attenuation inside a word.
    */
   speechSpikeTaming?: number;
 };
@@ -115,9 +114,9 @@ export type GainPlannerOutput = {
   microRideDb: number;
   /** Count of runs classified as transient-breath. Diagnostic. */
   breathRunCount: number;
-  /** Count of isolated body-speech frames locally dipped by the spike guard. */
+  /** Legacy localized-planner diagnostic; retained for telemetry compatibility and now always zero. */
   speechSpikeFrameCount: number;
-  /** Largest body-speech spike dip in dB. Diagnostic. */
+  /** Legacy localized-planner diagnostic; retained for telemetry compatibility and now always zero. */
   speechSpikeMaxReductionDb: number;
   /** Count of sustained-loud clusters (onomatopoeia / yells) tamed inside body-speech runs. */
   sustainedLoudClusterCount: number;
@@ -140,6 +139,10 @@ export type GainPlannerOutput = {
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+const smoothUnitRamp = (value: number, start: number, full: number) => {
+  const t = clamp((value - start) / Math.max(1e-9, full - start), 0, 1);
+  return t * t * (3 - 2 * t);
+};
 const dbToLin = (db: number) => Math.pow(10, db / 20);
 const COLD_OPEN_WINDOW_MS = 2500;
 const COLD_OPEN_RUN_COUNT = 3;
@@ -162,7 +165,6 @@ const SOFT_TAIL_RESCUE_NOISE_MARGIN_DB = 8;
 const SOFT_TAIL_RESCUE_SPEECH_MARGIN_DB = 14;
 const SOFT_TAIL_RESCUE_BODY_DROP_DB = 18;
 const SOFT_TAIL_RESCUE_HARD_NOISE_MARGIN_DB = 4;
-const RUN_EDGE_SPIKE_GUARD_EXCLUSION_MS = 150;
 const QUIET_BODY_FLOOR_OFFSET_DB = 2.4;
 const QUIET_BODY_FLOOR_LOUDNESS_OFFSET_DB = 1.0;
 const QUIET_BODY_FLOOR_MAX_LIFT_DB = 3.5;
@@ -170,6 +172,10 @@ const QUIET_BODY_FLOOR_HIGH_CREST_DB = 20;
 const QUIET_BODY_FLOOR_EXTREME_CREST_DB = 24;
 const BODY_SPIKE_MAX_RUN_LOSS_DB = 10;
 const BODY_SPIKE_RUN_FLOOR_OFFSET_DB = 9;
+// Absolute peak safety is useful, but its frame-wide envelope must not turn a
+// sample peak into a broadband body hole. The delivery limiter still owns the
+// remaining sample-level excess.
+const BODY_SPIKE_MAX_CREATED_ENVELOPE_LOSS_DB = 0.6;
 const RENDERED_CONSONANT_FRAME_MS = 10;
 /** Evidence resolution required to separate adjacent source-relative consonant events. */
 export const RENDERED_CONSONANT_SOURCE_FRAME_MS = 2;
@@ -179,14 +185,32 @@ const RENDERED_CONSONANT_ABSOLUTE_PEAK_DB = -6.5;
 const RENDERED_CONSONANT_MIN_TARGET_PEAK_DB = -12.5;
 const RENDERED_CONSONANT_MAX_REDUCTION_DB = 7.5;
 const RENDERED_CONSONANT_DIP_RADIUS_MS = 14;
+// Small alignment/resampling variance belongs to the native event. Authority
+// begins continuously only beyond this margin; there is no minimum output cut.
 const RENDERED_CONSONANT_SOURCE_ALLOWED_GROWTH_DB = 1.5;
 const RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB = 2.5;
+// A single 2 ms full-band owner can sound like a volume dropout even when its
+// source-relative decision is correct. Deeper repair needs adjacent evidence;
+// an isolated owner remains a subtle touch rather than a down-up notch.
+const RENDERED_CONSONANT_ISOLATED_OWNER_MAX_REDUCTION_DB = 0.6;
+const RENDERED_CONSONANT_ADJACENT_SUPPORT_SCALE = 0.4;
 const RENDERED_CONSONANT_REFERENCE_MATCH_WINDOW_MS = 20;
 const RENDERED_CONSONANT_REFERENCE_ALIGNMENT_MAX_MS = 120;
 const RENDERED_CONSONANT_REFERENCE_MIN_CONFIDENCE = 0.5;
-const RENDERED_CONSONANT_WEAK_SOURCE_CONTRAST_DB = 8;
-const RENDERED_CONSONANT_WEAK_SOURCE_CREST_DB = 12;
-const RENDERED_CONSONANT_WEAK_SOURCE_MAX_REDUCTION_DB = 1.25;
+const RENDERED_CONSONANT_RENDERED_CONTRAST_START_DB = 8;
+const RENDERED_CONSONANT_RENDERED_CREST_START_DB = 12;
+const RENDERED_CONSONANT_SOURCE_CONTRAST_START_DB = 4;
+const RENDERED_CONSONANT_SOURCE_CONTRAST_WEAK_DB = 8;
+const RENDERED_CONSONANT_SOURCE_CONTRAST_STRONG_START_DB = 10;
+const RENDERED_CONSONANT_SOURCE_CONTRAST_FULL_DB = 12;
+const RENDERED_CONSONANT_SOURCE_CREST_START_DB = 6;
+const RENDERED_CONSONANT_SOURCE_CREST_WEAK_DB = 12;
+const RENDERED_CONSONANT_SOURCE_CREST_STRONG_START_DB = 16;
+const RENDERED_CONSONANT_SOURCE_CREST_FULL_DB = 18;
+const RENDERED_CONSONANT_WEAK_BANDWIDTH_START_RATIO = 0.75;
+const RENDERED_CONSONANT_FULL_BANDWIDTH_RATIO = 0.9;
+const RENDERED_CONSONANT_AUDIBILITY_PEAK_START_DB = -24;
+const RENDERED_CONSONANT_AUDIBILITY_RMS_START_DB = -80;
 const PLANNER_ENVELOPE_FLOOR_PERCENTILE = 25;
 const PLANNER_ANALYSIS_FLOOR_HEADROOM_DB = 20;
 const K_WEIGHT_STAGE1_HIGH_SHELF_HZ = 1681.974450955533;
@@ -396,23 +420,6 @@ const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => 
   return 10 * Math.log10(sumPower / (b - a) + 1e-30);
 };
 
-const medianDbOfSlice = (frameDb: number[], start: number, end: number): number => {
-  const a = Math.max(0, start);
-  const b = Math.min(frameDb.length, end);
-  if (b <= a) return -120;
-  const values: number[] = [];
-  for (let i = a; i < b; i += 1) values.push(frameDb[i]);
-  values.sort((left, right) => left - right);
-  return values[Math.floor(values.length / 2)] ?? -120;
-};
-
-const stdDev = (values: number[]) => {
-  if (values.length === 0) return null;
-  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const variance = values.reduce((sum, value) => sum + (value - avg) * (value - avg), 0) / values.length;
-  return Math.sqrt(variance);
-};
-
 /**
  * Plan a gain curve for speech-aware leveling.
  */
@@ -454,19 +461,14 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // Scale: ±0.4 dB at instabilityHint=0, ±1.5 dB at instabilityHint=1.
   const instabilityHint = Math.max(0, Math.min(1, input.instabilityHint ?? 0.5));
   const microRideDb = 0.4 + instabilityHint * 1.1;
-  // Speech-spike taming is now ENGAGED much earlier. Even a "moderately
-  // stable" source can still have a single syllable peak 15+ dB above its
-  // body — the kind of spike users actually flag visually in the waveform.
-  // We start at 0.30 (so even instabilityHint=0 gets a baseline of taming)
-  // and ramp to 1.0 as instabilityHint approaches 1. Previously the guard
-  // only kicked in above instabilityHint 0.35, leaving most files with
-  // speechSpikeTaming = 0 and no within-sentence spike protection.
+  // This controls only the uniform residual correction for a whole hot run.
+  // Time-local consonant repair is source-relative later in the delivery path;
+  // the planner must not infer within-word attenuation from source level alone.
   const speechSpikeTaming = clamp(
     Math.max(input.speechSpikeTaming ?? clamp(0.3 + (instabilityHint - 0.05) * 0.85, 0.3, 1), 0.3),
     0,
     1,
   );
-  let bodyRelativeSpeechSpikeTaming = speechSpikeTaming;
 
   // 1) Per-run body RMS + classification.
   //
@@ -675,20 +677,6 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // The exact offset scales with crest excess. We also widen the
   // attenuation clamp to -18 dB so extremely loud sources (source body
   // > target + 14 dB) can be brought down further.
-  const bodyRunSigmaDb = stdDev(runRmsDb);
-  if (
-    runRmsDb.length >= 3 &&
-    runRmsDb.length <= 8 &&
-    bodyRunSigmaDb !== null &&
-    bodyRunSigmaDb <= 1.25 &&
-    input.pauseNoiseRisk <= 0.25
-  ) {
-    // Sparse takes that are already line-consistent should not get aggressive
-    // body-relative spike shaping, but the residual safety floor must remain
-    // active so caller-provided zeroes cannot bypass the speech-spike guard.
-    bodyRelativeSpeechSpikeTaming = Math.min(bodyRelativeSpeechSpikeTaming, 0.05);
-  }
-
   const breathTargetDb = targetDb - 3.2;
   const plannedRunGainDb: number[] = runMeta.map((m) => {
     if (m.runClass === "transient-breath") {
@@ -1029,28 +1017,14 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //    because the slew can't catch up to body gain in 80 ms).
   const slewed = gainDbCurve;
 
-  // 7) LOCALIZED peak/body-spike guard.
+  // 7) LOCALIZED absolute-peak guard.
   //
-  // Previous approach reduced a WHOLE RUN's gain when any single sample
-  // in the run exceeded the ceiling. A single loud plosive therefore cost
-  // the entire sentence its body level. The user could hear "spikes"
-  // because those plosive-dominated sentences came out with normal peaks
-  // but QUIET bodies relative to the rest of the dialogue.
-  //
-  // New approach: compute the peak per 10 ms frame (we built framePeakDb
-  // above when samples were available). Absolute peaks still get a 50 ms
-  // cosine dip, but body-speech also gets a body-relative spike guard:
-  // isolated 20-140 ms syllable/plosive jumps are tamed even when they sit
-  // below the global -3/-4 dBFS ceiling. Sustained loud delivery is skipped.
-  // Wider dip (40 ms half-width = 80 ms total) — smoother envelope edges,
-  // less audible as a "click" or "pump" while still localized to the spike.
+  // The former body-relative branch made source-blind 6-10 dB decisions on
+  // short syllables and created the reported intra-word down/up movement. It
+  // is intentionally absent: processing-added consonant contrast is judged
+  // later against the native-rate source. Here we retain only absolute peak
+  // safety and continuously limit its broadband envelope by real RMS headroom.
   const peakDipFrames = Math.max(1, Math.round(40 / frameMs));
-  const runEdgeSpikeGuardExclusionFrames = Math.max(1, Math.round(RUN_EDGE_SPIKE_GUARD_EXCLUSION_MS / frameMs));
-  // Allow the guard to act on longer sustained-loud passages too. A 280 ms
-  // cluster covers a stressed-syllable cluster like "WHAT!" without
-  // touching genuinely sustained loud delivery (which our `clearlyHot`
-  // threshold gates separately).
-  const bodySpikeClusterLimitFrames = Math.max(6, Math.round(280 / frameMs));
   const peakReductionDbByRun = new Array<number>(runMeta.length).fill(0);
   const runIndexByFrame = new Array<number>(frameCount).fill(-1);
   for (let r = 0; r < runMeta.length; r += 1) {
@@ -1059,8 +1033,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
   }
   const dipDbByFrame = new Float32Array(frameCount);
-  let speechSpikeFrameCount = 0;
-  let speechSpikeMaxReductionDb = 0;
+  const speechSpikeFrameCount = 0;
+  const speechSpikeMaxReductionDb = 0;
   let sustainedClusterTamedCount = 0;
   let sustainedClusterMaxReductionDbOut = 0;
   if (framePeakDb) {
@@ -1078,89 +1052,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         ? Math.min(peakCeilingDb, targetDb + 8)
         : peakCeilingDb;
       const appliedPeakDb = framePeakDb[f] + currentGainDb;
-      let reductionDb = Math.max(0, appliedPeakDb - localPeakCeilingDb);
-
-      if (
-        runIdx >= 0 &&
-        runMetaForFrame?.runClass === "body-speech" &&
-        bodyRelativeSpeechSpikeTaming > 0.08 &&
-        f < runMetaForFrame.endFrame - runEdgeSpikeGuardExclusionFrames
-      ) {
-        const bodyLevelDb = runMetaForFrame.meanDb + (plannedRunGainDb[runIdx] ?? currentGainDb);
-        // TIGHTER thresholds. Previously allowed 14.8 dB peak / 4.8 dB RMS
-        // above body, which let visible waveform spikes through entirely.
-        // Pro VO crest factor is 8-10 dB; anything above ~10 dB peak / 3 dB
-        // RMS reads as a "spike" to the listener and on the waveform.
-        const allowedRmsSpikeDb = 3.0 - bodyRelativeSpeechSpikeTaming * 1.0; // 3.0 → 2.0 dB
-        const allowedPeakSpikeDb = 9.5 - bodyRelativeSpeechSpikeTaming * 1.5; // 9.5 → 8.0 dB
-        const appliedFrameDb = input.frameDb[f] + currentGainDb;
-        const relativePeakCeilingDb = Math.min(peakCeilingDb, bodyLevelDb + allowedPeakSpikeDb);
-        const rmsExcessDb = appliedFrameDb - (bodyLevelDb + allowedRmsSpikeDb);
-        const relativePeakExcessDb = appliedPeakDb - relativePeakCeilingDb;
-
-        if (rmsExcessDb > 0 || relativePeakExcessDb > 0) {
-          const localMedianDb = medianDbOfSlice(
-            input.frameDb,
-            Math.max(runMetaForFrame.startFrame, f - 5),
-            Math.min(runMetaForFrame.endFrame, f + 6),
-          );
-          const localContrastDb = input.frameDb[f] - localMedianDb;
-          // Lower contrast threshold so even modest local jumps qualify
-          // as spikes worth taming. Previously 1.4 dB minimum kept many
-          // audible peaks unprotected.
-          const localContrastThresholdDb = 0.8 + (1 - bodyRelativeSpeechSpikeTaming) * 0.6;
-          const isHotFrame = (idx: number) => {
-            const gainDb = slewed[idx];
-            return (
-              input.frameDb[idx] + gainDb > bodyLevelDb + allowedRmsSpikeDb - 0.4 ||
-              framePeakDb[idx] + gainDb > relativePeakCeilingDb - 0.5
-            );
-          };
-
-          let hotClusterFrames = 1;
-          for (
-            let idx = f - 1;
-            idx >= runMetaForFrame.startFrame && hotClusterFrames <= bodySpikeClusterLimitFrames;
-            idx -= 1
-          ) {
-            if (!isHotFrame(idx)) break;
-            hotClusterFrames += 1;
-          }
-          for (
-            let idx = f + 1;
-            idx < runMetaForFrame.endFrame && hotClusterFrames <= bodySpikeClusterLimitFrames;
-            idx += 1
-          ) {
-            if (!isHotFrame(idx)) break;
-            hotClusterFrames += 1;
-          }
-
-          const locallyIsolated = hotClusterFrames <= bodySpikeClusterLimitFrames;
-          const locallyContrasty = localContrastDb >= localContrastThresholdDb;
-          // `clearlyHot` triggers the dip even without local-contrast
-          // evidence — useful when a stressed syllable sustains for several
-          // frames at uniformly elevated level. Lowered thresholds so this
-          // catches the actual visually-audible spikes (1.0 dB RMS / 0.8 dB
-          // peak excess instead of 2.0 / 1.6).
-          const clearlyHot = rmsExcessDb >= 1 || relativePeakExcessDb >= 0.8;
-          if (locallyIsolated && (locallyContrasty || clearlyHot)) {
-            // RAISED dip cap so a 17 dB peak above body can be reduced by
-            // 11 dB → 6 dB above body (well within "natural crest").
-            // Previously capped at 5.5 dB so a 17 dB spike came out at
-            // 11.5 dB above body — still spike-y on the waveform.
-            const bodySpikeReductionDb = clamp(
-              Math.max(rmsExcessDb * 0.85, relativePeakExcessDb * 1.0),
-              0,
-              5.5 + bodyRelativeSpeechSpikeTaming * 6,
-            );
-            if (bodySpikeReductionDb > 0.05) {
-              reductionDb = Math.max(reductionDb, bodySpikeReductionDb);
-              speechSpikeFrameCount += 1;
-              speechSpikeMaxReductionDb = Math.max(speechSpikeMaxReductionDb, bodySpikeReductionDb);
-            }
-          }
-        }
-      }
+      const reductionDb = Math.max(0, appliedPeakDb - localPeakCeilingDb);
 
       if (reductionDb <= 0) continue;
       // Apply cosine dip from -peakDipFrames..+peakDipFrames around f.
@@ -1185,6 +1077,26 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       }
     }
 
+  }
+
+  // A frame-wide absolute-peak correction can spend only its RMS headroom
+  // above the planned body. Flat speech therefore receives at most 0.6 dB of
+  // broadband movement, while a genuinely hot frame can still protect the
+  // ceiling. This has no event-duration or percentile engagement boundary.
+  for (let r = 0; r < runMeta.length; r += 1) {
+    const meta = runMeta[r];
+    if (meta.runClass !== "body-speech") continue;
+    const plannedBodyDb = meta.meanDb + (plannedRunGainDb[r] ?? 0);
+    for (let f = meta.startFrame; f < meta.endFrame; f += 1) {
+      const requestedDipDb = dipDbByFrame[f];
+      if (requestedDipDb <= 0) continue;
+      const preDipAppliedDb = input.frameDb[f] + slewed[f];
+      const envelopeSupportedDipDb = Math.max(
+        0,
+        preDipAppliedDb - (plannedBodyDb - BODY_SPIKE_MAX_CREATED_ENVELOPE_LOSS_DB),
+      );
+      dipDbByFrame[f] = Math.min(requestedDipDb, envelopeSupportedDipDb);
+    }
   }
 
   // 7b) POST-CLAMP RESIDUAL pass for body-speech runs.
@@ -1284,8 +1196,17 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     peakReductionDbByRun[r] = maxRemainingDipDb > 0 ? -maxRemainingDipDb : 0;
   }
 
-  // Final dip-application — covers BOTH the framePeak-driven body-spike
-  // guard (when samples were supplied) AND the residual pass.
+  // Recompute run diagnostics after every non-destructive relaxation.
+  for (let r = 0; r < runMeta.length; r += 1) {
+    let maxAppliedDipDb = 0;
+    for (let f = runMeta[r].startFrame; f < runMeta[r].endFrame; f += 1) {
+      maxAppliedDipDb = Math.max(maxAppliedDipDb, dipDbByFrame[f]);
+    }
+    peakReductionDbByRun[r] = maxAppliedDipDb > 0 ? -maxAppliedDipDb : 0;
+  }
+
+  // Final dip-application — covers absolute-peak safety and the uniform
+  // residual pass. Time-local body-relative shaping is deliberately absent.
   for (let f = 0; f < frameCount; f += 1) {
     if (dipDbByFrame[f] > 0) slewed[f] -= dipDbByFrame[f];
   }
@@ -1726,7 +1647,65 @@ export const tameRenderedConsonantPeaks = (
       (options.referenceMatchWindowMs ?? RENDERED_CONSONANT_REFERENCE_MATCH_WINDOW_MS) / referenceFrameMs,
     ),
   );
-  const resolveReferencePeakOverBodyDb = (renderedFrame: number) => {
+  const sourceEvidenceAuthority = (contrastDb: number, crestDb: number) => {
+    const continuousWeakToStrong = (
+      value: number,
+      start: number,
+      weak: number,
+      strongStart: number,
+      full: number,
+    ) => {
+      if (value <= weak) return 0.5 * smoothUnitRamp(value, start, weak);
+      if (value <= strongStart) return 0.5;
+      return 0.5 + 0.5 * smoothUnitRamp(value, strongStart, full);
+    };
+    const fullBandwidthEvidence = Math.max(
+      continuousWeakToStrong(
+        contrastDb,
+        RENDERED_CONSONANT_SOURCE_CONTRAST_START_DB,
+        RENDERED_CONSONANT_SOURCE_CONTRAST_WEAK_DB,
+        RENDERED_CONSONANT_SOURCE_CONTRAST_STRONG_START_DB,
+        RENDERED_CONSONANT_SOURCE_CONTRAST_FULL_DB,
+      ),
+      continuousWeakToStrong(
+        crestDb,
+        RENDERED_CONSONANT_SOURCE_CREST_START_DB,
+        RENDERED_CONSONANT_SOURCE_CREST_WEAK_DB,
+        RENDERED_CONSONANT_SOURCE_CREST_STRONG_START_DB,
+        RENDERED_CONSONANT_SOURCE_CREST_FULL_DB,
+      ),
+    );
+    const bandwidthLimitedStrongEvidence = Math.max(
+      smoothUnitRamp(
+        contrastDb,
+        RENDERED_CONSONANT_SOURCE_CONTRAST_STRONG_START_DB,
+        RENDERED_CONSONANT_SOURCE_CONTRAST_FULL_DB,
+      ),
+      smoothUnitRamp(
+        crestDb,
+        RENDERED_CONSONANT_SOURCE_CREST_STRONG_START_DB,
+        RENDERED_CONSONANT_SOURCE_CREST_FULL_DB,
+      ),
+    );
+    const weakEvidenceBandwidthAuthority = referenceMetrics
+      ? smoothUnitRamp(
+          referenceMetrics.sampleRate / sampleRate,
+          RENDERED_CONSONANT_WEAK_BANDWIDTH_START_RATIO,
+          RENDERED_CONSONANT_FULL_BANDWIDTH_RATIO,
+        )
+      : 0;
+    return Math.max(
+      bandwidthLimitedStrongEvidence,
+      fullBandwidthEvidence * weakEvidenceBandwidthAuthority,
+    );
+  };
+  const referenceEvidenceCache: Array<
+    { contrastDb: number; crestDb: number; maxReductionDb: number } | undefined
+  > = referenceMetrics ? new Array(referenceMetrics.rmsDb.length) : [];
+  const resolveReferencePeakOverBodyDb = (
+    renderedFrame: number,
+    renderedContrastDb: number,
+  ) => {
     if (!referenceMetrics || referenceMetrics.rmsDb.length <= 0 || referenceMetrics.peakDb.length <= 0) return null;
     const centerTimeSec = ((renderedFrame + 0.5) * analysisFrameMs) / 1000;
     const referenceCenterFrame = Math.round(
@@ -1740,6 +1719,8 @@ export const tameRenderedConsonantPeaks = (
       Math.round(RENDERED_CONSONANT_LOCAL_WINDOW_MS / referenceFrameMs),
     );
     const contrastAtReferenceFrame = (referenceFrame: number) => {
+      const cached = referenceEvidenceCache[referenceFrame];
+      if (cached) return cached;
       const referencePeakDb = referenceMetrics.peakDb[referenceFrame] ?? -120;
       const referenceRmsDb = referenceMetrics.rmsDb[referenceFrame] ?? -120;
       const referenceBodyDb = renderedLocalBodyDb(
@@ -1747,49 +1728,85 @@ export const tameRenderedConsonantPeaks = (
         referenceFrame,
         referenceLocalWindowFrames,
       );
-      return {
-        contrastDb: referencePeakDb - referenceBodyDb,
-        crestDb: referencePeakDb - referenceRmsDb,
+      const contrastDb = referencePeakDb - referenceBodyDb;
+      const crestDb = referencePeakDb - referenceRmsDb;
+      const measured = {
+        contrastDb,
+        crestDb,
+        maxReductionDb:
+          RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB
+          * sourceEvidenceAuthority(contrastDb, crestDb),
       };
+      referenceEvidenceCache[referenceFrame] = measured;
+      return measured;
     };
 
-    // Match the nearest source-localized frame, with time as the primary
-    // key. This keeps adjacent /st/, /ts/, /sz/, and similar clusters from
-    // borrowing a stronger neighbor's contrast while retaining a small
-    // tolerance for resample/filter timing movement after global alignment.
-    let nearestDistanceFrames = Number.POSITIVE_INFINITY;
-    let nearestMatch: { contrastDb: number; maxReductionDb: number } | null = null;
-    let nearestMatchAmbiguous = false;
-    const canUseWeakFullBandwidthEvidence =
-      referenceMetrics.sampleRate >= sampleRate * 0.9;
-    for (let referenceFrame = startFrame; referenceFrame <= endFrame; referenceFrame += 1) {
-      const { contrastDb, crestDb } = contrastAtReferenceFrame(referenceFrame);
-      const hasStrongLocalizedSourceContrast = contrastDb >= 12 || crestDb >= 18;
-      const hasWeakFullBandwidthSourceContrast =
-        canUseWeakFullBandwidthEvidence &&
-        (contrastDb >= RENDERED_CONSONANT_WEAK_SOURCE_CONTRAST_DB ||
-          crestDb >= RENDERED_CONSONANT_WEAK_SOURCE_CREST_DB);
-      const hasLocalizedSourceContrast = hasStrongLocalizedSourceContrast || hasWeakFullBandwidthSourceContrast;
-      if (!hasLocalizedSourceContrast) continue;
-      const distanceFrames = Math.abs(referenceFrame - referenceCenterFrame);
-      if (distanceFrames < nearestDistanceFrames) {
-        nearestDistanceFrames = distanceFrames;
-        nearestMatch = {
-          contrastDb,
-          maxReductionDb: hasStrongLocalizedSourceContrast
-            ? RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB
-            : RENDERED_CONSONANT_WEAK_SOURCE_MAX_REDUCTION_DB,
-        };
-        nearestMatchAmbiguous = false;
-      } else if (distanceFrames === nearestDistanceFrames) {
-        // Two equidistant source events cannot be assigned confidently to one
-        // rendered frame. Fail open for that frame instead of choosing the
-        // louder event and risking damage to native articulation.
-        nearestMatchAmbiguous = true;
+    // Assign the first trusted time-local match continuously. Exact native
+    // evidence consumes the match and protects its owner from neighboring
+    // consonants; weak evidence only partially owns it, so an epsilon change
+    // cannot replace a trusted adjacent timing match. The unassigned remainder
+    // is an explicit no-repair prior, and distance tapers rapidly inside the
+    // bounded alignment window so a remote event cannot lend its full budget.
+    let unassignedAuthority = 1;
+    let blendedReductionDb = 0;
+    const potentialReductionDb = (match: { contrastDb: number; maxReductionDb: number }) => clamp(
+      renderedContrastDb - match.contrastDb - RENDERED_CONSONANT_SOURCE_ALLOWED_GROWTH_DB,
+      0,
+      match.maxReductionDb,
+    );
+    for (let distanceFrames = 0; distanceFrames <= referenceMatchFrames; distanceFrames += 1) {
+      let groupMissAuthority = 1;
+      let groupEvidenceSum = 0;
+      let groupWeightedReductionSum = 0;
+      const groupFrames = distanceFrames === 0
+        ? [referenceCenterFrame]
+        : [referenceCenterFrame - distanceFrames, referenceCenterFrame + distanceFrames];
+      for (const referenceFrame of groupFrames) {
+        if (referenceFrame < startFrame || referenceFrame > endFrame) continue;
+        const { contrastDb, maxReductionDb } = contrastAtReferenceFrame(referenceFrame);
+        const evidenceAuthority = clamp(
+          maxReductionDb / RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB,
+          0,
+          1,
+        );
+        groupMissAuthority *= 1 - evidenceAuthority;
+        groupEvidenceSum += evidenceAuthority;
+        groupWeightedReductionSum += potentialReductionDb({ contrastDb, maxReductionDb })
+          * evidenceAuthority;
       }
+      if (groupEvidenceSum <= 0) continue;
+
+      const groupAuthority = 1 - groupMissAuthority;
+      const groupReductionDb = groupWeightedReductionSum / groupEvidenceSum;
+      // The weak-evidence plateau is already a trusted localized source event,
+      // so it owns its exact frame fully. Below that plateau ownership fades in
+      // smoothly; this is what prevents epsilon evidence from masking a nearby
+      // match without letting a native weak consonant borrow from its neighbor.
+      const ownershipAuthority = smoothUnitRamp(groupAuthority, 0, 0.5);
+      const edgeAuthority = 1 - smoothUnitRamp(
+        distanceFrames,
+        0,
+        referenceMatchFrames + 1,
+      );
+      const baseLocalityAuthority = edgeAuthority / ((distanceFrames + 1) ** 2);
+      // Strong source evidence can absorb one-frame resample/filter movement.
+      // Its extra timing trust also fades continuously across the wider search
+      // window, so a distant consonant never receives full ownership.
+      const strongEvidenceTrust = smoothUnitRamp(groupAuthority, 0.5, 1);
+      const nearbyStrongAllowance = 1 - smoothUnitRamp(
+        distanceFrames,
+        1,
+        referenceMatchFrames + 1,
+      );
+      const localityAuthority = baseLocalityAuthority
+        + (1 - baseLocalityAuthority) * strongEvidenceTrust * nearbyStrongAllowance;
+      const assignedAuthority = unassignedAuthority * ownershipAuthority * localityAuthority;
+      blendedReductionDb += assignedAuthority * groupReductionDb;
+      unassignedAuthority *= 1 - ownershipAuthority * localityAuthority;
     }
-    if (nearestMatchAmbiguous) return null;
-    if (nearestMatch && Number.isFinite(nearestMatch.contrastDb)) return nearestMatch;
+    if (blendedReductionDb > 0) {
+      return { reductionDb: blendedReductionDb };
+    }
     // An optional final tamer needs positive, time-local source evidence. A
     // missing event can be a bandwidth-limited reference rather than a defect,
     // so preserve the render instead of inferring authorization from the body.
@@ -1803,31 +1820,56 @@ export const tameRenderedConsonantPeaks = (
   for (let frame = 0; frame < frameCount; frame += 1) {
     const peak = peakDb[frame] ?? -120;
     const rms = rmsDb[frame] ?? -120;
-    if (peak < -14 || rms < -70) continue;
+    const sourceRelativeAudibilityAuthority = referenceMetrics
+      ? Math.min(
+          smoothUnitRamp(peak, RENDERED_CONSONANT_AUDIBILITY_PEAK_START_DB, -14),
+          smoothUnitRamp(rms, RENDERED_CONSONANT_AUDIBILITY_RMS_START_DB, -70),
+        )
+      : 1;
+    if (referenceMetrics) {
+      // This is a zero-authority performance screen, not an engagement gate:
+      // quiet evidence fades in smoothly before the former -14/-70 limits.
+      if (sourceRelativeAudibilityAuthority <= 0) continue;
+    } else if (peak < -14 || rms < -70) {
+      continue;
+    }
 
     const bodyDb = renderedLocalBodyDb(rmsDb, frame, localWindowFrames);
     const peakOverBodyDb = peak - bodyDb;
     const crestDb = peak - rms;
     const strongVisiblePeak = peak >= RENDERED_CONSONANT_ABSOLUTE_PEAK_DB && peakOverBodyDb >= 12;
     const narrowConsonantPeak = peakOverBodyDb >= 17 || crestDb >= 18;
-    const referenceMatch = resolveReferencePeakOverBodyDb(frame);
     let reductionDb = 0;
     if (referenceMetrics) {
+      const renderedEvidenceAuthority = Math.max(
+        smoothUnitRamp(
+          peakOverBodyDb,
+          RENDERED_CONSONANT_RENDERED_CONTRAST_START_DB,
+          RENDERED_CONSONANT_SOURCE_CONTRAST_FULL_DB,
+        ),
+        smoothUnitRamp(
+          crestDb,
+          RENDERED_CONSONANT_RENDERED_CREST_START_DB,
+          RENDERED_CONSONANT_SOURCE_CREST_FULL_DB,
+        ),
+      );
+      // Ordinary voice frames have mathematically zero repair authority and
+      // still avoid the source scan. Above that point authority rises smoothly.
+      if (renderedEvidenceAuthority <= 0) continue;
+      const referenceMatch = resolveReferencePeakOverBodyDb(frame, peakOverBodyDb);
       // A source-relative request never falls through to the source-blind
       // absolute tamer. Ambiguous local matches preserve the rendered frame.
       if (referenceMatch === null) continue;
       // Compare articulation shape instead of absolute level. A naturally strong
       // /s/, /z/, /f/, or similar consonant is preserved when the source already
       // contains it; only contrast added by processing receives a short soft dip.
-      const contrastGrowthDb = peakOverBodyDb - referenceMatch.contrastDb;
-      const sourceRelativeReductionDb = clamp(
-        contrastGrowthDb - RENDERED_CONSONANT_SOURCE_ALLOWED_GROWTH_DB,
-        0,
-        Math.min(requestedMaxReductionDb, referenceMatch.maxReductionDb),
+      const sourceRelativeReductionDb = Math.min(
+        requestedMaxReductionDb,
+        referenceMatch.reductionDb,
       );
-      const hasLocalizedRenderedContrast = peakOverBodyDb >= 12 || crestDb >= 18;
-      if (!hasLocalizedRenderedContrast) continue;
-      reductionDb = sourceRelativeReductionDb;
+      reductionDb = sourceRelativeReductionDb
+        * renderedEvidenceAuthority
+        * sourceRelativeAudibilityAuthority;
       sourceRelativeReductionDbByFrame![frame] = reductionDb;
     } else {
       if (!strongVisiblePeak && !narrowConsonantPeak) continue;
@@ -1840,7 +1882,9 @@ export const tameRenderedConsonantPeaks = (
       );
       reductionDb = clamp(peak - targetPeakDb, 0, requestedMaxReductionDb);
     }
-    if (reductionDb < 0.4) continue;
+    // Preserve continuity at the quiet end of the curve. A minimum audible
+    // cutoff turns a tiny evidence change into a millisecond gain jump.
+    if (reductionDb <= 0) continue;
 
     tamedFrameCount += 1;
     maxReductionDb = Math.max(maxReductionDb, reductionDb);
@@ -1853,16 +1897,50 @@ export const tameRenderedConsonantPeaks = (
     }
   }
 
+  let sourceRelativeOwnerCapDbByFrame = sourceRelativeReductionDbByFrame;
   if (sourceRelativeReductionDbByFrame) {
+    const evidenceSupportedCapDbByFrame = new Float32Array(frameCount);
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      const requestedReductionDb = sourceRelativeReductionDbByFrame[frame];
+      const previousSupportDb = frame > 0
+        ? sourceRelativeReductionDbByFrame[frame - 1]
+        : 0;
+      const nextSupportDb = frame + 1 < frameCount
+        ? sourceRelativeReductionDbByFrame[frame + 1]
+        : 0;
+      // Grow depth continuously with evidence on each side. Geometric support
+      // keeps the relationship symmetric (a weak lane cannot lend a stronger
+      // budget than it owns), avoids the former one-cell -> two-cell 2.5 dB
+      // cliff, while sustained multi-cell evidence can accumulate more depth.
+      const previousEvidenceSupportDb = Math.sqrt(
+        requestedReductionDb * previousSupportDb,
+      );
+      const nextEvidenceSupportDb = Math.sqrt(
+        requestedReductionDb * nextSupportDb,
+      );
+      evidenceSupportedCapDbByFrame[frame] = Math.min(
+        requestedReductionDb,
+        RENDERED_CONSONANT_ISOLATED_OWNER_MAX_REDUCTION_DB
+          + RENDERED_CONSONANT_ADJACENT_SUPPORT_SCALE
+            * (previousEvidenceSupportDb + nextEvidenceSupportDb),
+      );
+    }
+    sourceRelativeOwnerCapDbByFrame = evidenceSupportedCapDbByFrame;
+    tamedFrameCount = 0;
+    maxReductionDb = 0;
     for (let frame = 0; frame < frameCount; frame += 1) {
       // Keep the cosine shoulder from spilling onto an adjacent source-native
-      // consonant. Interpolation between frame centers still gives the target
-      // event a smooth boundary, but a neighboring /s/, /t/, or /z/ whose
-      // source contrast did not grow receives no borrowed attenuation.
+      // consonant. The owner cap also scales continuously with adjacent repair
+      // evidence, so one isolated 2 ms cell cannot become a deep full-band
+      // down-up hole while a real multi-frame event retains useful depth.
       dipDbByFrame[frame] = Math.min(
         dipDbByFrame[frame],
-        sourceRelativeReductionDbByFrame[frame],
+        evidenceSupportedCapDbByFrame[frame],
       );
+      if (dipDbByFrame[frame] > 0) {
+        tamedFrameCount += 1;
+        maxReductionDb = Math.max(maxReductionDb, dipDbByFrame[frame]);
+      }
     }
   }
 
@@ -1889,7 +1967,7 @@ export const tameRenderedConsonantPeaks = (
     const frame1 = Math.max(0, Math.min(frameCount - 1, frame0 + 1));
     const mix = clamp(framePos - frame0, 0, 1);
     let dipDb: number;
-    if (sourceRelativeReductionDbByFrame) {
+    if (sourceRelativeOwnerCapDbByFrame) {
       const centeredDipDb = Math.max(dipDbByFrame[frame0], dipDbByFrame[frame1]);
       // Analysis owns integer samples through rounded absolute frame bounds:
       // [round(f*S), round((f+1)*S)). Use the equivalent closed form here so
@@ -1912,12 +1990,12 @@ export const tameRenderedConsonantPeaks = (
         0,
         1,
       );
-      const ownerCapDb = sourceRelativeReductionDbByFrame[ownerFrame];
+      const ownerCapDb = sourceRelativeOwnerCapDbByFrame[ownerFrame];
       const previousCapDb = ownerFrame > 0
-        ? sourceRelativeReductionDbByFrame[ownerFrame - 1]
+        ? sourceRelativeOwnerCapDbByFrame[ownerFrame - 1]
         : ownerCapDb;
       const nextCapDb = ownerFrame + 1 < frameCount
-        ? sourceRelativeReductionDbByFrame[ownerFrame + 1]
+        ? sourceRelativeOwnerCapDbByFrame[ownerFrame + 1]
         : ownerCapDb;
       let smoothOwnerCapDb = ownerCapDb;
       if (ownerPhase < 0.5 && previousCapDb < ownerCapDb) {
