@@ -35,6 +35,11 @@ import {
   type SpeechRun as PlannerSpeechRun,
 } from "../lib/gainPlanner";
 import {
+  computeSpeechKWeightedEnergyDb,
+  resolvePlannerDeliveryMakeupDb,
+  resolveSourceRelativeFinalTone,
+} from "../lib/plannerDelivery";
+import {
   AUDIBILITY_SAFE_STRATEGY_LABEL,
   PLANNER_TAIL_SAFE_STRATEGY_LABEL,
   applyCandidateMeasurementWindowSummary,
@@ -107,7 +112,6 @@ import {
   shouldRecycleFfmpegBeforeOperation,
 } from "../lib/ffmpegLifecyclePolicy";
 import { resolveGainPlannerOutcome } from "../lib/plannerFallbackPolicy";
-import { resolvePlannerSecondaryMaxGainFactor } from "../lib/plannerSecondaryDynamics";
 import {
   formatLongFormPartTag,
   planLongFormChunks,
@@ -484,6 +488,8 @@ type FileAnalysis = {
   bandSpectrumDb: number[] | null;
   /** Speech-selected spectrum used for spectral decisions and tone matching. */
   speechBandSpectrumDb: number[] | null;
+  /** K-weighted energy averaged only across speech-selected analysis samples. */
+  speechKWeightedEnergyDb: number | null;
   sibilanceScore: number | null;
   noiseFloorDb: number | null;
   pauseNoiseFloorDb: number | null;
@@ -522,6 +528,11 @@ type FileAnalysis = {
   analysisWindowRetryCount: number | null;
   longSparseModeEligible: boolean | null;
 };
+
+type FinalPolishEvidence = Pick<
+  FileAnalysis,
+  "speechBandSpectrumDb" | "speechKWeightedEnergyDb"
+>;
 
 type BatchReference = {
   lowTilt: number;
@@ -648,6 +659,7 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   highRms: null,
   bandSpectrumDb: null,
   speechBandSpectrumDb: null,
+  speechKWeightedEnergyDb: null,
   sibilanceScore: null,
   noiseFloorDb: null,
   pauseNoiseFloorDb: null,
@@ -686,6 +698,62 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   analysisWindowRetryCount: null,
   longSparseModeEligible: null,
 });
+
+const measureFinalPolishEvidenceFromAnalysisSamples = (
+  samples: Float32Array,
+  sampleRate: number,
+): FinalPolishEvidence | null => {
+  if (
+    samples.length === 0 ||
+    sampleRate !== ANALYSIS_SAMPLE_RATE
+  ) {
+    return null;
+  }
+
+  try {
+    const frameDb = frameDbFromFloatSamples(
+      samples,
+      sampleRate,
+      ENVELOPE_FRAME_MS,
+    );
+    if (frameDb.length < 20) return null;
+    const activityNoiseFloorDb = percentile(frameDb, 25) ?? -72;
+    const activityMask = buildSpeechMask(frameDb, activityNoiseFloorDb, {
+      frameMs: ENVELOPE_FRAME_MS,
+    });
+    if (!activityMask.some(Boolean)) return null;
+
+    const speechKWeightedEnergyDb = computeSpeechKWeightedEnergyDb(
+      samples,
+      sampleRate,
+      activityMask,
+      ENVELOPE_FRAME_MS,
+    );
+    let speechBandSpectrumDb: number[] | null = null;
+    try {
+      speechBandSpectrumDb = computeLogBandSpectrumDb(
+        samples,
+        sampleRate,
+        {
+          activityMask,
+          activityFrameMs: ENVELOPE_FRAME_MS,
+        },
+      );
+    } catch {
+      speechBandSpectrumDb = null;
+    }
+
+    if (speechKWeightedEnergyDb === null && speechBandSpectrumDb === null) {
+      return null;
+    }
+    return {
+      speechBandSpectrumDb,
+      speechKWeightedEnergyDb,
+    };
+  } catch {
+    return null;
+  }
+};
 
 export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: boolean }) {
   const ffmpegRef = useRef<FFmpeg | null>(null);
@@ -2252,6 +2320,7 @@ const summarizeFailureReason = (error: unknown) => {
         ...emptyEnvelopeMetrics,
         bandSpectrumDb: null,
         speechBandSpectrumDb: null,
+        speechKWeightedEnergyDb: null,
         sibilanceScore: null,
       };
     }
@@ -2263,6 +2332,7 @@ const summarizeFailureReason = (error: unknown) => {
     // the return type locally.
     let bandSpectrumDb: number[] | null = null;
     let speechBandSpectrumDb: number[] | null = null;
+    let speechKWeightedEnergyDb: number | null = null;
     let eventSibilanceAuthority = 0;
     let sibilanceScore: number | null = null;
     if (samples.length >= ANALYSIS_SAMPLE_RATE) {
@@ -2282,6 +2352,12 @@ const summarizeFailureReason = (error: unknown) => {
           frameMs: ENVELOPE_FRAME_MS,
         });
         if (activityMask.some(Boolean)) {
+          speechKWeightedEnergyDb = computeSpeechKWeightedEnergyDb(
+            samples,
+            ANALYSIS_SAMPLE_RATE,
+            activityMask,
+            ENVELOPE_FRAME_MS,
+          );
           speechBandSpectrumDb = computeLogBandSpectrumDb(samples, ANALYSIS_SAMPLE_RATE, {
             activityMask,
             activityFrameMs: ENVELOPE_FRAME_MS,
@@ -2293,6 +2369,7 @@ const summarizeFailureReason = (error: unknown) => {
         }
       } catch {
         speechBandSpectrumDb = null;
+        speechKWeightedEnergyDb = null;
       }
     }
     const spectralDecisionDb = speechBandSpectrumDb ?? bandSpectrumDb;
@@ -2301,7 +2378,13 @@ const summarizeFailureReason = (error: unknown) => {
       : eventSibilanceAuthority > 0
         ? eventSibilanceAuthority
         : null;
-    return { ...base, bandSpectrumDb, speechBandSpectrumDb, sibilanceScore };
+    return {
+      ...base,
+      bandSpectrumDb,
+      speechBandSpectrumDb,
+      speechKWeightedEnergyDb,
+      sibilanceScore,
+    };
   };
 
   const parseSilencedetectSpans = (text: string, durationSeconds: number | null): SilenceSpan[] => {
@@ -2731,6 +2814,7 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.endEdgeDipDb = envelope.endEdgeDipDb;
       analysis.bandSpectrumDb = envelope.bandSpectrumDb;
       analysis.speechBandSpectrumDb = envelope.speechBandSpectrumDb;
+      analysis.speechKWeightedEnergyDb = envelope.speechKWeightedEnergyDb;
       analysis.sibilanceScore = envelope.sibilanceScore;
     } finally {
       await safeDeleteFile(ffmpeg, analysisName);
@@ -2761,6 +2845,11 @@ const summarizeFailureReason = (error: unknown) => {
     aggregated.lowRms = weightedMetric(windowAnalyses, (a) => a.lowRms, 50);
     aggregated.midRms = weightedMetric(windowAnalyses, (a) => a.midRms, 50);
     aggregated.highRms = weightedMetric(windowAnalyses, (a) => a.highRms, 50);
+    aggregated.speechKWeightedEnergyDb = weightedMetric(
+      windowAnalyses,
+      (analysis) => analysis.speechKWeightedEnergyDb,
+      50,
+    );
     aggregated.noiseFloorDb = weightedMetric(windowAnalyses, (a) => a.noiseFloorDb, 70);
     aggregated.pauseNoiseFloorDb = weightedMetric(windowAnalyses, (a) => a.pauseNoiseFloorDb, 70);
     aggregated.nearSpeechNoiseFloorDb = weightedMetric(windowAnalyses, (a) => a.nearSpeechNoiseFloorDb, 70);
@@ -3787,9 +3876,9 @@ const summarizeFailureReason = (error: unknown) => {
     forceEndingProtection?: boolean;
     /**
      * When true, the input the chain is about to process has already been
-     * leveled by the speech-aware gain planner. That planner remains the main
-     * broadband level owner; any `dynaudnorm` lift is constrained by measured
-     * speech evidence and `acompressor` is relaxed to optional glue duty only.
+     * leveled by the speech-aware gain planner. That planner is the only
+     * broadband level owner; `dynaudnorm` is skipped and `acompressor` is
+     * relaxed to optional glue duty only.
      */
     gainPlannerActive?: boolean;
   };
@@ -3967,35 +4056,7 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(buildBreathSpikeTamerFilter(breathTameStrength));
     }
 
-    if (dyn && gainPlannerActive && !minimalStabilityChain) {
-      // The planner already owns the main gain curve. Retain only a bounded
-      // stability pass, and taper its possible lift continuously when both
-      // speech duty and independent-run evidence are sparse. This prevents an
-      // isolated phrase from being peak-normalized many dB above the planner
-      // target without creating a binary sparse-file processing switch.
-      const dynaSafetyBlend = clamp(
-        (profile?.instabilityScore ?? 0.5) * 0.5 +
-          (profile?.lineSwingScore ?? 0.5) * 0.3 +
-          (profile?.sentenceJumpScore ?? 0.5) * 0.2,
-        0,
-        1,
-      );
-      if (dynaSafetyBlend >= 0.3) {
-        const gateDb = clamp((profile?.speechThresholdDb ?? -44) - 6, -56, -38);
-        const gateAmp = fromDb(gateDb);
-        const safetyF = 161;
-        const safetyG = toOddInt(3 * levelerAdaptationScale, 3, 9);
-        const baseSecondaryMaxGainFactor = toOddInt(5 * levelerAdaptationScale, 3, 11);
-        const secondaryMaxGainFactor = resolvePlannerSecondaryMaxGainFactor({
-          baseMaxGainFactor: baseSecondaryMaxGainFactor,
-          speechDutyCyclePct: profile?.speechDutyCyclePct ?? null,
-          speechSegmentCount: profile?.speechSegmentCount ?? null,
-        });
-        filters.push(
-          `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${secondaryMaxGainFactor.toFixed(3)}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
-        );
-      }
-    } else if (dyn) {
+    if (dyn && !gainPlannerActive) {
       let dynaF: number = dyn.f;
       let dynaG: number = controls.noiseGuard ? Math.max(3, dyn.g - 1) : dyn.g;
       let dynaM: number = controls.noiseGuard ? Math.max(3, dyn.m - 1) : dyn.m;
@@ -4344,7 +4405,7 @@ const summarizeFailureReason = (error: unknown) => {
       ratioAdjust -= 0.08 + pauseNoiseRisk * 0.08;
     }
 
-    // Compressor should not create phrase ramps after dynaudnorm. If onset taming is active,
+    // The compressor must not create phrase ramps after upstream leveling. If onset taming is active,
     // make the downstream compressor less grabby on the first word and let it recover faster.
     const continuityAttackBias =
       lineContinuityRisk * 0.2 +
@@ -4537,34 +4598,12 @@ const summarizeFailureReason = (error: unknown) => {
     };
   };
 
-  const buildFinalPolishProfile = (
-    profile: AdaptiveProfile | null,
-    directives: AudioReviewAdaptiveDirectives,
-  ): AdaptiveProfile | null => {
-    if (!profile) return null;
-
-    const polish = clamp(0.28 + directives.finalPolishIntensity * 0.34, 0.28, 0.62);
-    const toneScale = clamp(0.34 + polish * 0.38, 0.34, 0.58);
-    const deHarshScale = clamp(0.5 + polish * 0.34, 0.5, 0.72);
-
-    return {
-      ...profile,
-      lowMidGainDb: clamp(profile.lowMidGainDb * toneScale, -1.35, 0.65),
-      presenceGainDb: clamp(profile.presenceGainDb * toneScale, -1.05, 0.75),
-      airGainDb: clamp(profile.airGainDb * toneScale, -0.75, 0.55),
-      emotionalHarshnessCutDb: clamp(profile.emotionalHarshnessCutDb * deHarshScale, 0, 1.15),
-      topEndHarshnessCutDb: clamp(profile.topEndHarshnessCutDb * deHarshScale, 0, 0.85),
-      // The primary pass already owns the user's fixed cinematic-color curve.
-      // Repeating it here would turn a finishing pass into cumulative voicing.
-      cinematicColorEnabled: false,
-      toneMatchDeltaDb: profile.toneMatchDeltaDb?.map((value) => clamp(value * toneScale, -0.75, 0.75)) ?? null,
-    };
-  };
-
   const runFinalAppPolishPass = async (
     ffmpeg: FFmpeg,
     targetName: string,
-    profile: AdaptiveProfile | null,
+    sourceAnalysis: FinalPolishEvidence | null,
+    renderedAnalysis: FinalPolishEvidence | null,
+    plannerTargetDb: number | null | undefined,
     context: {
       base: string;
       detail: string;
@@ -4573,28 +4612,40 @@ const summarizeFailureReason = (error: unknown) => {
     },
   ) => {
     let activeFfmpeg = ffmpeg;
-    const directives = getActiveAudioReviewAdaptiveDirectives();
-    const finalPolishProfile = buildFinalPolishProfile(profile, directives);
     const inputBytes = await readVirtualFileBytes(activeFfmpeg, targetName);
     const inputByteLength = assertUsableWavBytes(inputBytes, "App output before final app polish");
     const tempBase = targetName.replace(/\.wav$/i, "");
     const appPassName = `${tempBase}_final_polish_tmp.wav`;
     const sourceSafePolish = context.sourceSafeChain === true || context.candidateVariant === "source-safe";
-    const controls = getActiveAudioReviewControls();
-    const finalPolishFilter = buildFinalPolishFilter(finalPolishProfile, {
-      eqCleanupEnabled: controls.eqCleanup,
-      // The primary pass already applied the user's fixed harshness curve.
-      // This pass uses only the scaled, measured residual tone profile.
-      softenHarshnessEnabled: false,
+    const sourceRelativeTone = sourceSafePolish
+      ? null
+      : resolveSourceRelativeFinalTone(
+          sourceAnalysis?.speechBandSpectrumDb,
+          renderedAnalysis?.speechBandSpectrumDb,
+        );
+    const makeupGainDb = sourceSafePolish
+      ? 0
+      : resolvePlannerDeliveryMakeupDb({
+          plannerTargetDb,
+          speechKWeightedEnergyDb: renderedAnalysis?.speechKWeightedEnergyDb,
+        });
+    const finalPolishFilter = buildFinalPolishFilter(sourceRelativeTone, {
       sourceSafe: sourceSafePolish,
+      makeupGainDb,
     });
 
     try {
       setStatus(`Final app polish: ${context.base}`);
-      setActiveQueueStage(context.base, "Final app polish", `${context.detail}, linear tone pass`);
+      setActiveQueueStage(context.base, "Final app polish", `${context.detail}, static delivery pass`);
       await safeDeleteFile(activeFfmpeg, appPassName);
       appendLog(
-        `[FinalPolish] ${context.base}: app output -> linear tone + delivery limiter (${formatBytes(inputByteLength)}).`,
+        `[FinalPolish] ${context.base}: source-relative 4 kHz ${
+          sourceRelativeTone ? sourceRelativeTone.fourKhzTrimDb.toFixed(2) : "0.00"
+        } dB / 8 kHz ${
+          sourceRelativeTone ? sourceRelativeTone.eightKhzTrimDb.toFixed(2) : "0.00"
+        } dB, static planner makeup +${makeupGainDb.toFixed(
+          2,
+        )} dB, then delivery limiter (${formatBytes(inputByteLength)}).`,
       );
       resetLogBuffer();
       await execOrThrow(
@@ -4748,7 +4799,7 @@ const summarizeFailureReason = (error: unknown) => {
   ) => {
     // When the caller has already produced a planner-leveled version of the
     // input, we use it verbatim and tell the mix chain that broadband leveling
-    // is already done (so any secondary lift is evidence-bounded).
+    // is already done so no second auto-leveler can reshape its microdynamics.
     const chainInput = plannerLeveledInputName ?? inputName;
     const gainPlannerActive = Boolean(plannerLeveledInputName);
     const filterChain = buildMixFilter(profile, {
@@ -6150,12 +6201,23 @@ const summarizeFailureReason = (error: unknown) => {
             skipSpeechSegmentation: true,
           },
         );
-        const chunkPolish = await runFinalAppPolishPass(ffmpeg, mixChunkName, profile, {
-          base: job.base,
-          detail: `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}, final app polish`,
-          candidateVariant,
-        });
+        const chunkPolishFfmpeg = ffmpeg;
+        const chunkPolish = await runFinalAppPolishPass(
+          ffmpeg,
+          mixChunkName,
+          null,
+          null,
+          null,
+          {
+            base: job.base,
+            detail: `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}, final app polish`,
+            candidateVariant,
+          },
+        );
         ffmpeg = chunkPolish.ffmpeg;
+        if (ffmpeg !== chunkPolishFfmpeg) {
+          await writeJobInput(ffmpeg, job);
+        }
         const chunkFlow = chunkPolish.applied ? "app-final-polish" : "app";
         await assertDurationDeltaWithin(ffmpeg, `Long-form mix ${job.base} ${partTag}`, chunk.durationSec, mixChunkName);
         await assertTruePeakWithin(ffmpeg, `Long-form mix ${job.base} ${partTag}`, mixChunkName);
@@ -6281,6 +6343,49 @@ const summarizeFailureReason = (error: unknown) => {
       await ffmpeg.deleteFile(name);
     } catch {
       // Ignore cleanup failures from missing temp files.
+    }
+  };
+
+  const recoverFinalPolishEvidenceFromExactWav = async (
+    ffmpeg: FFmpeg,
+    targetName: string,
+    exactBytes: Uint8Array,
+  ): Promise<FinalPolishEvidence | null> => {
+    const rawName = `${sanitizeBase(targetName)}_final_polish_evidence.f32`;
+    await ffmpeg.writeFile(targetName, cloneBytes(exactBytes));
+    try {
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-filter_threads",
+          "1",
+          "-y",
+          "-i",
+          targetName,
+          "-ac",
+          "1",
+          "-ar",
+          `${ANALYSIS_SAMPLE_RATE}`,
+          "-c:a",
+          "pcm_f32le",
+          "-f",
+          "f32le",
+          rawName,
+        ],
+        "Static delivery evidence decode",
+      );
+      const rawBytes = await readVirtualFileBytes(ffmpeg, rawName);
+      return measureFinalPolishEvidenceFromAnalysisSamples(
+        toFloatSamples(rawBytes),
+        ANALYSIS_SAMPLE_RATE,
+      );
+    } finally {
+      await safeDeleteFile(ffmpeg, rawName);
     }
   };
 
@@ -6449,6 +6554,7 @@ const summarizeFailureReason = (error: unknown) => {
     label: string;
     bytes: Uint8Array;
     analysis: FileAnalysis | null;
+    finalPolishEvidence: FinalPolishEvidence | null;
     meta: CandidateRenderMeta;
     baselineScore: CandidateScore;
     scoredScore: CandidateScore;
@@ -7663,6 +7769,7 @@ const summarizeFailureReason = (error: unknown) => {
           let selectedBytes: Uint8Array | null = null;
           let selectedScore: CandidateScore | null = null;
           let selectedAnalysis: FileAnalysis | null = null;
+          let selectedFinalPolishEvidence: FinalPolishEvidence | null = null;
           let selectedMeta: CandidateRenderMeta | null = null;
           let selectedReason: string | null = null;
           let attemptedCandidates = 0;
@@ -7823,6 +7930,32 @@ const summarizeFailureReason = (error: unknown) => {
                   );
                 }
               }
+              let candidateFinalPolishEvidence: FinalPolishEvidence | null = candidateAnalysis;
+              if (!candidateFinalPolishEvidence && !useBoundedCandidateReviewMemory) {
+                try {
+                  candidateFinalPolishEvidence =
+                    await recoverFinalPolishEvidenceFromExactWav(
+                      ffmpeg,
+                      candidateName,
+                      candidateBytes,
+                    );
+                  if (candidateFinalPolishEvidence) {
+                    appendLog(
+                      `[FinalPolish] ${job.base}/${candidateLabel}: recovered same-domain static delivery evidence from the exact rendered WAV after full QC was unavailable.`,
+                    );
+                  }
+                } catch (error) {
+                  appendLog(
+                    `[FinalPolish] ${job.base}/${candidateLabel}: same-domain evidence recovery unavailable; static delivery adjustments omitted (${describeError(
+                      error,
+                    )}).`,
+                  );
+                  if (shouldResetFfmpegForError(error)) {
+                    ffmpeg = await refreshFfmpeg(`candidate delivery evidence on ${job.base}`);
+                    await writeJobInput(ffmpeg, job);
+                  }
+                }
+              }
               const alignment = useBoundedCandidateReviewMemory
                 ? buildDurationOnlyAlignmentMetrics(
                     fileDurationForVariants,
@@ -7857,6 +7990,7 @@ const summarizeFailureReason = (error: unknown) => {
                 label: candidateLabel,
                 bytes: candidateBytes,
                 analysis: candidateAnalysis,
+                finalPolishEvidence: candidateFinalPolishEvidence,
                 meta: candidateMeta,
                 baselineScore: candidateBaselineScore,
                 scoredScore: candidateScore,
@@ -7883,6 +8017,7 @@ const summarizeFailureReason = (error: unknown) => {
                 selectedBytes = candidateBytes;
                 selectedScore = candidateScore;
                 selectedAnalysis = candidateAnalysis;
+                selectedFinalPolishEvidence = candidateFinalPolishEvidence;
                 selectedMeta = candidateMeta;
                 selectedReason = plannerContext.sourcePreservingFallback
                   ? "source-preserving fallback because the gain planner returned no usable plan; adaptive enhancement not claimed"
@@ -7937,6 +8072,7 @@ const summarizeFailureReason = (error: unknown) => {
                 selectedBytes = fallbackArtifact.bytes;
                 selectedScore = fallbackArtifact.scoredScore;
                 selectedAnalysis = fallbackArtifact.analysis;
+                selectedFinalPolishEvidence = fallbackArtifact.finalPolishEvidence;
                 selectedMeta = fallbackArtifact.meta;
                 selectedReason = "QC-unavailable fallback because rendered audio exists and all candidate QC failed";
                 appendLog(
@@ -8004,13 +8140,24 @@ const summarizeFailureReason = (error: unknown) => {
               `[FinalPolish] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`,
             );
           } else {
-            const polishResult = await runFinalAppPolishPass(ffmpeg, job.mixName, profile, {
-              base: job.base,
-              detail: `File ${i + 1} of ${jobs.length}, final app polish`,
-              candidateVariant: selectedVariant,
-              sourceSafeChain: selectedVariant === "source-safe",
-            });
+            const selectedPolishFfmpeg = ffmpeg;
+            const polishResult = await runFinalAppPolishPass(
+              ffmpeg,
+              job.mixName,
+              fileAnalysis ?? null,
+              selectedFinalPolishEvidence,
+              plannerContext.plan?.targetDb,
+              {
+                base: job.base,
+                detail: `File ${i + 1} of ${jobs.length}, final app polish`,
+                candidateVariant: selectedVariant,
+                sourceSafeChain: selectedVariant === "source-safe",
+              },
+            );
             ffmpeg = polishResult.ffmpeg;
+            if (ffmpeg !== selectedPolishFfmpeg) {
+              await writeJobInput(ffmpeg, job);
+            }
             outputProcessingFlow = polishResult.applied ? "app-final-polish" : "app";
           }
 
@@ -8116,6 +8263,7 @@ const summarizeFailureReason = (error: unknown) => {
               label,
               bytes,
               analysis: renderedAnalysis,
+              finalPolishEvidence: renderedAnalysis,
               meta: renderedMeta,
               baselineScore,
               scoredScore,
@@ -8335,13 +8483,94 @@ const summarizeFailureReason = (error: unknown) => {
                       `[FinalPolish] ${job.base}: skipped corrective final app polish because audibility guard selected a source-safe recovery render.`,
                     );
                   } else {
-                    const correctivePolish = await runFinalAppPolishPass(ffmpeg, correctiveName, correctiveProfile, {
-                      base: job.base,
-                      detail: `File ${i + 1} of ${jobs.length}, corrective final app polish`,
-                      candidateVariant: selectedVariant,
-                      sourceSafeChain: selectedVariant === "source-safe",
-                    });
+                    const correctiveBytesBeforePolish = await readVirtualFileBytes(ffmpeg, correctiveName);
+                    const correctiveMeasurementFfmpeg = ffmpeg;
+                    let correctiveFinalPolishEvidence: FinalPolishEvidence | null = null;
+                    try {
+                      const useBoundedCorrectiveMeasurement = shouldUseBoundedCandidateQc(
+                        candidateQcSafeDurationSeconds,
+                        correctiveBytesBeforePolish.byteLength,
+                        job.file.size,
+                      );
+                      const correctiveAnalysisResult = useBoundedCorrectiveMeasurement
+                        ? await analyzeRenderedPcmWindows(
+                            ffmpeg,
+                            correctiveBytesBeforePolish,
+                            correctiveName,
+                            candidateQcSafeDurationSeconds,
+                            speechRenderPlan?.speechSpans ?? [],
+                            speechRenderPlan?.silenceSpans ?? [],
+                          )
+                        : await analyzeFile(ffmpeg, correctiveName, [job.inputName]);
+                      ffmpeg = correctiveAnalysisResult.ffmpeg;
+                      correctiveFinalPolishEvidence = correctiveAnalysisResult.analysis;
+                      if (ffmpeg !== correctiveMeasurementFfmpeg) {
+                        await writeJobInput(ffmpeg, job);
+                      }
+                    } catch (error) {
+                      appendLog(
+                        `[FinalPolish] ${job.base}: corrective pre-polish measurement unavailable; static delivery adjustments omitted (${describeError(
+                          error,
+                        )}).`,
+                      );
+                      if (shouldResetFfmpegForError(error)) {
+                        ffmpeg = await refreshFfmpeg(`corrective final measurement on ${job.base}`);
+                        await writeJobInput(ffmpeg, job);
+                      } else if (ffmpeg !== correctiveMeasurementFfmpeg) {
+                        await writeJobInput(ffmpeg, job);
+                      }
+                    } finally {
+                      await ffmpeg.writeFile(correctiveName, cloneBytes(correctiveBytesBeforePolish));
+                    }
+                    if (!correctiveFinalPolishEvidence) {
+                      try {
+                        correctiveFinalPolishEvidence =
+                          await recoverFinalPolishEvidenceFromExactWav(
+                            ffmpeg,
+                            correctiveName,
+                            correctiveBytesBeforePolish,
+                          );
+                        if (correctiveFinalPolishEvidence) {
+                          appendLog(
+                            `[FinalPolish] ${job.base}: recovered same-domain corrective static delivery evidence from the exact rendered WAV.`,
+                          );
+                        }
+                      } catch (error) {
+                        appendLog(
+                          `[FinalPolish] ${job.base}: same-domain corrective evidence recovery unavailable; static delivery adjustments omitted (${describeError(
+                            error,
+                          )}).`,
+                        );
+                        if (shouldResetFfmpegForError(error)) {
+                          ffmpeg = await refreshFfmpeg(`corrective delivery evidence on ${job.base}`);
+                          await writeJobInput(ffmpeg, job);
+                        }
+                        correctiveFinalPolishEvidence = null;
+                      } finally {
+                        await ffmpeg.writeFile(
+                          correctiveName,
+                          cloneBytes(correctiveBytesBeforePolish),
+                        );
+                      }
+                    }
+                    const correctivePolishFfmpeg = ffmpeg;
+                    const correctivePolish = await runFinalAppPolishPass(
+                      ffmpeg,
+                      correctiveName,
+                      fileAnalysis ?? null,
+                      correctiveFinalPolishEvidence,
+                      correctivePlannerContext.plan?.targetDb,
+                      {
+                        base: job.base,
+                        detail: `File ${i + 1} of ${jobs.length}, corrective final app polish`,
+                        candidateVariant: selectedVariant,
+                        sourceSafeChain: selectedVariant === "source-safe",
+                      },
+                    );
                     ffmpeg = correctivePolish.ffmpeg;
+                    if (ffmpeg !== correctivePolishFfmpeg) {
+                      await writeJobInput(ffmpeg, job);
+                    }
                   }
                   const correctiveBytes = await readVirtualFileBytes(ffmpeg, correctiveName);
                   const correctiveArtifact = await buildArtifactForRenderedMix(

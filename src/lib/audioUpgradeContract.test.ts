@@ -169,28 +169,96 @@ test("final app polish uses the isolated linear filter instead of rerunning the 
     "const analyzeIntegratedLoudness = async",
   );
 
+  assert.match(finalPolishBlock, /resolveSourceRelativeFinalTone\(/);
+  assert.match(finalPolishBlock, /resolvePlannerDeliveryMakeupDb\(/);
   assert.match(finalPolishBlock, /buildFinalPolishFilter\(/);
   assert.match(finalPolishBlock, /"-af",\s*finalPolishFilter/);
   assert.match(finalPolishBlock, /"Linear final app polish"/);
+  assert.doesNotMatch(finalPolishBlock, /buildFinalPolishProfile/);
+  assert.doesNotMatch(finalPolishBlock, /getActiveAudioReviewAdaptiveDirectives/);
   assert.doesNotMatch(finalPolishBlock, /runMixReady\(/);
 });
 
-test("planner-active secondary dynamics use continuous speech evidence instead of a fixed large lift", () => {
+test("planner delivery uses the existing speech mask and the selected pre-polish measurement", () => {
+  const envelopeBlock = sourceBetween(
+    "const computeEnvelopeMetrics = (samples: Float32Array)",
+    "const parseSilencedetectSpans =",
+  );
+  const exactEvidenceRecoveryBlock = sourceBetween(
+    "const recoverFinalPolishEvidenceFromExactWav = async (",
+    "const runCrossfadeConcat = async (",
+  );
+  const aggregationBlock = sourceBetween(
+    "const aggregateWindowAnalyses = (",
+    "type AnalysisOptions =",
+  );
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assertMarkersInOrder(envelopeBlock, [
+    "const activityMask = buildSpeechMask(",
+    "speechKWeightedEnergyDb = computeSpeechKWeightedEnergyDb(",
+    "activityMask,",
+    "speechBandSpectrumDb = computeLogBandSpectrumDb(",
+  ]);
+  assert.match(
+    aggregationBlock,
+    /aggregated\.speechKWeightedEnergyDb = weightedMetric\([\s\S]*?speechKWeightedEnergyDb[\s\S]*?50/,
+  );
+  assert.match(
+    processFilesBlock,
+    /runFinalAppPolishPass\([\s\S]*?fileAnalysis \?\? null,[\s\S]*?selectedFinalPolishEvidence,[\s\S]*?plannerContext\.plan\?\.targetDb/,
+    "the selected candidate's measured post-chain speech level must drive only one static delivery gain",
+  );
+  assert.match(
+    processFilesBlock,
+    /candidateFinalPolishEvidence\s*=\s*await recoverFinalPolishEvidenceFromExactWav\([\s\S]*?candidateName,[\s\S]*?candidateBytes/,
+    "a full-QC worker failure must recover delivery evidence from the exact rendered WAV",
+  );
+  assert.match(
+    processFilesBlock,
+    /correctiveFinalPolishEvidence\s*=\s*await recoverFinalPolishEvidenceFromExactWav\([\s\S]*?correctiveName,[\s\S]*?correctiveBytesBeforePolish/,
+  );
+  assert.match(exactEvidenceRecoveryBlock, /await ffmpeg\.writeFile\(targetName, cloneBytes\(exactBytes\)\)/);
+  assert.match(
+    exactEvidenceRecoveryBlock,
+    /"-ar",\s*`\$\{ANALYSIS_SAMPLE_RATE\}`/,
+    "fallback evidence must be decoded into the same 16 kHz domain as planner/source analysis",
+  );
+  assert.match(
+    exactEvidenceRecoveryBlock,
+    /measureFinalPolishEvidenceFromAnalysisSamples\(\s*toFloatSamples\(rawBytes\),\s*ANALYSIS_SAMPLE_RATE/,
+  );
+  assert.doesNotMatch(
+    voLevelerSource,
+    /measureFinalPolishEvidenceFromDecodedMono/,
+    "native-rate alignment decodes must never drive 16 kHz planner delivery decisions",
+  );
+});
+
+test("speech-aware gain planner owns leveling without a post-planner dynaudnorm stage", () => {
   const mixFilterBlock = sourceBetween(
     "const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions)",
     "const runMixReady = async",
   );
+  const dynamicsStageBlock = textBetween(
+    mixFilterBlock,
+    "    if (dyn",
+    "    const continuityBreathProtect =",
+  );
 
   assert.match(
-    mixFilterBlock,
-    /const baseSecondaryMaxGainFactor = toOddInt\(5 \* levelerAdaptationScale, 3, 11\)/,
+    dynamicsStageBlock,
+    /if \(dyn && !gainPlannerActive\) \{/,
+    "legacy dynaudnorm must be explicitly gated to renders the gain planner does not own",
   );
-  assert.match(mixFilterBlock, /resolvePlannerSecondaryMaxGainFactor\(\{/);
-  assert.match(mixFilterBlock, /baseMaxGainFactor: baseSecondaryMaxGainFactor/);
-  assert.match(mixFilterBlock, /speechDutyCyclePct: profile\?\.speechDutyCyclePct \?\? null/);
-  assert.match(mixFilterBlock, /speechSegmentCount: profile\?\.speechSegmentCount \?\? null/);
-  assert.match(mixFilterBlock, /m=\$\{secondaryMaxGainFactor\.toFixed\(3\)\}/);
-  assert.doesNotMatch(mixFilterBlock, /baseMaxGainFactor:\s*5[,}]/);
+  assert.equal(
+    dynamicsStageBlock.match(/filters\.push\(\s*`dynaudnorm=/g)?.length ?? 0,
+    1,
+    "buildMixFilter may retain one legacy/fallback dynaudnorm, but must not add a second planner-active stage",
+  );
 });
 
 test("speech-only spectrum and continuous event evidence drive de-essing without changing the QC speech mask", () => {

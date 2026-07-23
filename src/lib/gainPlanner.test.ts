@@ -9,6 +9,7 @@ import {
   emitSendcmdScript,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
+  relaxNarrowConsonantOwnerCaps,
   resolvePlannerCalibration,
   speechRunsFromMask,
   tameRenderedConsonantPeaks,
@@ -1325,6 +1326,114 @@ const maxSampleReductionDb = (
   return { maxReductionDb, nonzeroSampleCount, samplesOverWeakCap };
 };
 
+describe("narrow source-relative consonant owner-cap relaxation", () => {
+  it("continuously relaxes isolated and two-cell caps with a five-tap triangular kernel", () => {
+    const isolated = relaxNarrowConsonantOwnerCaps(
+      Float32Array.from([0, 0, 0.6, 0, 0]),
+    );
+    const adjacentPair = relaxNarrowConsonantOwnerCaps(
+      Float32Array.from([0, 0, 0.6, 0.6, 0, 0]),
+    );
+    assert.ok(
+      Math.abs(isolated[2] - 0.6 * ((3 / 9) ** 4)) < 1e-6,
+      `isolated owner should retain only its triangular self-support, got ${isolated[2].toFixed(6)} dB`,
+    );
+    assert.ok(
+      Math.abs(adjacentPair[2] - 0.6 * ((5 / 9) ** 4)) < 1e-6,
+      `first paired owner should blend self and adjacent support, got ${adjacentPair[2].toFixed(6)} dB`,
+    );
+    assert.ok(
+      Math.abs(adjacentPair[3] - 0.6 * ((5 / 9) ** 4)) < 1e-6,
+      `second paired owner should blend self and adjacent support, got ${adjacentPair[3].toFixed(6)} dB`,
+    );
+  });
+
+  it("keeps native owners at zero and never grants more attenuation than an original owner cap", () => {
+    const original = Float32Array.from([
+      0,
+      0.6,
+      2.5,
+      0,
+      1.2,
+      0.35,
+      0,
+      2,
+      0,
+    ]);
+    const relaxed = relaxNarrowConsonantOwnerCaps(original);
+
+    assert.equal(relaxed.length, original.length);
+    for (let frame = 0; frame < original.length; frame += 1) {
+      if (original[frame] === 0) {
+        assert.equal(
+          relaxed[frame],
+          0,
+          `native owner ${frame} must remain exactly zero instead of borrowing neighboring authority`,
+        );
+      }
+      assert.ok(
+        relaxed[frame] <= original[frame] + 1e-7,
+        `owner ${frame} deepened from ${original[frame].toFixed(6)} to ${relaxed[frame].toFixed(6)} dB`,
+      );
+      assert.ok(
+        relaxed[frame] >= 0,
+        `owner ${frame} produced an invalid negative attenuation cap`,
+      );
+    }
+  });
+
+  it("relaxes the measured four-cell regression cluster without widening it", () => {
+    const original = Float32Array.from([
+      0,
+      0,
+      0.121,
+      1.407,
+      1.201,
+      0.037,
+      0,
+      0,
+    ]);
+    const relaxed = relaxNarrowConsonantOwnerCaps(original, original);
+
+    assert.ok(
+      Math.abs(relaxed[3] - 0.124179) < 1e-6,
+      `first strong 2 ms owner should relax to the measured safe cap, got ${relaxed[3].toFixed(6)} dB`,
+    );
+    assert.ok(
+      Math.abs(relaxed[4] - 0.168164) < 1e-6,
+      `second strong 2 ms owner should relax to the measured safe cap, got ${relaxed[4].toFixed(6)} dB`,
+    );
+    assert.deepEqual(
+      Array.from(relaxed, (value, frame) => original[frame] === 0 ? value : 0),
+      Array.from(original, () => 0),
+      "the regression repair must not widen attenuation into unsupported owners",
+    );
+  });
+
+  it("retains the interior depth of a sustained five-cell event", () => {
+    const relaxed = relaxNarrowConsonantOwnerCaps(
+      Float32Array.from([0, 0, 2.5, 2.5, 2.5, 2.5, 2.5, 0, 0]),
+    );
+
+    assert.ok(
+      Math.abs(relaxed[4] - 2.5) < 1e-6,
+      `five supported owners should retain full interior depth, got ${relaxed[4].toFixed(6)} dB`,
+    );
+    assert.ok(
+      relaxed[2] <= relaxed[3] && relaxed[3] < relaxed[4],
+      `event edges should ease continuously into the retained interior: ${Array.from(relaxed)
+        .map((value) => value.toFixed(3))
+        .join(", ")}`,
+    );
+    assert.ok(
+      relaxed[4] > relaxed[5] && relaxed[5] >= relaxed[6],
+      `event edges should ease continuously out of the retained interior: ${Array.from(relaxed)
+        .map((value) => value.toFixed(3))
+        .join(", ")}`,
+    );
+  });
+});
+
 describe("full-rate rendered consonant peak tamer", () => {
   it("tames narrow full-rate consonant peaks without changing the surrounding voice body", () => {
     const sampleRate = 48000;
@@ -1512,7 +1621,7 @@ describe("full-rate rendered consonant peak tamer", () => {
 
     assert.equal(fullBandResult.stats.referenceUsed, true);
     assert.ok(
-      fullBandReductionDb >= 0.4 && fullBandReductionDb <= 1.25,
+      fullBandReductionDb >= 0.1 && fullBandReductionDb <= 1.25,
       `full-band weak evidence should authorize only subtle repair, got ${fullBandReductionDb.toFixed(3)} dB`,
     );
     assert.ok(
@@ -1570,8 +1679,8 @@ describe("full-rate rendered consonant peak tamer", () => {
     );
     assert.ok(weak.maxReductionDb <= 1.251, `weak owner reached ${weak.maxReductionDb.toFixed(6)} dB`);
     assert.ok(
-      strong.maxReductionDb > 1.25 && strong.maxReductionDb <= 2.501,
-      `strong owner should retain its bounded lane, got ${strong.maxReductionDb.toFixed(6)} dB`,
+      strong.maxReductionDb > 0.05 && strong.maxReductionDb <= 1.251,
+      `a two-frame strong owner should retain only subtle repair, got ${strong.maxReductionDb.toFixed(6)} dB`,
     );
     assert.ok(native.maxReductionDb <= 0.001, `native owner borrowed ${native.maxReductionDb.toFixed(6)} dB`);
   });
@@ -1602,9 +1711,9 @@ describe("full-rate rendered consonant peak tamer", () => {
     );
 
     assert.equal(result.stats.referenceUsed, true);
-    assert.ok(target.maxReductionDb >= 0.4, `isolated processing growth still needs subtle repair, got ${target.maxReductionDb.toFixed(3)} dB`);
+    assert.ok(target.maxReductionDb > 0.005, `isolated processing growth still needs subtle nonzero repair, got ${target.maxReductionDb.toFixed(3)} dB`);
     assert.ok(
-      target.maxReductionDb <= 0.75,
+      target.maxReductionDb <= 0.15,
       `one isolated 2 ms owner must not create a deep broadband hole, got ${target.maxReductionDb.toFixed(3)} dB`,
     );
     assert.deepEqual(
@@ -1646,7 +1755,7 @@ describe("full-rate rendered consonant peak tamer", () => {
 
     assert.equal(result.stats.referenceUsed, true);
     assert.ok(
-      pair.maxReductionDb >= 0.8,
+      pair.maxReductionDb >= 0.1,
       `two adjacent processing-grown owners should retain useful subtle repair, got ${pair.maxReductionDb.toFixed(3)} dB`,
     );
     assert.ok(
@@ -1716,11 +1825,11 @@ describe("full-rate rendered consonant peak tamer", () => {
 
     assert.equal(result.stats.referenceUsed, true);
     assert.ok(
-      evidenceReductionDb.every((reductionDb) => reductionDb >= 0.4 && reductionDb <= 0.75),
+      evidenceReductionDb.every((reductionDb) => reductionDb >= 0.04 && reductionDb <= 0.25),
       `multi-frame event must retain useful repair, got ${evidenceReductionDb.map((value) => value.toFixed(3)).join(", ")}`,
     );
     assert.ok(
-      bridgedReductionDb.every((reductionDb) => reductionDb >= 0.12 && reductionDb <= 0.25),
+      bridgedReductionDb.every((reductionDb) => reductionDb >= 0.005 && reductionDb <= 0.1),
       `one-frame event holes must receive a soft bridge, got ${bridgedReductionDb.map((value) => value.toFixed(3)).join(", ")}`,
     );
     for (const [gapIndex, bridgedDb] of bridgedReductionDb.entries()) {
@@ -2004,7 +2113,7 @@ describe("full-rate rendered consonant peak tamer", () => {
     assert.equal(weakFrameStart, 4498);
     assert.equal(weak.samplesOverWeakCap, 0);
     assert.ok(weak.maxReductionDb <= 1.251, `weak measured owner reached ${weak.maxReductionDb.toFixed(9)} dB`);
-    assert.ok(strong.maxReductionDb > 1.25 && strong.maxReductionDb <= 2.501);
+    assert.ok(strong.maxReductionDb > 0.05 && strong.maxReductionDb <= 1.251);
   });
 
   it("does not let a rounded 44.1 kHz native frame borrow from its strong predecessor", () => {
@@ -2383,7 +2492,7 @@ describe("full-rate rendered consonant peak tamer", () => {
         `${gapMs} ms source-native event must stay effectively untouched, got ${nativeReductionDb.toFixed(3)} dB`,
       );
       assert.ok(
-        grownReductionDb >= 0.4,
+        grownReductionDb >= 0.2,
         `${gapMs} ms processing-grown event should receive a subtle repair, got ${grownReductionDb.toFixed(3)} dB`,
       );
       assert.ok(

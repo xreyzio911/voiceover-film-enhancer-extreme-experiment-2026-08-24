@@ -3,18 +3,13 @@ import test from "node:test";
 import {
   FINAL_POLISH_LIMITER_FILTER,
   buildFinalPolishFilter,
-  type FinalPolishProfile,
 } from "./finalPolishFilter.ts";
 
-const activeProfile: FinalPolishProfile = {
-  lowMidGainDb: -1.2,
-  presenceGainDb: 0.4,
-  airGainDb: 0.2,
-  emotionalHarshnessCutDb: 0.3,
-  topEndHarshnessCutDb: 0.5,
-  toneMatchDeltaDb: [0.8, -0.7, 0.1, 0, -0.6, 0.5, 0, -0.9],
-  cinematicColorEnabled: true,
-  emotionProtection: 0.2,
+const activeTone = {
+  fourKhzExcessDb: 2.4,
+  eightKhzExcessDb: 3.2,
+  fourKhzTrimDb: -0.62,
+  eightKhzTrimDb: -0.78,
 };
 
 const assertLinearDeliveryChain = (filter: string) => {
@@ -26,8 +21,13 @@ const assertLinearDeliveryChain = (filter: string) => {
   );
   assert.equal(stages.at(-1), FINAL_POLISH_LIMITER_FILTER, "the delivery limiter must remain last");
   assert.ok(
-    stages.every((stage) => stage.startsWith("equalizer=") || stage === FINAL_POLISH_LIMITER_FILTER),
-    `final polish must stay static-EQ-only before the limiter: ${filter}`,
+    stages.every(
+      (stage) =>
+        stage.startsWith("equalizer=") ||
+        stage.startsWith("volume=") ||
+        stage === FINAL_POLISH_LIMITER_FILTER,
+    ),
+    `final polish must stay static-EQ/static-gain-only before the limiter: ${filter}`,
   );
 
   for (const prohibited of [
@@ -49,71 +49,44 @@ const assertLinearDeliveryChain = (filter: string) => {
 test("null and source-safe final polish are limiter-only", () => {
   assert.equal(
     buildFinalPolishFilter(null, {
-      eqCleanupEnabled: true,
-      softenHarshnessEnabled: true,
       sourceSafe: false,
+      makeupGainDb: 0,
     }),
     FINAL_POLISH_LIMITER_FILTER,
   );
   assert.equal(
-    buildFinalPolishFilter(activeProfile, {
-      eqCleanupEnabled: true,
-      softenHarshnessEnabled: true,
+    buildFinalPolishFilter(activeTone, {
       sourceSafe: true,
+      makeupGainDb: 9,
     }),
     FINAL_POLISH_LIMITER_FILTER,
   );
 });
 
-test("final polish emits bounded static tone EQ and one delivery limiter", () => {
-  const filter = buildFinalPolishFilter(activeProfile, {
-    eqCleanupEnabled: true,
-    softenHarshnessEnabled: true,
+test("final polish emits only measured source-relative trims, static makeup, and one limiter", () => {
+  const filter = buildFinalPolishFilter(activeTone, {
     sourceSafe: false,
+    makeupGainDb: 7.45,
   });
 
   assertLinearDeliveryChain(filter);
-  assert.match(filter, /equalizer=f=250:width_type=q:width=1\.0:g=-1\.20/);
-  assert.match(filter, /equalizer=f=3500:width_type=q:width=1\.15:g=-1\.90/);
-  assert.match(filter, /equalizer=f=8000:width_type=q:width=0\.75:g=-1\.40/);
-  assert.match(filter, /equalizer=f=11200:width_type=q:width=0\.7:g=-0\.63/);
-
-  // Only the three largest eligible tone deltas are retained.
-  assert.match(filter, /equalizer=f=8000:width_type=q:width=0\.9:g=-0\.90/);
-  assert.match(filter, /equalizer=f=60:width_type=q:width=0\.9:g=0\.80/);
-  assert.match(filter, /equalizer=f=120:width_type=q:width=0\.9:g=-0\.70/);
-  assert.doesNotMatch(filter, /equalizer=f=1000:width_type=q:width=1\.1:g=-0\.60/);
-
-  assert.match(filter, /equalizer=f=180:width_type=q:width=1\.1:g=0\.8/);
-  assert.match(filter, /equalizer=f=4500:width_type=q:width=1\.2:g=0\.6/);
-  assert.match(filter, /equalizer=f=10000:width_type=q:width=0\.7:g=-0\.5/);
+  assert.match(filter, /equalizer=f=4000:width_type=q:width=1\.0:g=-0\.62/);
+  assert.match(filter, /equalizer=f=8000:width_type=q:width=0\.9:g=-0\.78/);
+  assert.match(filter, /volume=7\.450dB/);
 });
 
-test("final polish respects optional cleanup and emotion-preserving color policy", () => {
-  const filter = buildFinalPolishFilter(
-    {
-      ...activeProfile,
-      presenceGainDb: 9,
-      airGainDb: -9,
-      emotionalHarshnessCutDb: 0,
-      topEndHarshnessCutDb: 0,
-      toneMatchDeltaDb: [9, -9, 0, 0, 0, 0, 0, 0],
-      emotionProtection: 0.5,
-    },
-    {
-      eqCleanupEnabled: false,
-      softenHarshnessEnabled: false,
-      sourceSafe: false,
-    },
-  );
+test("final polish cannot replay the primary tone profile or add dynamics", () => {
+  const filter = buildFinalPolishFilter(activeTone, {
+    sourceSafe: false,
+    makeupGainDb: 99,
+  });
 
   assertLinearDeliveryChain(filter);
   assert.doesNotMatch(filter, /equalizer=f=250:/);
-  assert.match(filter, /equalizer=f=3500:width_type=q:width=1\.15:g=0\.70/);
-  assert.match(filter, /equalizer=f=8000:width_type=q:width=0\.75:g=-2\.70/);
-  assert.match(filter, /equalizer=f=60:width_type=q:width=0\.9:g=3\.00/);
-  assert.match(filter, /equalizer=f=120:width_type=q:width=0\.9:g=-3\.00/);
+  assert.doesNotMatch(filter, /equalizer=f=3500:/);
+  assert.doesNotMatch(filter, /equalizer=f=11200:/);
   assert.doesNotMatch(filter, /equalizer=f=180:/);
   assert.doesNotMatch(filter, /equalizer=f=4500:/);
   assert.doesNotMatch(filter, /equalizer=f=10000:/);
+  assert.match(filter, /volume=10\.500dB/);
 });

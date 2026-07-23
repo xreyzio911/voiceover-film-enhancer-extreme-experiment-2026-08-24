@@ -218,6 +218,81 @@ const K_WEIGHT_STAGE1_GAIN_DB = 4;
 const K_WEIGHT_STAGE2_HIGH_PASS_HZ = 38.13547087602444;
 const K_WEIGHT_STAGE2_Q = 0.5;
 
+/**
+ * Relax millisecond-scale attenuation caps without widening their ownership.
+ *
+ * The fixed triangular average keeps a five-frame consonant plateau intact,
+ * but continuously reduces isolated or very short cap peaks. Raising the
+ * normalized temporal support to the fourth power is the minimum measured
+ * curve that removes the audible down-up shape from one- and two-frame
+ * plateaus while retaining the center of sustained events. Taking the minimum
+ * with the original cap makes this strictly non-additive: a native
+ * zero-authority frame stays exactly zero and no frame can receive more
+ * attenuation than its source-relative evidence already authorized.
+ *
+ * The first and last two file frames are preserved because they have no
+ * symmetric context. Chunked delivery supplies overlap context, so this
+ * exception applies only to the true file edges.
+ */
+export const relaxNarrowConsonantOwnerCaps = (
+  ownerCapsDb: Float32Array,
+  requestedReductionDbByFrame?: Float32Array,
+): Float32Array => {
+  const relaxedCapsDb = new Float32Array(ownerCapsDb);
+  if (ownerCapsDb.length < 5) return relaxedCapsDb;
+  const evidenceDbByFrame =
+    requestedReductionDbByFrame?.length === ownerCapsDb.length
+      ? requestedReductionDbByFrame
+      : ownerCapsDb;
+
+  const weights = [1, 2, 3, 2, 1] as const;
+  const weightSum = 9;
+  for (let frame = 2; frame + 2 < ownerCapsDb.length; frame += 1) {
+    const originalCapDb = ownerCapsDb[frame];
+    if (!(originalCapDb > 0) || !Number.isFinite(originalCapDb)) {
+      relaxedCapsDb[frame] = 0;
+      continue;
+    }
+    let weightedCapDb = 0;
+    for (let offset = -2; offset <= 2; offset += 1) {
+      const neighborCapDb = ownerCapsDb[frame + offset];
+      if (Number.isFinite(neighborCapDb) && neighborCapDb > 0) {
+        weightedCapDb += neighborCapDb * weights[offset + 2];
+      }
+    }
+    const temporalSupportRatio = clamp(
+      weightedCapDb / (weightSum * originalCapDb),
+      0,
+      1,
+    );
+    const durationSupportedCapDb =
+      originalCapDb * (temporalSupportRatio ** 4);
+    relaxedCapsDb[frame] = Math.min(
+      originalCapDb,
+      durationSupportedCapDb,
+    );
+  }
+
+  const bridgeReconciledCapsDb = new Float32Array(relaxedCapsDb);
+  for (let frame = 1; frame + 1 < ownerCapsDb.length; frame += 1) {
+    if (
+      (evidenceDbByFrame[frame] ?? 0) > 0
+      || (evidenceDbByFrame[frame - 1] ?? 0) <= 0
+      || (evidenceDbByFrame[frame + 1] ?? 0) <= 0
+    ) {
+      continue;
+    }
+    bridgeReconciledCapsDb[frame] = Math.min(
+      relaxedCapsDb[frame],
+      Math.min(
+        relaxedCapsDb[frame - 1],
+        relaxedCapsDb[frame + 1],
+      ) * RENDERED_CONSONANT_ADJACENT_SUPPORT_SCALE,
+    );
+  }
+  return bridgeReconciledCapsDb;
+};
+
 type BiquadCoefficients = {
   b0: number;
   b1: number;
@@ -1897,7 +1972,8 @@ export const tameRenderedConsonantPeaks = (
     }
   }
 
-  let sourceRelativeOwnerCapDbByFrame = sourceRelativeReductionDbByFrame;
+  let sourceRelativeOwnerCapDbByFrame: Float32Array | null =
+    sourceRelativeReductionDbByFrame;
   if (sourceRelativeReductionDbByFrame) {
     const evidenceSupportedCapDbByFrame = new Float32Array(frameCount);
     for (let frame = 0; frame < frameCount; frame += 1) {
@@ -1961,17 +2037,22 @@ export const tameRenderedConsonantPeaks = (
         evidenceSupportedCapDbByFrame[frame]
         + missingBridgeCapDb * missingAuthority;
     }
-    sourceRelativeOwnerCapDbByFrame = eventContiguousCapDbByFrame;
+    const continuityRelaxedCapDbByFrame =
+      relaxNarrowConsonantOwnerCaps(
+        eventContiguousCapDbByFrame,
+        sourceRelativeReductionDbByFrame,
+      );
+    sourceRelativeOwnerCapDbByFrame = continuityRelaxedCapDbByFrame;
     tamedFrameCount = 0;
     maxReductionDb = 0;
     for (let frame = 0; frame < frameCount; frame += 1) {
       // Keep the cosine shoulder from spilling onto an adjacent source-native
-      // consonant. The owner cap also scales continuously with adjacent repair
-      // evidence, so one isolated 2 ms cell cannot become a deep full-band
-      // down-up hole while a real multi-frame event retains useful depth.
+      // consonant. The relaxed owner cap can only remove narrow attenuation;
+      // unsupported frames stay at zero and sustained evidence keeps its
+      // interior depth.
       dipDbByFrame[frame] = Math.min(
         dipDbByFrame[frame],
-        eventContiguousCapDbByFrame[frame],
+        continuityRelaxedCapDbByFrame[frame],
       );
       if (dipDbByFrame[frame] > 0) {
         tamedFrameCount += 1;
