@@ -7,6 +7,7 @@ import {
   buildRenderedConsonantReference,
   computeFricativeFrameDb,
   emitSendcmdScript,
+  limitEmbeddedPerformancePositiveGainAuthority,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
   relaxNarrowBodySpeechGainValleys,
@@ -91,6 +92,20 @@ const makeTone = (frequencyHz: number, gain: number, seconds = 2) => {
   return samples;
 };
 
+const buildEditedBedCalibrationFixture = (bedDb = -52) => {
+  const frameDb = new Array<number>(1000).fill(-120);
+  for (let frame = 500; frame < frameDb.length; frame += 1) frameDb[frame] = bedDb;
+  for (const [startFrame, endFrame] of [
+    [550, 575],
+    [675, 700],
+    [800, 825],
+    [925, 950],
+  ] as const) {
+    for (let frame = startFrame; frame < endFrame; frame += 1) frameDb[frame] = -28;
+  }
+  return frameDb;
+};
+
 describe("fricative-band envelope", () => {
   it("responds to consonant-band energy without mistaking low formants for fricatives", () => {
     const totalSamples = SAMPLE_RATE;
@@ -115,6 +130,111 @@ describe("fricative-band envelope", () => {
 });
 
 describe("gainPlanner", () => {
+  it("learns a clip-attached recording bed despite edited digital silence", () => {
+    const frameDb = buildEditedBedCalibrationFixture();
+    const originalFrameDb = [...frameDb];
+
+    const calibration = resolvePlannerCalibration(frameDb, -110, -58);
+    const runs = speechRunsFromMask(
+      buildSpeechMask(frameDb, calibration.noiseFloorDb, { frameMs: FRAME_MS }),
+    );
+
+    assert.deepEqual(frameDb, originalFrameDb, "calibration must not mutate the decoded envelope");
+    assert.ok(
+      calibration.noiseFloorDb >= -59 && calibration.noiseFloorDb <= -54,
+      `recording bed should move the planner floor near -56 dB, got ${calibration.noiseFloorDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      calibration.speechThresholdDb >= -46 && calibration.speechThresholdDb <= -42,
+      `speech threshold should sit above the -52 dB bed, got ${calibration.speechThresholdDb.toFixed(2)} dB`,
+    );
+    assert.equal(runs.length, 4, "the recorded bed must not become one continuous body-speech run");
+    for (const run of runs) {
+      assert.ok(run.endFrame - run.startFrame < 60, `speech burst grew into recorded bed: ${JSON.stringify(run)}`);
+    }
+  });
+
+  it("keeps a permissive floor for sparse clean quiet speech amid digital silence", () => {
+    const frameDb = new Array<number>(1000).fill(-120);
+    for (const [startFrame, endFrame] of [
+      [100, 145],
+      [420, 475],
+      [760, 810],
+    ] as const) {
+      for (let frame = startFrame; frame < endFrame; frame += 1) frameDb[frame] = -48;
+    }
+
+    const calibration = resolvePlannerCalibration(frameDb, -110, -58);
+    const runs = speechRunsFromMask(
+      buildSpeechMask(frameDb, calibration.noiseFloorDb, { frameMs: FRAME_MS }),
+    );
+
+    assert.ok(
+      calibration.noiseFloorDb <= -100,
+      `sparse clean words must not be reinterpreted as a noise bed, got ${calibration.noiseFloorDb.toFixed(2)} dB`,
+    );
+    assert.equal(calibration.speechThresholdDb, -58);
+    assert.equal(runs.length, 3, "all quiet clean words should remain detectable");
+  });
+
+  it("does not relabel a recurring quiet-dialogue mode as a persistent recording bed", () => {
+    const frameDb = new Array<number>(1000).fill(-120);
+    const quietWordFrames: number[] = [];
+    for (let cycleStart = 0; cycleStart < frameDb.length; cycleStart += 100) {
+      for (let frame = cycleStart + 50; frame < cycleStart + 75; frame += 1) {
+        frameDb[frame] = -48;
+        quietWordFrames.push(frame);
+      }
+      for (let frame = cycleStart + 75; frame < cycleStart + 100; frame += 1) {
+        frameDb[frame] = -28;
+      }
+    }
+
+    const calibration = resolvePlannerCalibration(frameDb, -110, -58);
+    const mask = buildSpeechMask(frameDb, calibration.noiseFloorDb, { frameMs: FRAME_MS });
+
+    assert.ok(
+      calibration.noiseFloorDb <= -78,
+      `intermittent quiet dialogue must keep a permissive planner floor, got ${calibration.noiseFloorDb.toFixed(2)} dB`,
+    );
+    assert.equal(calibration.speechThresholdDb, -58);
+    const retainedQuietFrameRatio =
+      quietWordFrames.filter((frame) => mask[frame]).length / quietWordFrames.length;
+    assert.ok(
+      retainedQuietFrameRatio >= 0.85,
+      `quiet-dialogue words should remain detected apart from normal mask edge confirmation, retained ${(retainedQuietFrameRatio * 100).toFixed(1)}%`,
+    );
+    for (let cycleStart = 0; cycleStart < frameDb.length; cycleStart += 100) {
+      assert.ok(
+        mask.slice(cycleStart + 50, cycleStart + 75).some(Boolean),
+        `quiet word at frame ${cycleStart + 50} disappeared`,
+      );
+    }
+  });
+
+  it("moves calibration continuously for a 0.01 dB recording-bed change", () => {
+    const lowerBed = buildEditedBedCalibrationFixture(-52);
+    const higherBed = buildEditedBedCalibrationFixture(-51.99);
+    const lowerSnapshot = [...lowerBed];
+    const higherSnapshot = [...higherBed];
+
+    const lower = resolvePlannerCalibration(lowerBed, -110, -58);
+    const higher = resolvePlannerCalibration(higherBed, -110, -58);
+
+    assert.deepEqual(lowerBed, lowerSnapshot);
+    assert.deepEqual(higherBed, higherSnapshot);
+    assert.ok(
+      higher.noiseFloorDb > lower.noiseFloorDb &&
+        higher.noiseFloorDb - lower.noiseFloorDb < 0.03,
+      `0.01 dB evidence change should make a small monotonic floor change, got ${lower.noiseFloorDb.toFixed(5)} -> ${higher.noiseFloorDb.toFixed(5)}`,
+    );
+    assert.ok(
+      higher.speechThresholdDb > lower.speechThresholdDb &&
+        higher.speechThresholdDb - lower.speechThresholdDb < 0.03,
+      `0.01 dB evidence change should make a small monotonic threshold change, got ${lower.speechThresholdDb.toFixed(5)} -> ${higher.speechThresholdDb.toFixed(5)}`,
+    );
+  });
+
   it("caps hot adaptive noise floors against the decoded planner envelope", () => {
     const frameDb = new Array<number>(1000).fill(-120);
     for (let frame = 100; frame < 220; frame += 1) frameDb[frame] = -29;
@@ -125,7 +245,7 @@ describe("gainPlanner", () => {
     const hotMaskRuns = speechRunsFromMask(buildSpeechMask(frameDb, -32.9, { frameMs: FRAME_MS }));
     const plannerMaskRuns = speechRunsFromMask(buildSpeechMask(frameDb, calibration.noiseFloorDb, { frameMs: FRAME_MS }));
 
-    assert.ok(calibration.noiseFloorDb <= -85, `planner floor should be capped low, got ${calibration.noiseFloorDb.toFixed(1)} dB`);
+    assert.ok(calibration.noiseFloorDb <= -80, `planner floor should be capped low, got ${calibration.noiseFloorDb.toFixed(1)} dB`);
     assert.equal(calibration.speechThresholdDb, -58);
     assert.equal(hotMaskRuns.length, 0, "fixture should prove hot profile floor loses the quiet speech");
     assert.equal(plannerMaskRuns.length, 2);
@@ -575,11 +695,13 @@ describe("gainPlanner", () => {
 
     assert.ok(plan.earlyRunCapCount >= 2, `expected early caps, got ${plan.earlyRunCapCount}`);
     const appliedBodies = plan.runs.map((run) => run.meanDb + run.plannedGainDb);
-    const laterBodies = appliedBodies.slice(3).sort((a, b) => a - b);
-    const laterMedian = laterBodies[Math.floor(laterBodies.length / 2)];
     assert.ok(
-      Math.max(appliedBodies[0], appliedBodies[1]) <= laterMedian + 1.55,
-      `hot openers should be capped near later body: ${appliedBodies.map((v) => v.toFixed(1)).join(", ")}`,
+      plan.runs[0].plannedGainDb <= -4 && plan.runs[0].plannedGainDb >= -6.05,
+      `hot opener control should be meaningful but continuously bounded: ${plan.runs[0].plannedGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      appliedBodies[0] <= -7.5,
+      `hot openers should be tamed without being forced to ordinary dialogue: ${appliedBodies.map((v) => v.toFixed(1)).join(", ")}`,
     );
 
     const naturalFrameDb = new Array(800).fill(-78);
@@ -725,7 +847,7 @@ describe("gainPlanner", () => {
     }
   });
 
-  it("keeps silences quiet (expander keeps pauses below speech by >= 10 dB)", () => {
+  it("keeps unclassified recording beds source-stable instead of hard-ducking them", () => {
     const spans = [{ startSec: 0.5, endSec: 2.5, rmsDb: -24 }];
     const samples = synthesizeTake(spans, 4, -58); // noisier pause
     const metrics = analyzeFloatSamples(samples, SAMPLE_RATE, FRAME_MS);
@@ -753,13 +875,47 @@ describe("gainPlanner", () => {
       frameMs: FRAME_MS,
     });
 
-    // expander depth must be applied in pauses
-    assert.ok(plan.expanderDepthDb >= 12, `expander depth too small: ${plan.expanderDepthDb.toFixed(1)}`);
+    // The legacy binary mask applied 12-30 dB of attenuation to every
+    // unclassified frame, including real quiet words. Pause risk may now trim
+    // an unchanged bed only subtly and continuously.
+    assert.ok(
+      plan.expanderDepthDb >= 0 && plan.expanderDepthDb <= 1.5,
+      `unclassified-frame trim must stay subtle: ${plan.expanderDepthDb.toFixed(2)} dB`,
+    );
 
-    // pick a mid-pause frame (3.5s) and confirm gain there is <= -10 dB
+    // Pick a mid-pause frame (3.5 s): no uplift, but never a speech-erasing
+    // binary expansion cut.
     const pauseFrame = Math.round(3.5 * 100);
     const pauseGainDb = 20 * Math.log10(plan.gainCurve[pauseFrame] + 1e-9);
-    assert.ok(pauseGainDb <= -9, `pause gain should duck: got ${pauseGainDb.toFixed(1)} dB`);
+    assert.ok(
+      pauseGainDb <= 0.05 && pauseGainDb >= -1.55,
+      `pause gain should remain source-stable, got ${pauseGainDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("preserves an unclassified quiet word even when pause-noise risk is high", () => {
+    const frameDb = new Array<number>(400).fill(-58);
+    for (let frame = 80; frame < 210; frame += 1) frameDb[frame] = -24;
+    for (let frame = 280; frame < 315; frame += 1) frameDb[frame] = -49;
+    const before = frameDb.slice();
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 80, endFrame: 210 }],
+      noiseFloorDb: -58,
+      speechThresholdDb: -45,
+      pauseNoiseRisk: 1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+    });
+
+    const quietWordGainDb = gainDbAtFrame(plan.gainCurve, 295);
+    assert.ok(
+      quietWordGainDb >= -1.55 && quietWordGainDb <= 0.05,
+      `an uncertain quiet word must remain audible, got ${quietWordGainDb.toFixed(2)} dB`,
+    );
+    assert.deepEqual(frameDb, before);
   });
 
   it("does not apply peaks above the ceiling (peak guard)", () => {
@@ -933,11 +1089,16 @@ describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
       `post-clamp residual must fire on extreme-loud yell; got count ${plan.sustainedLoudClusterCount}`,
     );
 
-    // The yell's planned gain should reach the widened lower clamp
-    // (-18 dB) for high-crest body-speech runs, NOT the standard -14.
+    // Even an extreme vocalization is tamed continuously, not flattened to
+    // dialogue. The final limiter owns remaining absolute peak safety.
     assert.ok(
-      yellRun!.plannedGainDb <= -16,
-      `high-crest yell gain should reach the widened clamp; got ${yellRun!.plannedGainDb.toFixed(2)} dB`,
+      yellRun!.plannedGainDb >= -6.05 && yellRun!.plannedGainDb <= -4,
+      `high-crest yell attenuation must stay subtle; got ${yellRun!.plannedGainDb.toFixed(2)} dB`,
+    );
+    const yellCenterGainDb = gainDbAtFrame(plan.gainCurve, yellStart + 75);
+    assert.ok(
+      yellCenterGainDb >= -6.05,
+      `post-planner shaping must not exceed the same continuous authority; got ${yellCenterGainDb.toFixed(2)} dB`,
     );
 
     // Dialogue frames untouched.
@@ -997,15 +1158,15 @@ describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
     // shifts target by ~(crest - 11) * 0.4. For crest 18 → -2.8 dB shift,
     // adjusted target -24.8, gain -24.8 - (-12) = -12.8.
     assert.ok(
-      yellRun.plannedGainDb < -11,
-      `high-crest sub-targeting should shift gain below -11 dB; got ${yellRun.plannedGainDb.toFixed(2)} dB`,
+      yellRun.plannedGainDb >= -6.05 && yellRun.plannedGainDb <= -4,
+      `high-crest sub-targeting should remain subtly bounded; got ${yellRun.plannedGainDb.toFixed(2)} dB`,
     );
     // Applied body is now BELOW dialogue (compensates psycho-acoustic
     // overload from high-crest content).
     const yellAppliedBodyDb = -12 + yellRun.plannedGainDb;
     assert.ok(
-      yellAppliedBodyDb < -22,
-      `high-crest yell should land BELOW dialogue body (-22); got ${yellAppliedBodyDb.toFixed(2)} dB`,
+      yellAppliedBodyDb > -20 && yellAppliedBodyDb < -16,
+      `high-crest yell should remain expressive but controlled; got ${yellAppliedBodyDb.toFixed(2)} dB`,
     );
   });
 });
@@ -1750,11 +1911,11 @@ describe("full-rate rendered consonant peak tamer", () => {
 
     assert.equal(result.samples.length, renderedSamples.length, "source-aware repair must preserve sample length");
     assert.ok(result.stats.tamedFrameCount >= 3, "each start, middle, and final fricative should receive local repair");
-    assert.ok(result.stats.maxReductionDb > 0 && result.stats.maxReductionDb <= 2.5, `repair must stay subtle, got ${result.stats.maxReductionDb.toFixed(2)} dB`);
+    assert.ok(result.stats.maxReductionDb > 0 && result.stats.maxReductionDb <= 1.5, `source-relative repair must stay below the audible micro-dip budget, got ${result.stats.maxReductionDb.toFixed(2)} dB`);
     for (const centerSec of consonantCentersSec) {
       const reductionDb = peakDbNear(renderedSamples, sampleRate, centerSec) - peakDbNear(result.samples, sampleRate, centerSec);
-      assert.ok(reductionDb >= 0.4, `fricative at ${centerSec.toFixed(2)} s should receive a measurable local reduction`);
-      assert.ok(reductionDb <= 2.5, `fricative at ${centerSec.toFixed(2)} s must not be reduced more than 2.5 dB, got ${reductionDb.toFixed(2)} dB`);
+      assert.ok(reductionDb >= 0.3, `fricative at ${centerSec.toFixed(2)} s should receive a measurable local reduction`);
+      assert.ok(reductionDb <= 1.5, `fricative at ${centerSec.toFixed(2)} s must not be reduced more than 1.5 dB, got ${reductionDb.toFixed(2)} dB`);
     }
     assert.ok(
       Math.abs(bodyAfterDb - bodyBeforeDb) < 0.05,
@@ -1852,7 +2013,7 @@ describe("full-rate rendered consonant peak tamer", () => {
     assert.deepEqual(lowRateResult.samples, renderedSamples);
   });
 
-  it("never lets an adjacent strong lane lend its 2.5 dB budget to weak or native owner samples", () => {
+  it("never lets an adjacent strong lane lend its residual budget to weak or native owner samples", () => {
     const source = synthesizeAdjacentWeakStrongLaneTake([-10.4, -4]);
     const rendered = synthesizeAdjacentWeakStrongLaneTake([-3.9, 2]);
     const reference = buildRenderedConsonantReference(source.samples, source.sampleRate);
@@ -1975,7 +2136,7 @@ describe("full-rate rendered consonant peak tamer", () => {
     );
     assert.ok(
       pair.maxReductionDb <= 1.75,
-      `two adjacent 2 ms owners must not jump to the full 2.5 dB depth, got ${pair.maxReductionDb.toFixed(3)} dB`,
+      `two adjacent 2 ms owners must not jump to the full residual depth, got ${pair.maxReductionDb.toFixed(3)} dB`,
     );
     assert.deepEqual(
       result.samples.slice(firstOwnerStart - samplesPerEvidenceFrame, firstOwnerStart),
@@ -2504,7 +2665,7 @@ describe("full-rate rendered consonant peak tamer", () => {
       `the late source-native event must remain intact, got ${nativeReductionDb.toFixed(3)} dB reduction`,
     );
     assert.ok(
-      grownReductionDb >= 0.4 && grownReductionDb <= 2.5,
+      grownReductionDb >= 0.3 && grownReductionDb <= 1.5,
       `the late processing-grown event needs bounded repair, got ${grownReductionDb.toFixed(3)} dB`,
     );
   });
@@ -2603,10 +2764,10 @@ describe("full-rate rendered consonant peak tamer", () => {
       - peakDbNear(result.samples, sampleRate, renderedAnchorSec);
 
     assert.ok(
-      targetReductionDb >= 0.4,
+      targetReductionDb >= 0.3,
       `the latency-shifted render-created consonant contrast must still be repaired, got ${targetReductionDb.toFixed(3)} dB`,
     );
-    assert.ok(targetReductionDb <= 2.5, `latency-aware repair must stay subtle, got ${targetReductionDb.toFixed(2)} dB`);
+    assert.ok(targetReductionDb <= 1.5, `latency-aware repair must stay subtle, got ${targetReductionDb.toFixed(2)} dB`);
     assert.ok(nativeAnchorReductionDb < 0.1, `the aligned native consonant anchor must stay intact, got ${nativeAnchorReductionDb.toFixed(2)} dB reduction`);
   });
 
@@ -2642,10 +2803,10 @@ describe("full-rate rendered consonant peak tamer", () => {
       - peakDbNear(result.samples, sampleRate, nativeNeighborSec, 8);
 
     assert.ok(
-      targetReductionDb >= 0.4,
+      targetReductionDb >= 0.3,
       `the render-created member of a dense consonant pair must be repaired, got ${targetReductionDb.toFixed(2)} dB`,
     );
-    assert.ok(targetReductionDb <= 2.5, `dense-pair repair must stay subtle, got ${targetReductionDb.toFixed(2)} dB`);
+    assert.ok(targetReductionDb <= 1.5, `dense-pair repair must stay subtle, got ${targetReductionDb.toFixed(2)} dB`);
     assert.ok(
       neighborReductionDb < 0.1,
       `the adjacent source-native consonant must stay intact, got ${neighborReductionDb.toFixed(2)} dB reduction`,
@@ -2711,8 +2872,8 @@ describe("full-rate rendered consonant peak tamer", () => {
         `${gapMs} ms processing-grown event should receive a subtle repair, got ${grownReductionDb.toFixed(3)} dB`,
       );
       assert.ok(
-        grownReductionDb <= 2.5,
-        `${gapMs} ms repair must remain within the 2.5 dB cap, got ${grownReductionDb.toFixed(3)} dB`,
+        grownReductionDb <= 1.5,
+        `${gapMs} ms repair must remain within the 1.5 dB cap, got ${grownReductionDb.toFixed(3)} dB`,
       );
     }
   });
@@ -3097,9 +3258,189 @@ describe("localized peak guard", () => {
       `sustained loud phrase should keep performance level, got ${loudPhraseGainDb.toFixed(2)} vs body ${bodyGainDb.toFixed(2)} dB`,
     );
   });
+
+  it("does not lend a long low-bed run's +14 dB authority to embedded performance events", () => {
+    const totalFrames = 2400;
+    const frameDb = new Array<number>(totalFrames).fill(-52);
+    for (const [startFrame, endFrame] of [
+      [900, 920],
+      [1500, 1530],
+    ] as const) {
+      for (let frame = startFrame; frame < endFrame; frame += 1) frameDb[frame] = -20;
+    }
+    const speechRuns = [{ startFrame: 0, endFrame: totalFrames }];
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -110,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.4,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.5,
+    });
+
+    const eventGains = Array.from(
+      { length: 12 },
+      (_, index) => gainDbAtFrame(plan.gainCurve, 904 + index),
+    );
+    const eventCenterGainDb = gainDbAtFrame(plan.gainCurve, 910);
+    const lowBedGainDb = gainDbAtFrame(plan.gainCurve, 700);
+    const eventOutputDb = frameDb[910] + eventCenterGainDb;
+    const bedOutputDb = frameDb[700] + lowBedGainDb;
+    const largestEventStepDb = eventGains.slice(1).reduce(
+      (largest, gainDb, index) => Math.max(largest, Math.abs(gainDb - eventGains[index])),
+      0,
+    );
+
+    assert.equal(plan.runs[0].runClass, "body-speech");
+    assert.ok(
+      plan.runs[0].plannedGainDb >= 13.4,
+      `fixture must reproduce near-maximum broad-run authority, got ${plan.runs[0].plannedGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      eventCenterGainDb >= -0.05 && eventCenterGainDb <= 3,
+      `source-owned performance event should receive only target recovery, got ${eventCenterGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      lowBedGainDb >= 13.5,
+      `event ownership must not lower unrelated run frames, got ${lowBedGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      eventOutputDb - bedOutputDb >= 18,
+      `source dynamics should remain expressive after authority limiting, got ${(eventOutputDb - bedOutputDb).toFixed(2)} dB`,
+    );
+    assert.ok(
+      largestEventStepDb < 1.5,
+      `event ownership should move as a phrase envelope, not a millisecond notch; largest step ${largestEventStepDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("retains recovery for a quiet voiced high-frequency island and keeps inputs immutable", () => {
+    const totalFrames = 1600;
+    const frameDb = new Array<number>(totalFrames).fill(-58);
+    const fricativeFrameDb = new Array<number>(totalFrames).fill(-90);
+    for (let frame = 700; frame < 735; frame += 1) {
+      frameDb[frame] = -38;
+      fricativeFrameDb[frame] = -32;
+    }
+    const speechRuns = [{ startFrame: 0, endFrame: totalFrames }];
+    const frameSnapshot = [...frameDb];
+    const fricativeSnapshot = [...fricativeFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+
+    const plan = planGainCurve({
+      frameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -90,
+      speechRuns,
+      noiseFloorDb: -110,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.4,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.5,
+    });
+
+    const quietVoiceGainDb = gainDbAtFrame(plan.gainCurve, 717);
+    assert.ok(
+      quietVoiceGainDb >= 13.5,
+      `quiet voiced/HF evidence should keep recovery authority, got ${quietVoiceGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      frameDb[717] + quietVoiceGainDb >= -24.5,
+      `quiet voiced island should recover near dialogue level, got ${(frameDb[717] + quietVoiceGainDb).toFixed(2)} dB`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(fricativeFrameDb, fricativeSnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+  });
+
+  it("changes embedded-event authority continuously and leaves helper inputs immutable", () => {
+    const gainDbCurve = new Float32Array(320).fill(14);
+    const buildSource = (eventDb: number) => {
+      const sourceFrameDb = new Array<number>(gainDbCurve.length).fill(-52);
+      for (let frame = 140; frame < 160; frame += 1) sourceFrameDb[frame] = eventDb;
+      return sourceFrameDb;
+    };
+    const lowerEvent = buildSource(-20);
+    const higherEvent = buildSource(-19.99);
+    const gainSnapshot = new Float32Array(gainDbCurve);
+    const lowerSnapshot = [...lowerEvent];
+    const runs = [{ startFrame: 0, endFrame: gainDbCurve.length }];
+    const runSnapshot = runs.map((run) => ({ ...run }));
+
+    const lowerResult = limitEmbeddedPerformancePositiveGainAuthority(
+      gainDbCurve,
+      lowerEvent,
+      runs,
+      -22,
+      FRAME_MS,
+    );
+    const higherResult = limitEmbeddedPerformancePositiveGainAuthority(
+      gainDbCurve,
+      higherEvent,
+      runs,
+      -22,
+      FRAME_MS,
+    );
+    const lowerGainDb = lowerResult[150];
+    const higherGainDb = higherResult[150];
+
+    assert.ok(
+      higherGainDb < lowerGainDb && lowerGainDb - higherGainDb < 0.03,
+      `0.01 dB stronger event should receive a small monotonic authority change, got ${lowerGainDb.toFixed(5)} -> ${higherGainDb.toFixed(5)}`,
+    );
+    assert.deepEqual(gainDbCurve, gainSnapshot);
+    assert.deepEqual(lowerEvent, lowerSnapshot);
+    assert.deepEqual(runs, runSnapshot);
+  });
 });
 
 describe("ramp placement", () => {
+  it("eases only excess positive gain into a quiet later run instead of lifting its pre-roll bed", () => {
+    const frameDb = new Array<number>(260).fill(-58);
+    for (let frame = 20; frame < 90; frame += 1) frameDb[frame] = -22;
+    for (let frame = 150; frame < 190; frame += 1) frameDb[frame] = -40;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [
+        { startFrame: 20, endFrame: 90 },
+        { startFrame: 150, endFrame: 190 },
+      ],
+      noiseFloorDb: -58,
+      speechThresholdDb: -47,
+      pauseNoiseRisk: 0.7,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.1,
+    });
+
+    const untouchedBedGainDb = gainDbAtFrame(plan.gainCurve, 141);
+    const lastPreRollGainDb = gainDbAtFrame(plan.gainCurve, 149);
+    const earlySpeechGainDb = gainDbAtFrame(plan.gainCurve, 151);
+    const settledSpeechGainDb = gainDbAtFrame(plan.gainCurve, 178);
+
+    assert.ok(
+      lastPreRollGainDb <= 4.1,
+      `detector-negative pre-roll must receive only subtle onset authority, got ${lastPreRollGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      earlySpeechGainDb - untouchedBedGainDb <= 5.5,
+      `processing must not add a >5.5 dB/100 ms handoff while the source bed is flat, got ${(earlySpeechGainDb - untouchedBedGainDb).toFixed(2)} dB`,
+    );
+    assert.ok(
+      settledSpeechGainDb >= 12,
+      `verified quiet speech must still reach the intended leveling gain, got ${settledSpeechGainDb.toFixed(2)} dB`,
+    );
+  });
+
   it("uses bounded high-frequency evidence to preserve a later line onset", () => {
     const frameDb = new Array<number>(300).fill(-82);
     for (let frame = 20; frame < 80; frame += 1) frameDb[frame] = -28;
@@ -3410,8 +3751,8 @@ describe("ramp placement", () => {
     // release) gain should be at full expander floor.
     const deepSilenceGainDb = 20 * Math.log10(plan.gainCurve[299] + 1e-9);
     assert.ok(
-      deepSilenceGainDb <= -9,
-      `deep silence gain ${deepSilenceGainDb.toFixed(2)} dB should be below -9 dB (full expander)`,
+      deepSilenceGainDb <= 0.05 && deepSilenceGainDb >= -1.55,
+      `deep silence gain ${deepSilenceGainDb.toFixed(2)} dB should stay source-stable`,
     );
   });
 
@@ -3449,8 +3790,8 @@ describe("ramp placement", () => {
       `release should continue after rescued tail, got ${postTailReleaseGainDb.toFixed(2)} dB at 250 ms post-tail`,
     );
     assert.ok(
-      deepSilenceGainDb <= -9,
-      `real post-tail silence should still return to expander floor, got ${deepSilenceGainDb.toFixed(2)} dB`,
+      deepSilenceGainDb <= 0.05 && deepSilenceGainDb >= -1.55,
+      `real post-tail silence should return to the shallow source-stable trim, got ${deepSilenceGainDb.toFixed(2)} dB`,
     );
   });
 
@@ -3678,7 +4019,10 @@ describe("house target and performance transients", () => {
     const quietBody = quietActor.runs[0].meanDb + quietActor.runs[0].plannedGainDb;
     const loudBody = loudActor.runs[0].meanDb + loudActor.runs[0].plannedGainDb;
 
-    assert.ok(Math.abs(quietBody - loudBody) < 2.5, `actors should converge: ${quietBody.toFixed(2)} vs ${loudBody.toFixed(2)} dB`);
+    assert.ok(
+      Math.abs(quietBody - loudBody) < 3.5,
+      `actors should converge materially without destructive attenuation: ${quietBody.toFixed(2)} vs ${loudBody.toFixed(2)} dB`,
+    );
     assert.ok(Math.abs(quietActor.targetDb - -22) < 1.4, `quiet actor target should stay near house target: ${quietActor.targetDb.toFixed(2)}`);
     assert.ok(Math.abs(loudActor.targetDb - -22) < 1.4, `loud actor target should stay near house target: ${loudActor.targetDb.toFixed(2)}`);
   });
@@ -3726,7 +4070,10 @@ describe("house target and performance transients", () => {
     });
 
     assert.equal(plan.runs[1].runClass, "transient-breath");
-    assert.ok(plan.runs[1].plannedGainDb <= -4.5, `performance transient should be pulled below dialogue: ${plan.runs[1].plannedGainDb.toFixed(2)} dB`);
+    assert.ok(
+      plan.runs[1].plannedGainDb <= -3.5 && plan.runs[1].plannedGainDb >= -6.05,
+      `performance transient should be subtly and boundedly tamed: ${plan.runs[1].plannedGainDb.toFixed(2)} dB`,
+    );
 
     const leveled = applyGainCurveToSamples(samples, plan.gainCurve, sampleRate, 1, frameMs);
     const transientFrameStart = 260 * samplesPerFrame;
@@ -3736,8 +4083,8 @@ describe("house target and performance transients", () => {
     }
     const transientPeakDb = 20 * Math.log10(transientPeak + 1e-9);
     assert.ok(
-      transientPeakDb <= plan.targetDb + 13,
-      `performance spike should sit under dialogue peak range: ${transientPeakDb.toFixed(2)} dB`,
+      transientPeakDb <= plan.targetDb + 15.5,
+      `performance spike should be meaningfully tamed while retaining its native emphasis: ${transientPeakDb.toFixed(2)} dB`,
     );
 
     const beforeDialogueGainDb = 20 * Math.log10(plan.gainCurve[180] + 1e-9);

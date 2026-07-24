@@ -143,6 +143,12 @@ const smoothUnitRamp = (value: number, start: number, full: number) => {
   const t = clamp((value - start) / Math.max(1e-9, full - start), 0, 1);
   return t * t * (3 - 2 * t);
 };
+const softLimitNegativePlannerGainDb = (gainDb: number, limitDb: number) => {
+  if (!Number.isFinite(gainDb)) return 0;
+  if (gainDb >= 0) return gainDb;
+  const safeLimitDb = Math.max(0.1, Math.abs(limitDb));
+  return -safeLimitDb * Math.tanh(-gainDb / safeLimitDb);
+};
 const dbToLin = (db: number) => Math.pow(10, db / 20);
 const COLD_OPEN_WINDOW_MS = 2500;
 const COLD_OPEN_RUN_COUNT = 3;
@@ -152,6 +158,13 @@ const COLD_OPEN_LIFT_TOLERANCE_DB = 1.5;
 const COLD_OPEN_LIFT_MAX_DB = 5;
 const RUN_ONSET_BACKTRACK_MS = 60;
 const COLD_OPEN_ATTACK_LEAD_MS = 40;
+// A detector-negative pre-roll may contain the recording bed, so it can borrow
+// only a small amount of positive body gain. Any additional lift is eased into
+// the evidence-backed run at a speech-rate time scale instead of arriving as
+// an 80 ms +10..15 dB handoff.
+const POSITIVE_ATTACK_ENTRY_GAIN_DB = 4;
+const POSITIVE_ATTACK_FRICATIVE_ENTRY_BONUS_DB = 1.25;
+const POSITIVE_ATTACK_EXCESS_SLEW_DB_PER_100_MS = 4;
 const FRICATIVE_BAND_LOW_HZ = 3500;
 const FRICATIVE_BAND_HIGH_HZ = 7400;
 const FRICATIVE_EVIDENCE_MARGIN_DB = 10;
@@ -170,6 +183,7 @@ const QUIET_BODY_FLOOR_LOUDNESS_OFFSET_DB = 1.0;
 const QUIET_BODY_FLOOR_MAX_LIFT_DB = 3.5;
 const QUIET_BODY_FLOOR_HIGH_CREST_DB = 20;
 const QUIET_BODY_FLOOR_EXTREME_CREST_DB = 24;
+const PLANNER_NEGATIVE_GAIN_SOFT_LIMIT_DB = 6;
 const BODY_SPIKE_MAX_RUN_LOSS_DB = 10;
 const BODY_SPIKE_RUN_FLOOR_OFFSET_DB = 9;
 // Absolute peak safety is useful, but its frame-wide envelope must not turn a
@@ -188,7 +202,12 @@ const RENDERED_CONSONANT_DIP_RADIUS_MS = 14;
 // Small alignment/resampling variance belongs to the native event. Authority
 // begins continuously only beyond this margin; there is no minimum output cut.
 const RENDERED_CONSONANT_SOURCE_ALLOWED_GROWTH_DB = 1.5;
-const RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB = 2.5;
+// The final source-relative stage is a residual polish, not another dynamics
+// processor. A 2.5 dB cut over a 2 ms owner is visible and can sound like the
+// exact down-up instability this stage is meant to prevent. Keep the evidence
+// response continuous, but bound even fully supported repairs to a subtle
+// 1.5 dB touch.
+const RENDERED_CONSONANT_SOURCE_MAX_REDUCTION_DB = 1.5;
 // A single 2 ms full-band owner can sound like a volume dropout even when its
 // source-relative decision is correct. Deeper repair needs adjacent evidence;
 // an isolated owner remains a subtle touch rather than a down-up notch.
@@ -213,6 +232,15 @@ const RENDERED_CONSONANT_AUDIBILITY_PEAK_START_DB = -24;
 const RENDERED_CONSONANT_AUDIBILITY_RMS_START_DB = -80;
 const PLANNER_ENVELOPE_FLOOR_PERCENTILE = 25;
 const PLANNER_ANALYSIS_FLOOR_HEADROOM_DB = 20;
+const PLANNER_ACTIVE_RELIABILITY_CENTER_DB = -100;
+const PLANNER_ACTIVE_RELIABILITY_SOFTNESS_DB = 6;
+const PLANNER_RECORDING_BED_LOW_PERCENTILE = 10;
+const PLANNER_RECORDING_BED_UPPER_PERCENTILE = 90;
+const PLANNER_RECORDING_BED_CONTRAST_KNEE_DB = 4;
+const PLANNER_RECORDING_BED_COVERAGE_KNEE = 0.15;
+const PLANNER_RECORDING_BED_LOW_MODE_WIDTH_DB = 6;
+const PLANNER_RECORDING_BED_PERSISTENCE_WINDOW_FRAMES = 101;
+const PLANNER_RECORDING_BED_PERSISTENCE_KNEE = 0.25;
 const K_WEIGHT_STAGE1_HIGH_SHELF_HZ = 1681.974450955533;
 const K_WEIGHT_STAGE1_GAIN_DB = 4;
 const K_WEIGHT_STAGE2_HIGH_PASS_HZ = 38.13547087602444;
@@ -220,6 +248,10 @@ const K_WEIGHT_STAGE2_Q = 0.5;
 const BODY_GAIN_VALLEY_INNER_SHOULDER_MS = 60;
 const BODY_GAIN_VALLEY_OUTER_SHOULDER_MS = 140;
 const BODY_GAIN_VALLEY_RELAXATION_BLEND = 0.7;
+const EMBEDDED_PERFORMANCE_CONTEXT_MS = 240;
+const EMBEDDED_PERFORMANCE_GAIN_KNEE_DB = 0.35;
+const EMBEDDED_PERFORMANCE_GAIN_AUTHORITY_KNEE_DB = 6;
+const EMBEDDED_PERFORMANCE_RECOVERY_HEADROOM_DB = 0.5;
 
 /**
  * Relax millisecond-scale attenuation caps without widening their ownership.
@@ -319,6 +351,94 @@ const percentileDb = (values: number[], percent: number) => {
   return finite[index];
 };
 
+const plannerActiveReliability = (db: number) =>
+  1 /
+  (1 +
+    Math.pow(
+      10,
+      (PLANNER_ACTIVE_RELIABILITY_CENTER_DB - db) /
+        PLANNER_ACTIVE_RELIABILITY_SOFTNESS_DB,
+    ));
+
+const weightedPercentileDb = (
+  entries: ReadonlyArray<{ db: number; weight: number }>,
+  percent: number,
+) => {
+  const sorted = entries
+    .filter(({ db, weight }) => Number.isFinite(db) && Number.isFinite(weight) && weight > 0)
+    .sort((a, b) => a.db - b.db);
+  if (sorted.length === 0) return null;
+  const totalWeight = sorted.reduce((sum, { weight }) => sum + weight, 0);
+  const targetWeight = totalWeight * clamp(percent / 100, 0, 1);
+  let cumulativeWeight = 0;
+  for (const entry of sorted) {
+    cumulativeWeight += entry.weight;
+    if (cumulativeWeight >= targetWeight) return entry.db;
+  }
+  return sorted[sorted.length - 1].db;
+};
+
+const estimatePlannerRecordingBedEvidence = (frameDb: number[]) => {
+  const weightedFrames = frameDb
+    .filter(Number.isFinite)
+    .map((db) => ({ db, weight: plannerActiveReliability(db) }));
+  const frameCount = Math.max(1, weightedFrames.length);
+  const activeCoverage =
+    weightedFrames.reduce((sum, { weight }) => sum + weight, 0) / frameCount;
+  const quietBedDb =
+    weightedPercentileDb(weightedFrames, PLANNER_RECORDING_BED_LOW_PERCENTILE) ?? -110;
+  const upperActiveDb =
+    weightedPercentileDb(weightedFrames, PLANNER_RECORDING_BED_UPPER_PERCENTILE) ??
+    quietBedDb;
+  const contrastDb = Math.max(0, upperActiveDb - quietBedDb);
+  const contrastPower = contrastDb * contrastDb;
+  const contrastKneePower =
+    PLANNER_RECORDING_BED_CONTRAST_KNEE_DB *
+    PLANNER_RECORDING_BED_CONTRAST_KNEE_DB;
+  const contrastAuthority =
+    contrastPower / (contrastPower + contrastKneePower + Number.EPSILON);
+  const coveragePower = activeCoverage ** 4;
+  const coverageKneePower = PLANNER_RECORDING_BED_COVERAGE_KNEE ** 4;
+  const coverageAuthority =
+    coveragePower / (coveragePower + coverageKneePower + Number.EPSILON);
+  const lowModeMembership = weightedFrames.map(({ db, weight }) => {
+    const distance = (db - quietBedDb) / PLANNER_RECORDING_BED_LOW_MODE_WIDTH_DB;
+    return weight * Math.exp(-(distance * distance));
+  });
+  const lowModePrefix = new Float64Array(lowModeMembership.length + 1);
+  for (let index = 0; index < lowModeMembership.length; index += 1) {
+    lowModePrefix[index + 1] = lowModePrefix[index] + lowModeMembership[index];
+  }
+  const persistenceRadiusFrames = Math.floor(
+    PLANNER_RECORDING_BED_PERSISTENCE_WINDOW_FRAMES / 2,
+  );
+  let persistenceWeightedSum = 0;
+  let persistenceWeight = 0;
+  for (let index = 0; index < lowModeMembership.length; index += 1) {
+    const startFrame = Math.max(0, index - persistenceRadiusFrames);
+    const endFrame = Math.min(
+      lowModeMembership.length,
+      index + persistenceRadiusFrames + 1,
+    );
+    const localLowModeDensity =
+      (lowModePrefix[endFrame] - lowModePrefix[startFrame]) /
+      Math.max(1, endFrame - startFrame);
+    persistenceWeightedSum += lowModeMembership[index] * localLowModeDensity;
+    persistenceWeight += lowModeMembership[index];
+  }
+  const temporalPersistence =
+    persistenceWeightedSum / (persistenceWeight + Number.EPSILON);
+  const persistencePower = temporalPersistence ** 6;
+  const persistenceKneePower = PLANNER_RECORDING_BED_PERSISTENCE_KNEE ** 6;
+  const persistenceAuthority =
+    persistencePower / (persistencePower + persistenceKneePower + Number.EPSILON);
+
+  return {
+    quietBedDb: clamp(quietBedDb, -110, -48),
+    authority: contrastAuthority * coverageAuthority * persistenceAuthority,
+  };
+};
+
 export const estimatePlannerEnvelopeNoiseFloorDb = (frameDb: number[]) => {
   const quietFloorDb = percentileDb(frameDb, PLANNER_ENVELOPE_FLOOR_PERCENTILE) ?? -70;
   return clamp(quietFloorDb, -110, -48);
@@ -333,14 +453,37 @@ export const resolvePlannerCalibration = (
   const suppliedNoiseFloorDb = Number.isFinite(analysisNoiseFloorDb)
     ? (analysisNoiseFloorDb as number)
     : envelopeNoiseFloorDb;
-  const noiseFloorDb = Math.min(suppliedNoiseFloorDb, envelopeNoiseFloorDb + PLANNER_ANALYSIS_FLOOR_HEADROOM_DB);
-  const envelopeSpeechThresholdDb = clamp(noiseFloorDb + 11, -58, -24);
+  const baselineNoiseFloorDb = Math.min(
+    suppliedNoiseFloorDb,
+    envelopeNoiseFloorDb + PLANNER_ANALYSIS_FLOOR_HEADROOM_DB,
+  );
+  const recordingBedEvidence = estimatePlannerRecordingBedEvidence(frameDb);
+  const noiseFloorDb = clamp(
+    baselineNoiseFloorDb +
+      (recordingBedEvidence.quietBedDb - baselineNoiseFloorDb) *
+        recordingBedEvidence.authority,
+    -110,
+    -48,
+  );
+  const baselineEnvelopeSpeechThresholdDb = clamp(
+    baselineNoiseFloorDb + 11,
+    -58,
+    -24,
+  );
   const suppliedSpeechThresholdDb = Number.isFinite(analysisSpeechThresholdDb)
     ? (analysisSpeechThresholdDb as number)
-    : envelopeSpeechThresholdDb;
+    : baselineEnvelopeSpeechThresholdDb;
+  const permissiveSpeechThresholdDb = Math.min(
+    suppliedSpeechThresholdDb,
+    baselineEnvelopeSpeechThresholdDb,
+  );
+  const refinedEnvelopeSpeechThresholdDb = clamp(noiseFloorDb + 11, -58, -24);
   return {
     noiseFloorDb,
-    speechThresholdDb: Math.min(suppliedSpeechThresholdDb, envelopeSpeechThresholdDb),
+    speechThresholdDb:
+      permissiveSpeechThresholdDb +
+      (refinedEnvelopeSpeechThresholdDb - permissiveSpeechThresholdDb) *
+        recordingBedEvidence.authority,
     envelopeNoiseFloorDb,
   };
 };
@@ -606,6 +749,104 @@ export const relaxNarrowBodySpeechGainValleys = (
   return relaxedGainDbCurve;
 };
 
+const softPositiveDb = (value: number, kneeDb: number) => {
+  const scaled = value / Math.max(kneeDb, Number.EPSILON);
+  if (scaled >= 40) return value;
+  if (scaled <= -40) return kneeDb * Math.exp(scaled);
+  return kneeDb * Math.log1p(Math.exp(scaled));
+};
+
+/**
+ * Give an energetic event embedded in a broad body-speech run only the
+ * positive gain it still needs to reach the dialogue target.
+ *
+ * Long edited regions can occasionally arrive as one speech run: a quiet
+ * recorded bed sets the run gain while sparse laughs, calls, impacts, or
+ * onomatopoeic voice events already carry their own level. A cosine-weighted
+ * source envelope transfers ownership over roughly a phoneme/short-event
+ * window, so the response cannot form a one-frame down/up notch. Soft-positive
+ * recovery and excess curves make the mapping continuous at every level:
+ * ordinary quiet voice retains its planned lift, an already-loud event tends
+ * toward source gain, and no frame is ever attenuated below its native level.
+ */
+export const limitEmbeddedPerformancePositiveGainAuthority = (
+  gainDbCurve: Float32Array,
+  sourceFrameDb: ArrayLike<number>,
+  bodySpeechRuns: readonly SpeechRun[],
+  targetDb: number,
+  frameMs = 10,
+): Float32Array => {
+  const limitedGainDbCurve = new Float32Array(gainDbCurve);
+  if (sourceFrameDb.length !== gainDbCurve.length) return limitedGainDbCurve;
+  const effectiveFrameMs = Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 10;
+  const contextRadiusFrames = Math.max(
+    2,
+    Math.round(EMBEDDED_PERFORMANCE_CONTEXT_MS / (2 * effectiveFrameMs)),
+  );
+  const sourcePower = new Float64Array(sourceFrameDb.length);
+  for (let frame = 0; frame < sourceFrameDb.length; frame += 1) {
+    const sourceDb = sourceFrameDb[frame];
+    sourcePower[frame] = Number.isFinite(sourceDb)
+      ? Math.pow(10, sourceDb / 10)
+      : Number.NaN;
+  }
+  const contextWeights = new Float64Array(contextRadiusFrames * 2 + 1);
+  for (
+    let offset = -contextRadiusFrames;
+    offset <= contextRadiusFrames;
+    offset += 1
+  ) {
+    const normalizedOffset = Math.abs(offset) / (contextRadiusFrames + 1);
+    contextWeights[offset + contextRadiusFrames] =
+      Math.cos((normalizedOffset * Math.PI) / 2) ** 2;
+  }
+
+  for (const run of bodySpeechRuns) {
+    const startFrame = clamp(Math.trunc(run.startFrame), 0, gainDbCurve.length);
+    const endFrame = clamp(Math.trunc(run.endFrame), startFrame, gainDbCurve.length);
+    for (let frame = startFrame; frame < endFrame; frame += 1) {
+      const originalGainDb = gainDbCurve[frame];
+      if (!Number.isFinite(originalGainDb)) continue;
+
+      let weightedPower = 0;
+      let totalWeight = 0;
+      for (let offset = -contextRadiusFrames; offset <= contextRadiusFrames; offset += 1) {
+        const sourceFrame = frame + offset;
+        if (sourceFrame < startFrame || sourceFrame >= endFrame) continue;
+        const framePower = sourcePower[sourceFrame];
+        if (!Number.isFinite(framePower)) continue;
+        const weight = contextWeights[offset + contextRadiusFrames];
+        weightedPower += weight * framePower;
+        totalWeight += weight;
+      }
+      if (totalWeight <= 0) continue;
+
+      const localEventDb = 10 * Math.log10(weightedPower / totalWeight + 1e-30);
+      const positiveGainDb = Math.max(0, originalGainDb);
+      const negativeGainDb = Math.min(0, originalGainDb);
+      const recoveryBudgetDb = softPositiveDb(
+        targetDb + EMBEDDED_PERFORMANCE_RECOVERY_HEADROOM_DB - localEventDb,
+        EMBEDDED_PERFORMANCE_GAIN_KNEE_DB,
+      );
+      const unauthorizedPositiveGainDb = softPositiveDb(
+        positiveGainDb - recoveryBudgetDb,
+        EMBEDDED_PERFORMANCE_GAIN_KNEE_DB,
+      );
+      const positiveGainPower = positiveGainDb ** 4;
+      const gainAuthorityKneePower =
+        EMBEDDED_PERFORMANCE_GAIN_AUTHORITY_KNEE_DB ** 4;
+      const broadRunAuthority =
+        positiveGainPower /
+        (positiveGainPower + gainAuthorityKneePower + Number.EPSILON);
+      limitedGainDbCurve[frame] =
+        negativeGainDb +
+        Math.max(0, positiveGainDb - unauthorizedPositiveGainDb * broadRunAuthority);
+    }
+  }
+
+  return limitedGainDbCurve;
+};
+
 /**
  * Plan a gain curve for speech-aware leveling.
  */
@@ -615,6 +856,10 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const sourceTargetBlend = clamp(input.sourceTargetBlend ?? 0.15, 0, 1);
   const maxGainDb = input.maxGainDb ?? 14;
   const minGainDb = input.minGainDb ?? -14;
+  const negativeGainSoftLimitDb = Math.min(
+    PLANNER_NEGATIVE_GAIN_SOFT_LIMIT_DB,
+    Math.max(0.1, Math.abs(minGainDb)),
+  );
   const coldOpenLiftToleranceDb = input.coldOpenLiftToleranceDb ?? COLD_OPEN_LIFT_TOLERANCE_DB;
   const coldOpenLiftMaxAllowedDb = input.coldOpenLiftMaxDb ?? COLD_OPEN_LIFT_MAX_DB;
   // -4 dBFS ceiling gives the downstream `alimiter=limit=-2dB` genuine
@@ -1020,8 +1265,19 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
   }
 
-  // 4) Expander depth — deeper duck on noisier files.
-  const expanderDepthDb = clamp(12 + input.pauseNoiseRisk * 18, 12, 30);
+  // Keep downward planner authority continuous and bounded. Extreme source
+  // events may still sit below ordinary dialogue, but one detector decision
+  // must never turn them into a crushed word or a millisecond-scale hole.
+  for (let index = 0; index < plannedRunGainDb.length; index += 1) {
+    plannedRunGainDb[index] = softLimitNegativePlannerGainDb(
+      plannedRunGainDb[index],
+      negativeGainSoftLimitDb,
+    );
+  }
+
+  // 4) Unclassified-frame trim. Detector misses are uncertainty, not proof of
+  // silence, so pause-noise risk earns only a shallow continuous reduction.
+  const expanderDepthDb = clamp(input.pauseNoiseRisk * 1.5, 0, 1.5);
 
   // 5) Paint the curve.
   //
@@ -1036,7 +1292,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //                preceding silence)                following silence)
   //
   // Result: ending consonants and soft tails survive. First syllables are
-  // not ducked. The expander still ducks sustained silence between runs.
+  // not ducked. Unclassified frames retain their native level with at most a
+  // subtle trim; dedicated cleanup owns actual room-bed reduction.
   const silenceGainDefaultDb = -expanderDepthDb;
   for (let i = 0; i < frameCount; i += 1) gainDbCurve[i] = silenceGainDefaultDb;
 
@@ -1150,15 +1407,38 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     const attackEnd = r === 0 ? Math.max(attackStart, startFrame - attackLeadFrames) : startFrame;
     const attackLen = attackEnd - attackStart;
     const bodyGainAtStart = gainDbCurve[startFrame];
+    const isFileHeadRun = r === 0 && startFrame <= attackFrames;
+    const precedingGainDb =
+      startFrame > 0 ? gainDbCurve[startFrame - 1] : silenceGainDefaultDb;
+    const fricativeAttackAuthority = fricativeFrameDb
+      ? smoothUnitRamp(
+          (fricativeFrameDb[startFrame] ?? -120) - fricativeEvidenceFloorDb,
+          0,
+          12,
+        )
+      : 0;
+    const positiveAttackEntryBudgetDb =
+      POSITIVE_ATTACK_ENTRY_GAIN_DB +
+      POSITIVE_ATTACK_FRICATIVE_ENTRY_BONUS_DB * fricativeAttackAuthority;
+    const positiveAttackEntryGainDb = Math.min(
+      bodyGainAtStart,
+      Math.max(
+        precedingGainDb,
+        Math.min(bodyGainAtStart, positiveAttackEntryBudgetDb),
+      ),
+    );
+    const attackTargetGainDb = isFileHeadRun
+      ? bodyGainAtStart
+      : positiveAttackEntryGainDb;
     for (let k = 0; k < attackLen; k += 1) {
       const t = (k + 1) / (attackLen + 1); // 0 → 1 as we approach run start
       const weight = Math.sin((t * Math.PI) / 2) ** 2; // cos² rising
       gainDbCurve[attackStart + k] =
-        silenceGainDefaultDb + (bodyGainAtStart - silenceGainDefaultDb) * weight;
+        silenceGainDefaultDb + (attackTargetGainDb - silenceGainDefaultDb) * weight;
     }
     if (r === 0) {
       for (let f = attackEnd; f < startFrame; f += 1) {
-        gainDbCurve[f] = bodyGainAtStart;
+        gainDbCurve[f] = attackTargetGainDb;
       }
     }
 
@@ -1167,6 +1447,34 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     // The preceding run keeps ownership of its already-bounded soft-tail
     // window up to the detector's original next-run boundary. A later run's
     // optional onset backtrack must not shorten that established protection.
+    // The run itself remains the only owner of large positive recovery. Ease
+    // just the excess above the conservative onset budget into its already
+    // planned per-frame curve. The duration derives continuously from the gain
+    // distance, so there is no short/long-run engagement gate.
+    const positiveAttackExcessDb = Math.max(
+      0,
+      bodyGainAtStart - attackTargetGainDb,
+    );
+    if (positiveAttackExcessDb > 0) {
+      const slewDbPerFrame = Math.max(
+        Number.EPSILON,
+        POSITIVE_ATTACK_EXCESS_SLEW_DB_PER_100_MS * (frameMs / 100),
+      );
+      const handoffFrames = Math.max(
+        1,
+        Math.ceil(positiveAttackExcessDb / slewDbPerFrame),
+      );
+      const handoffEndFrame = Math.min(endFrame, startFrame + handoffFrames);
+      for (let frame = startFrame; frame < handoffEndFrame; frame += 1) {
+        const progress = (frame - startFrame + 1) / handoffFrames;
+        const weight = Math.sin((Math.min(1, progress) * Math.PI) / 2) ** 2;
+        const plannedFrameGainDb = gainDbCurve[frame];
+        gainDbCurve[frame] =
+          attackTargetGainDb +
+          (plannedFrameGainDb - attackTargetGainDb) * weight;
+      }
+    }
+
     const nextRunStart = r + 1 < runMeta.length ? runMeta[r + 1].detectedStartFrame : frameCount;
     const bodyGainAtEnd = gainDbCurve[endFrame - 1];
     const softTailEndFrame = resolveSoftTailRescueEndFrame(runMeta[r], nextRunStart);
@@ -1196,12 +1504,24 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //    only short downward concavities created by the centered micro-ride.
   //    Symmetric context rejects a simple level trend, and lift-only response
   //    cannot create a new dip or attenuate a performance transient.
-  const slewed = relaxNarrowBodySpeechGainValleys(
+  const valleyRelaxed = relaxNarrowBodySpeechGainValleys(
     gainDbCurve,
     input.frameDb,
     runMeta
       .filter(({ runClass }) => runClass === "body-speech")
       .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
+    frameMs,
+  );
+  // 6b) A detector can still merge a recorded bed and sparse performance
+  //      moments into one body run. Continuously return only excessive
+  //      positive gain to the source-owned event; never apply negative gain.
+  const slewed = limitEmbeddedPerformancePositiveGainAuthority(
+    valleyRelaxed,
+    input.frameDb,
+    runMeta
+      .filter(({ runClass }) => runClass === "body-speech")
+      .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
+    targetDb,
     frameMs,
   );
 
@@ -1393,10 +1713,15 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     peakReductionDbByRun[r] = maxAppliedDipDb > 0 ? -maxAppliedDipDb : 0;
   }
 
-  // Final dip-application — covers absolute-peak safety and the uniform
-  // residual pass. Time-local body-relative shaping is deliberately absent.
+  // Final dip application covers absolute-peak safety and the uniform residual
+  // pass. Reapply the same continuous negative-authority limit after combining
+  // decisions so independently reasonable stages cannot stack into a hole.
   for (let f = 0; f < frameCount; f += 1) {
-    if (dipDbByFrame[f] > 0) slewed[f] -= dipDbByFrame[f];
+    const combinedGainDb = slewed[f] - Math.max(0, dipDbByFrame[f]);
+    slewed[f] = softLimitNegativePlannerGainDb(
+      combinedGainDb,
+      negativeGainSoftLimitDb,
+    );
   }
 
   // Stash diagnostics for the caller (logged via PlannedGain output).
@@ -2104,7 +2429,7 @@ export const tameRenderedConsonantPeaks = (
         : 0;
       // Grow depth continuously with evidence on each side. Geometric support
       // keeps the relationship symmetric (a weak lane cannot lend a stronger
-      // budget than it owns), avoids the former one-cell -> two-cell 2.5 dB
+      // budget than it owns), avoids a one-cell -> two-cell depth cliff,
       // cliff, while sustained multi-cell evidence can accumulate more depth.
       const previousEvidenceSupportDb = Math.sqrt(
         requestedReductionDb * previousSupportDb,

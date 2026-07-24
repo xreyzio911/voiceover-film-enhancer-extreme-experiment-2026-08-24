@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   computeSpeechKWeightedEnergyDb,
+  measurePlannerDeliverySafetyEvidence,
+  resolveBlendDeliverySafetyEvidence,
+  resolveEvidenceAwarePlannerDeliveryMakeupDb,
   resolvePlannerGainFrameRange,
   resolvePlannerDeliveryMakeupDb,
+  resolveSafePositiveDeliveryGainDb,
   resolveSourceRelativeFinalTone,
+  type PlannerDeliverySafetyEvidence,
 } from "./plannerDelivery.ts";
 import { applyGainCurveToSamples } from "./gainPlanner.ts";
 
@@ -17,6 +22,124 @@ const buildSpeechTone = (sampleRate: number, seconds: number, amplitude: number)
   }
   return samples;
 };
+
+const dbToAmplitude = (db: number) => 10 ** (db / 20);
+
+const fillAlternatingFrame = (
+  samples: Float32Array,
+  frame: number,
+  samplesPerFrame: number,
+  levelDb: number,
+) => {
+  const amplitude = dbToAmplitude(levelDb);
+  const start = frame * samplesPerFrame;
+  const end = Math.min(samples.length, start + samplesPerFrame);
+  for (let index = start; index < end; index += 1) {
+    samples[index] = (index - start) % 2 === 0 ? amplitude : -amplitude;
+  }
+};
+
+const buildMergedBedFixture = ({
+  bedDb,
+  samplePeakDb = -4,
+}: Readonly<{
+  bedDb: number;
+  samplePeakDb?: number;
+}>) => {
+  const sampleRate = 1_000;
+  const frameMs = 10;
+  const frameCount = 400;
+  const samplesPerFrame = (sampleRate * frameMs) / 1_000;
+  const samples = new Float32Array(frameCount * samplesPerFrame);
+  const activityMask = new Array<boolean>(frameCount).fill(false);
+
+  for (let frame = 200; frame < frameCount; frame += 1) {
+    fillAlternatingFrame(samples, frame, samplesPerFrame, bedDb);
+    activityMask[frame] = true;
+  }
+  for (const [start, end] of [
+    [240, 270],
+    [325, 350],
+    [375, 390],
+  ]) {
+    for (let frame = start; frame < end; frame += 1) {
+      fillAlternatingFrame(samples, frame, samplesPerFrame, -28);
+    }
+  }
+  samples[255 * samplesPerFrame] = dbToAmplitude(samplePeakDb);
+
+  return { samples, sampleRate, activityMask, frameMs };
+};
+
+const safetyEvidence = (
+  overrides: Partial<PlannerDeliverySafetyEvidence> = {},
+): PlannerDeliverySafetyEvidence => ({
+  nonzeroQuietBedDb: -76,
+  nonzeroQuietBedConfidence: 0.95,
+  nearSpeechFloorDb: -72,
+  nearSpeechFloorConfidence: 0.9,
+  samplePeakDb: -14,
+  ...overrides,
+});
+
+test("scene blend derives continuous conservative delivery evidence without decoding another full WAV", () => {
+  const input = Object.freeze(
+    safetyEvidence({
+      nonzeroQuietBedDb: -70,
+      nearSpeechFloorDb: -66,
+      samplePeakDb: -12,
+    }),
+  );
+  const snapshot = JSON.stringify(input);
+  const blended = resolveBlendDeliverySafetyEvidence({
+    inputSafetyEvidence: input,
+    indoorGain: 0.07,
+    outdoorGain: 0.055,
+    limiterCeilingDb: -2,
+  });
+  const nearby = resolveBlendDeliverySafetyEvidence({
+    inputSafetyEvidence: input,
+    indoorGain: 0.0701,
+    outdoorGain: 0.055,
+    limiterCeilingDb: -2,
+  });
+
+  assert.ok(blended);
+  assert.ok(nearby);
+  assert.ok(
+    blended.nonzeroQuietBedDb !== null &&
+      blended.nonzeroQuietBedDb > -70 &&
+      blended.nonzeroQuietBedDb < -69.4,
+    `the conservative blend envelope should reflect only the small wet sum, got ${String(blended.nonzeroQuietBedDb)}`,
+  );
+  assert.ok(
+    blended.nearSpeechFloorDb !== null &&
+      blended.nearSpeechFloorDb > -66 &&
+      blended.nearSpeechFloorDb < -65.4,
+  );
+  assert.ok(
+    blended.samplePeakDb !== null &&
+      blended.samplePeakDb >= -12 &&
+      blended.samplePeakDb <= -2,
+    `blend peak evidence must remain a conservative limiter-bounded upper envelope, got ${String(blended.samplePeakDb)}`,
+  );
+  assert.ok(
+    Math.abs(
+      (nearby.nonzeroQuietBedDb as number) -
+        (blended.nonzeroQuietBedDb as number),
+    ) < 0.01,
+    "a 0.0001 wet-gain change must not create an evidence step",
+  );
+  assert.equal(JSON.stringify(input), snapshot);
+  assert.equal(
+    resolveBlendDeliverySafetyEvidence({
+      inputSafetyEvidence: null,
+      indoorGain: 0.07,
+      outdoorGain: 0.055,
+    }),
+    null,
+  );
+});
 
 test("speech K energy averages only selected speech samples", () => {
   const sampleRate = 16_000;
@@ -108,6 +231,312 @@ test("planner delivery makeup fails open and never attenuates or exceeds bounded
     }),
     10.5,
   );
+});
+
+test("delivery safety evidence finds a persistent nonzero bed even when the speech mask merges it", () => {
+  const fixture = buildMergedBedFixture({ bedDb: -52 });
+  const beforeSamples = new Float32Array(fixture.samples);
+  const beforeMask = [...fixture.activityMask];
+  const measured = measurePlannerDeliverySafetyEvidence(
+    fixture.samples,
+    fixture.sampleRate,
+    fixture.activityMask,
+    fixture.frameMs,
+  );
+
+  assert.ok(measured.nonzeroQuietBedDb !== null);
+  assert.ok(
+    (measured.nonzeroQuietBedDb ?? -120) > -54 &&
+      (measured.nonzeroQuietBedDb ?? 0) < -50,
+    `the persistent bed should measure near -52 dB, got ${measured.nonzeroQuietBedDb}`,
+  );
+  assert.ok(
+    measured.nonzeroQuietBedConfidence > 0.45,
+    `the long, separated bed should carry useful confidence, got ${measured.nonzeroQuietBedConfidence}`,
+  );
+  assert.ok(measured.nearSpeechFloorDb !== null);
+  assert.ok(
+    (measured.nearSpeechFloorDb ?? -120) > -54 &&
+      (measured.nearSpeechFloorDb ?? 0) < -49,
+    `embedded near-speech bed should remain visible, got ${measured.nearSpeechFloorDb}`,
+  );
+  assert.ok(measured.nearSpeechFloorConfidence > 0.3);
+  assert.ok(Math.abs((measured.samplePeakDb ?? -120) - -4) < 0.01);
+  assert.deepEqual(fixture.samples, beforeSamples, "measurement must not mutate decoded samples");
+  assert.deepEqual(fixture.activityMask, beforeMask, "measurement must not mutate the shared speech mask");
+});
+
+test("delivery safety evidence assigns low bed authority to steady quiet speech", () => {
+  const sampleRate = 1_000;
+  const frameMs = 10;
+  const frameCount = 300;
+  const samplesPerFrame = (sampleRate * frameMs) / 1_000;
+  const samples = new Float32Array(frameCount * samplesPerFrame);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    fillAlternatingFrame(samples, frame, samplesPerFrame, -48);
+  }
+
+  const measured = measurePlannerDeliverySafetyEvidence(
+    samples,
+    sampleRate,
+    new Array<boolean>(frameCount).fill(true),
+    frameMs,
+  );
+
+  assert.ok(Math.abs((measured.nonzeroQuietBedDb ?? -120) - -48) < 0.05);
+  assert.ok(
+    measured.nonzeroQuietBedConfidence < 0.08,
+    `a single steady level has no evidence of a distinct quiet bed, got ${measured.nonzeroQuietBedConfidence}`,
+  );
+  assert.ok(
+    measured.nearSpeechFloorConfidence < 0.08,
+    "the same steady speech must not acquire a second high-confidence noise label",
+  );
+});
+
+test("exact digital silence is exempt from nonzero-bed evidence", () => {
+  const measured = measurePlannerDeliverySafetyEvidence(
+    new Float32Array(2_000),
+    1_000,
+    new Array<boolean>(200).fill(false),
+    10,
+  );
+
+  assert.deepEqual(measured, {
+    nonzeroQuietBedDb: null,
+    nonzeroQuietBedConfidence: 0,
+    nearSpeechFloorDb: null,
+    nearSpeechFloorConfidence: 0,
+    samplePeakDb: null,
+  });
+});
+
+test("delivery safety evidence measures the exact decoded peak beyond a shorter activity mask", () => {
+  const samples = new Float32Array(2_000);
+  samples.fill(dbToAmplitude(-60), 0, 1_000);
+  samples[1_999] = 1;
+
+  const measured = measurePlannerDeliverySafetyEvidence(
+    samples,
+    1_000,
+    new Array<boolean>(100).fill(true),
+    10,
+  );
+
+  assert.equal(
+    measured.samplePeakDb,
+    0,
+    "limiter headroom must use the whole decoded buffer, not only mask-covered frames",
+  );
+});
+
+test("source-relative quiet-bed headroom spends denoise-earned room without lifting an unchanged bed", () => {
+  const source = safetyEvidence({
+    nonzeroQuietBedDb: -52,
+    nonzeroQuietBedConfidence: 1,
+    nearSpeechFloorDb: -50,
+    nearSpeechFloorConfidence: 1,
+    samplePeakDb: -5,
+  });
+  const unchanged = safetyEvidence({
+    nonzeroQuietBedDb: -52,
+    nonzeroQuietBedConfidence: 1,
+    nearSpeechFloorDb: -50,
+    nearSpeechFloorConfidence: 1,
+    samplePeakDb: -8,
+  });
+  const denoised = safetyEvidence({
+    nonzeroQuietBedDb: -58,
+    nonzeroQuietBedConfidence: 1,
+    nearSpeechFloorDb: -56,
+    nearSpeechFloorConfidence: 1,
+    samplePeakDb: -10,
+  });
+
+  const unchangedGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 10.5,
+    sourceSafetyEvidence: source,
+    renderedSafetyEvidence: unchanged,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const denoisedGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 10.5,
+    sourceSafetyEvidence: source,
+    renderedSafetyEvidence: denoised,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+
+  assert.ok(
+    unchangedGain >= 0.7 && unchangedGain <= 1,
+    `an unchanged, elevated bed should receive only the subtle source-relative budget, got ${unchangedGain}`,
+  );
+  assert.ok(
+    denoisedGain >= 6.7 && denoisedGain <= 7,
+    `six dB of denoise should earn approximately six dB more makeup, got ${denoisedGain}`,
+  );
+  assert.ok(denoisedGain > unchangedGain + 5.8);
+});
+
+test("clean low-floor evidence preserves requested makeup while peak evidence limits limiter drive", () => {
+  const cleanSource = safetyEvidence({
+    nonzeroQuietBedDb: -80,
+    nearSpeechFloorDb: -74,
+    samplePeakDb: -15,
+  });
+  const cleanRendered = safetyEvidence({
+    nonzeroQuietBedDb: -81,
+    nearSpeechFloorDb: -75,
+    samplePeakDb: -14,
+  });
+
+  assert.equal(
+    resolveSafePositiveDeliveryGainDb({
+      requestedGainDb: 8,
+      sourceSafetyEvidence: cleanSource,
+      renderedSafetyEvidence: cleanRendered,
+      limiterCeilingDb: -2,
+      allowedLimiterDriveDb: 1.5,
+    }),
+    8,
+    "a genuinely low floor and ample peak headroom should not reduce useful makeup",
+  );
+
+  const peakLimited = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 8,
+    sourceSafetyEvidence: cleanSource,
+    renderedSafetyEvidence: {
+      ...cleanRendered,
+      samplePeakDb: -2.5,
+    },
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  assert.ok(
+    Math.abs(peakLimited - 2) < 1e-9,
+    `static gain may drive the -2 dB limiter by at most 1.5 dB, got ${peakLimited}`,
+  );
+});
+
+test("evidence-aware planner makeup fails safely on missing or polluted safety evidence", () => {
+  const valid = safetyEvidence();
+  const base = {
+    plannerTargetDb: -22,
+    speechKWeightedEnergyDb: -40,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  } as const;
+
+  assert.equal(
+    resolveEvidenceAwarePlannerDeliveryMakeupDb({
+      ...base,
+      sourceSafetyEvidence: null,
+      renderedSafetyEvidence: valid,
+    }),
+    0,
+  );
+  assert.equal(
+    resolveEvidenceAwarePlannerDeliveryMakeupDb({
+      ...base,
+      sourceSafetyEvidence: valid,
+      renderedSafetyEvidence: {
+        ...valid,
+        nearSpeechFloorConfidence: Number.NaN,
+      },
+    }),
+    0,
+  );
+  assert.equal(
+    resolveEvidenceAwarePlannerDeliveryMakeupDb({
+      ...base,
+      sourceSafetyEvidence: valid,
+      renderedSafetyEvidence: {
+        ...valid,
+        samplePeakDb: null,
+      },
+    }),
+    0,
+    "the new path must not silently fall back to the legacy +10.5 dB cap",
+  );
+  assert.equal(
+    resolveSafePositiveDeliveryGainDb({
+      requestedGainDb: -3,
+      sourceSafetyEvidence: valid,
+      renderedSafetyEvidence: valid,
+      limiterCeilingDb: -2,
+      allowedLimiterDriveDb: 1.5,
+    }),
+    0,
+    "the helper owns positive delivery gain only",
+  );
+});
+
+test("delivery gain authority is continuous at 0.01 dB evidence changes", () => {
+  const source = safetyEvidence({
+    nonzeroQuietBedDb: -52,
+    nonzeroQuietBedConfidence: 0.82,
+    nearSpeechFloorDb: -50,
+    nearSpeechFloorConfidence: 0.78,
+    samplePeakDb: -12,
+  });
+  const rendered = safetyEvidence({
+    nonzeroQuietBedDb: -53,
+    nonzeroQuietBedConfidence: 0.83,
+    nearSpeechFloorDb: -51,
+    nearSpeechFloorConfidence: 0.79,
+    samplePeakDb: -12,
+  });
+  const initial = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 7,
+    sourceSafetyEvidence: source,
+    renderedSafetyEvidence: rendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const nearby = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 7,
+    sourceSafetyEvidence: source,
+    renderedSafetyEvidence: {
+      ...rendered,
+      nonzeroQuietBedDb: (rendered.nonzeroQuietBedDb as number) + 0.01,
+      nearSpeechFloorDb: (rendered.nearSpeechFloorDb as number) + 0.01,
+      samplePeakDb: (rendered.samplePeakDb as number) + 0.01,
+    },
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+
+  assert.ok(initial > 0);
+  assert.ok(
+    Math.abs(nearby - initial) <= 0.03,
+    `a 0.01 dB evidence change must not create a gain step: ${initial} -> ${nearby}`,
+  );
+});
+
+test("delivery gain policy is deterministic and immutable", () => {
+  const source = Object.freeze(safetyEvidence());
+  const rendered = Object.freeze(
+    safetyEvidence({
+      nonzeroQuietBedDb: -70,
+      nearSpeechFloorDb: -68,
+      samplePeakDb: -9,
+    }),
+  );
+  const options = Object.freeze({
+    requestedGainDb: 6.25,
+    sourceSafetyEvidence: source,
+    renderedSafetyEvidence: rendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const snapshot = JSON.stringify(options);
+
+  const first = resolveSafePositiveDeliveryGainDb(options);
+  const second = resolveSafePositiveDeliveryGainDb(options);
+
+  assert.equal(first, second);
+  assert.equal(JSON.stringify(options), snapshot);
 });
 
 test("range-local planner apply slices local gain frames for non-zero source offsets", () => {

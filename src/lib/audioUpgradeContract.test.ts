@@ -170,7 +170,12 @@ test("final app polish uses the isolated linear filter instead of rerunning the 
   );
 
   assert.match(finalPolishBlock, /resolveSourceRelativeFinalTone\(/);
-  assert.match(finalPolishBlock, /resolvePlannerDeliveryMakeupDb\(/);
+  assert.match(finalPolishBlock, /resolveEvidenceAwarePlannerDeliveryMakeupDb\(/);
+  assert.doesNotMatch(
+    finalPolishBlock,
+    /resolvePlannerDeliveryMakeupDb\(/,
+    "the shipped final-polish path must not retain the legacy speech-only +10.5 dB authority",
+  );
   assert.match(finalPolishBlock, /buildFinalPolishFilter\(/);
   assert.match(finalPolishBlock, /"-af",\s*finalPolishFilter/);
   assert.match(finalPolishBlock, /"Linear final app polish"/);
@@ -184,6 +189,10 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "const computeEnvelopeMetrics = (samples: Float32Array)",
     "const parseSilencedetectSpans =",
   );
+  const exactSampleEvidenceBlock = sourceBetween(
+    "const measureFinalPolishEvidenceFromAnalysisSamples = (",
+    "const mergeNativeFinalToneEvidence = (",
+  );
   const exactEvidenceRecoveryBlock = sourceBetween(
     "const recoverFinalPolishEvidenceFromExactWav = async (",
     "const runCrossfadeConcat = async (",
@@ -195,6 +204,14 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
   const finalPolishBlock = sourceBetween(
     "const runFinalAppPolishPass = async",
     "const analyzeIntegratedLoudness = async",
+  );
+  const batchAlignmentBlock = sourceBetween(
+    "const alignBatchMixReadyOutputs = async",
+    "const applyFinalConsonantResidualToOutputs = async",
+  );
+  const longFormBlock = sourceBetween(
+    "const renderLongFormSafeMode = async",
+    "const safeDeleteFile = async",
   );
   const aggregationBlock = sourceBetween(
     "const aggregateWindowAnalyses = (",
@@ -210,6 +227,7 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "speechKWeightedEnergyDb = computeSpeechKWeightedEnergyDb(",
     "activityMask,",
     "speechBandSpectrumDb = computeLogBandSpectrumDb(",
+    "plannerDeliverySafetyEvidence = measurePlannerDeliverySafetyEvidence(",
   ]);
   assert.match(
     aggregationBlock,
@@ -250,8 +268,68 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
   );
   assert.match(
     finalPolishBlock,
-    /resolvePlannerDeliveryMakeupDb\(\{[\s\S]*?speechKWeightedEnergyDb: renderedAnalysis\?\.speechKWeightedEnergyDb/,
+    /resolveEvidenceAwarePlannerDeliveryMakeupDb\(\{[\s\S]*?speechKWeightedEnergyDb: renderedAnalysis\?\.speechKWeightedEnergyDb,[\s\S]*?sourceSafetyEvidence: sourceAnalysis\?\.plannerDeliverySafetyEvidence,[\s\S]*?renderedSafetyEvidence: renderedAnalysis\?\.plannerDeliverySafetyEvidence/,
     "native-rate evidence must not replace the established 16 kHz planner delivery measurement",
+  );
+  assert.match(
+    exactSampleEvidenceBlock,
+    /measurePlannerDeliverySafetyEvidence\([\s\S]*?samples,[\s\S]*?sampleRate,[\s\S]*?activityMask,[\s\S]*?ENVELOPE_FRAME_MS/,
+    "the exact-WAV recovery path must measure nonzero-bed and peak authority from its shared decoded samples and speech mask",
+  );
+  assert.match(
+    exactEvidenceRecoveryBlock,
+    /measureFinalPolishEvidenceFromVirtualWav\(ffmpeg, targetName\)/,
+  );
+  assert.match(
+    voLevelerSource,
+    /type FinalPolishEvidence = Pick<[\s\S]*?"plannerDeliverySafetyEvidence"/,
+    "delivery evidence must retain the source-relative noise and peak measurement",
+  );
+  assert.match(
+    aggregationBlock,
+    /aggregated\.plannerDeliverySafetyEvidence = null/,
+    "sampled windows must not claim whole-file peak authority for positive file-wide gain",
+  );
+  assert.match(
+    processFilesBlock,
+    /selectedFinalPolishEvidence\s*=\s*selectedPostPolishArtifact\.finalPolishEvidence/,
+    "batch alignment must use evidence measured from the selected post-polish bytes",
+  );
+  assert.match(
+    processFilesBlock,
+    /selectedFinalPolishEvidence\s*=\s*correctiveArtifact\.finalPolishEvidence/,
+    "a winning corrective render must replace stale delivery evidence",
+  );
+  assert.match(
+    processFilesBlock,
+    /deliverySafetyEvidence:[\s\S]*?selectedFinalPolishEvidence\?\.plannerDeliverySafetyEvidence/,
+  );
+  assert.match(
+    processFilesBlock,
+    /const blendDeliverySafetyEvidence\s*=\s*resolveBlendDeliverySafetyEvidence\(\{[\s\S]*?inputSafetyEvidence:[\s\S]*?selectedFinalPolishEvidence\?\.plannerDeliverySafetyEvidence[\s\S]*?indoorGain,[\s\S]*?outdoorGain,[\s\S]*?deliverySafetyEvidence:\s*blendDeliverySafetyEvidence/,
+    "scene-blend alignment must propagate a conservative envelope from the selected clean bytes",
+  );
+  assert.doesNotMatch(
+    processFilesBlock,
+    /measureFinalPolishEvidenceFromVirtualWav\([\s\S]{0,240}?job\.blendMixName/,
+    "scene blend must not reintroduce an unbounded full-WAV evidence decode",
+  );
+  assert.match(
+    longFormBlock,
+    /long-form parts retain negative alignment, but optional positive batch gain is omitted because bounded windows cannot prove whole-file peak headroom/,
+    "the memory-bounded long-form limitation must remain explicit and observable",
+  );
+  assertMarkersInOrder(batchAlignmentBlock, [
+    "const requestedOffsetDb = plan.offsetDb",
+    "resolveSafePositiveDeliveryGainDb({",
+    "sourceSafetyEvidence:",
+    "renderedSafetyEvidence:",
+    "`volume=${authorizedOffsetDb.toFixed(2)}dB",
+  ]);
+  assert.match(
+    batchAlignmentBlock,
+    /omittedPositiveAlignmentCount[\s\S]*?requestedOffsetDb > 0 && authorizedOffsetDb <= 0[\s\S]*?omittedPositiveAlignmentCount \+= 1[\s\S]*?alignedCount === 0[\s\S]*?omittedPositiveAlignmentCount > 0/,
+    "an omitted positive offset must not be reported as already aligned",
   );
 });
 
@@ -275,6 +353,60 @@ test("speech-aware gain planner owns leveling without a post-planner dynaudnorm 
     dynamicsStageBlock.match(/filters\.push\(\s*`dynaudnorm=/g)?.length ?? 0,
     1,
     "buildMixFilter may retain one legacy/fallback dynaudnorm, but must not add a second planner-active stage",
+  );
+});
+
+test("planner-active renders do not stack fast event tamers or a second compressor", () => {
+  const mixFilterBlock = sourceBetween(
+    "const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions)",
+    "const runMixReady = async",
+  );
+
+  for (const [name, declaration] of [
+    ["click", "const useClickTamer ="],
+    ["onset", "const useOnsetTamer ="],
+    ["breath", "const useBreathSpikeTamer ="],
+  ] as const) {
+    const stageBlock = textBetween(
+      mixFilterBlock,
+      declaration,
+      name === "click"
+        ? "    const useOnsetTamer ="
+        : name === "onset"
+          ? "    const useBreathSpikeTamer ="
+          : "    if (controls.eqCleanup)",
+    );
+    assert.match(
+      stageBlock,
+      /!gainPlannerActive/,
+      `${name} tamer must yield fast-event authority when the planner already owns dynamics`,
+    );
+  }
+
+  assert.doesNotMatch(
+    mixFilterBlock,
+    /else if \(gainPlannerActive && !disableSpikeTamers\)[\s\S]*?acompressor=/,
+    "planner-active audio must not receive a second broadband compressor",
+  );
+  assert.match(
+    mixFilterBlock,
+    /const roomCleanupEnabled =[\s\S]*?!gainPlannerActive/,
+    "planner-active audio must not enter a second gate or dereverb authority path",
+  );
+  assert.match(
+    mixFilterBlock,
+    /const adaptiveNoiseReductionFilter = gainPlannerActive[\s\S]*?\?\s*null\s*:\s*resolveAdaptiveNoiseReductionFilter/,
+    "planner-active audio must not be spectrally erased by post-planner adaptive reduction",
+  );
+  assert.match(
+    mixFilterBlock,
+    /const breath =\s*gainPlannerActive \|\| sourceSafeMode[\s\S]*?\?\s*null/,
+    "planner-active audio must not stack a broadband breath compander",
+  );
+  assert.match(
+    mixFilterBlock,
+    /const preferFloorGuard =\s*!gainPlannerActive/,
+    "planner-active audio must not stack a floor compander",
   );
 });
 
@@ -324,6 +456,26 @@ test("distributed speech spectra retain recurring event authority without a bina
   assert.doesNotMatch(aggregationBlock, /sibilanceScore\s*>=/);
 });
 
+test("fricative onset evidence learns the recurring recording bed instead of digital silence", () => {
+  const plannerAnalysisBlock = sourceBetween(
+    "const planGainForInput = async",
+    "const applyPlannerToFullInput = async",
+  );
+
+  assertMarkersInOrder(plannerAnalysisBlock, [
+    "const fricativeFrameDb = computeFricativeFrameDb(",
+    "const fricativeCalibration =",
+    "resolvePlannerCalibration(fricativeFrameDb, null, null)",
+    "const fricativeNoiseFloorDb = fricativeCalibration?.noiseFloorDb",
+    "fricativeNoiseFloorDb,",
+  ]);
+  assert.doesNotMatch(
+    plannerAnalysisBlock,
+    /fricativeNoiseFloorDb\s*=\s*[\s\S]*?estimatePlannerEnvelopeNoiseFloorDb\(fricativeFrameDb\)/,
+    "edited digital silence must not make ordinary high-frequency room tone look like consonant evidence",
+  );
+});
+
 test("window QC carries the measured sentence-jump and breath-spike evidence into aggregation", () => {
   const windowAnalysisBlock = sourceBetween(
     "const analyzeFileWindow = async",
@@ -347,19 +499,43 @@ test("de-esser depth follows a continuous evidence curve without the legacy enga
   assert.doesNotMatch(mixFilterBlock, /1\.2 \+ depthNorm/);
 });
 
-test("audibility recovery aligns measured DSP latency before judging speech loss", () => {
+test("audibility recovery judges the final speech band against the raw source", () => {
+  const decodeBlock = sourceBetween(
+    "const renderAudibilityFrameDb = async",
+    "const decodeWavToMono =",
+  );
   const guardBlock = sourceBetween(
     "const assertRenderedAudibility = async",
     "// Candidate renders normally receive a file-level planner context",
   );
+  const renderBlock = sourceBetween(
+    "const renderMixReadyWithFallbacks = async",
+    "const processFiles = async () =>",
+  );
 
+  assertMarkersInOrder(decodeBlock, [
+    '"-af"',
+    "AUDIBILITY_GUARD_SPEECH_BAND_FILTER",
+    '"-ar"',
+    "`${AUDIBILITY_GUARD_SAMPLE_RATE}`",
+  ]);
+  assert.match(
+    voLevelerSource,
+    /const AUDIBILITY_GUARD_SPEECH_BAND_FILTER = "highpass=f=120,lowpass=f=7500"/,
+  );
   assertMarkersInOrder(guardBlock, [
+    "if (!sourceAudibilityFrameDb)",
     "sourceAudibilityFrameDb = await renderAudibilityFrameDb(",
+    "job.inputName",
+    "`${job.base}_source`",
     "const renderedFrameDb = await renderAudibilityFrameDb(",
     "detectAlignedAudibilityDropouts({",
     "maxAlignmentMs: 60",
     "const report = alignedResult.finalReport",
   ]);
+  assert.equal((renderBlock.match(/await assertRenderedAudibility\(/g) ?? []).length, 4);
+  assert.doesNotMatch(guardBlock, /planner-leveled|referenceInputName/);
+  assert.doesNotMatch(renderBlock, /assertRenderedAudibility\([^;]*leveled[^;]*\)/);
   assert.match(guardBlock, /aligned render latency/);
   assert.doesNotMatch(
     guardBlock,
@@ -544,6 +720,56 @@ test("long-form parts use chunk-local planner leveling without the legacy auto-l
     /runFinalAppPolishPass\(\s*ffmpeg,\s*mixChunkName,\s*null,\s*null,\s*null,/,
     "long-form parts must remain deliverable through limiter-only final polish when optional evidence is unavailable",
   );
+});
+
+test("stateful segmented renders warm every noninitial filter from real source history", () => {
+  const fixedSegmentBlock = sourceBetween(
+    "const runMixReadySegmented = async",
+    "const buildSpeechAlignedRenderSegments =",
+  );
+  const speechAlignedSegmentBlock = sourceBetween(
+    "const runMixReadySpeechAlignedSegmented = async",
+    "const runBlendMixReady = async",
+  );
+
+  assert.match(
+    voLevelerSource,
+    /import\s*\{\s*resolveSegmentRenderWindow\s*\}\s*from\s*["']\.\.\/lib\/segmentRenderContinuity["']/,
+  );
+  for (const [label, block] of [
+    ["fixed", fixedSegmentBlock],
+    ["speech-aligned", speechAlignedSegmentBlock],
+  ] as const) {
+    assert.match(
+      block,
+      /resolveSegmentRenderWindow\(\{/,
+      `${label} segmentation must derive one sample-exact history and trim window`,
+    );
+    assert.match(
+      block,
+      /stateHistorySec:\s*HEAD_PRIME_SECONDS/,
+      `${label} segmentation must warm stateful filters with the same one-second context as the file head`,
+    );
+    assert.match(
+      block,
+      /"-ss",\s*renderWindow\.readStartSec\.toFixed\(6\)/,
+      `${label} segmentation must read the real historical source span`,
+    );
+    assert.match(
+      block,
+      /atrim=start=\$\{renderWindow\.trimStartSec\.toFixed\(6\)\}:end=\$\{renderWindow\.trimEndSec\.toFixed\(6\)\}/,
+      `${label} segmentation must remove filter history after processing`,
+    );
+  }
+  assert.match(fixedSegmentBlock, /isInitialSegment:\s*index === 0/);
+  assert.match(speechAlignedSegmentBlock, /isInitialSegment:\s*index === 0/);
+  assertMarkersInOrder(fixedSegmentBlock, [
+    "resolveSegmentRenderWindow({",
+    "const runUnprimed = async",
+    "renderWindow.readStartSec",
+    "filterChainWithTrim",
+    "runCrossfadeConcat(",
+  ]);
 });
 
 test("large rendered-candidate QC analyzes bounded WAV windows without restoring whole files after retry", () => {
@@ -827,7 +1053,7 @@ test("source-relative consonant polish has one cumulative-capped delivery call s
   assert.equal(
     voLevelerSource.match(/await applyFinalConsonantPeakPolish\(/g)?.length ?? 0,
     1,
-    "the 2.5 dB source-relative cap must be cumulative, not reset by stacked passes",
+    "the bounded source-relative cap must be cumulative, not reset by stacked passes",
   );
   assert.doesNotMatch(
     levelInputRangeBlock,

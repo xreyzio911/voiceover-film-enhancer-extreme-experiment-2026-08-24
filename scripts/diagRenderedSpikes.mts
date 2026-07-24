@@ -34,7 +34,7 @@ const MIN_SPEECH_RMS_DB = -70;
 const MIN_CANDIDATE_PEAK_DB = -14;
 const REFERENCE_MATCH_WINDOW_MS = 20;
 const SOURCE_ALLOWED_GROWTH_DB = 1.5;
-const SOURCE_STRONG_MAX_REDUCTION_DB = 2.5;
+const SOURCE_STRONG_MAX_REDUCTION_DB = 1.5;
 const SOURCE_WEAK_MAX_REDUCTION_DB = 1.25;
 const REDUCTION_DELIVERY_TOLERANCE_DB = 0.15;
 const CONSERVATIVE_SPEECH_BODY_MOVEMENT_DB = 0.5;
@@ -471,7 +471,7 @@ const tamed = sourceReference
   ? tameRenderedConsonantPeaks(rendered.samples, rendered.sampleRate, FRAME_MS, {
       reference: sourceReference,
       referenceMatchWindowMs: REFERENCE_MATCH_WINDOW_MS,
-      maxReductionDb: 2.5,
+      maxReductionDb: SOURCE_STRONG_MAX_REDUCTION_DB,
     })
   : {
       samples: new Float32Array(rendered.samples),

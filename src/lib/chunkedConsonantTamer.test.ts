@@ -764,7 +764,10 @@ describe("chunked mono float WAV consonant tamer", () => {
     for (const centerSec of consonantCentersSec) {
       const reductionDb = peakDbNear(renderedSamples, sampleRate, centerSec)
         - peakDbNear(decoded.samples, sampleRate, centerSec);
-      assert.ok(reductionDb >= 0.4 && reductionDb <= 2.5 + 1e-3);
+      assert.ok(
+        reductionDb >= 0.35 && reductionDb <= 1.5 + 1e-3,
+        `event at ${centerSec.toFixed(2)} s should be subtly reduced, got ${reductionDb.toFixed(3)} dB`,
+      );
     }
   });
 
@@ -837,8 +840,11 @@ describe("chunked mono float WAV consonant tamer", () => {
     for (const centerSec of consonantCentersSec) {
       const reductionDb = peakDbNear(renderedSamples, outputSampleRate, centerSec)
         - peakDbNear(decoded.samples, outputSampleRate, centerSec);
-      assert.ok(reductionDb >= 0.4, `16 kHz source evidence should repair ${centerSec.toFixed(2)} s`);
-      assert.ok(reductionDb <= 2.5 + 1e-3, `repair at ${centerSec.toFixed(2)} s exceeded the cap`);
+      assert.ok(
+        reductionDb >= 0.35,
+        `16 kHz source evidence should repair ${centerSec.toFixed(2)} s, got ${reductionDb.toFixed(3)} dB`,
+      );
+      assert.ok(reductionDb <= 1.5 + 1e-3, `repair at ${centerSec.toFixed(2)} s exceeded the cap`);
     }
   });
 
@@ -911,7 +917,7 @@ describe("chunked mono float WAV consonant tamer", () => {
     assert.ok(result.stats.processedChunkCount === 3);
     assert.ok(result.stats.changedSpanCount >= consonantCentersSec.length);
     assert.ok(result.stats.tamedFrameCount >= consonantCentersSec.length);
-    assert.ok(result.stats.maxReductionDb >= 0.4 && result.stats.maxReductionDb <= 2.5 + 1e-4);
+    assert.ok(result.stats.maxReductionDb >= 0.35 && result.stats.maxReductionDb <= 1.5 + 1e-4);
 
     const decoded = decodeWav(await result.blob.arrayBuffer());
     assert.equal(decoded.channels, 1);
@@ -928,8 +934,11 @@ describe("chunked mono float WAV consonant tamer", () => {
     for (const centerSec of consonantCentersSec) {
       const reductionDb = peakDbNear(renderedSamples, sampleRate, centerSec)
         - peakDbNear(decoded.samples, sampleRate, centerSec);
-      assert.ok(reductionDb >= 0.4, `event at ${centerSec.toFixed(2)} s should be subtly reduced`);
-      assert.ok(reductionDb <= 2.5 + 1e-3, `event at ${centerSec.toFixed(2)} s exceeded the existing cap`);
+      assert.ok(
+        reductionDb >= 0.35,
+        `event at ${centerSec.toFixed(2)} s should be subtly reduced, got ${reductionDb.toFixed(3)} dB`,
+      );
+      assert.ok(reductionDb <= 1.5 + 1e-3, `event at ${centerSec.toFixed(2)} s exceeded the residual cap`);
     }
   });
 

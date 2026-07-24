@@ -24,7 +24,6 @@ import {
   applyGainCurveToSamples,
   buildRenderedConsonantReference,
   computeFricativeFrameDb,
-  estimatePlannerEnvelopeNoiseFloorDb,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
   resolvePlannerCalibration,
@@ -36,9 +35,13 @@ import {
 } from "../lib/gainPlanner";
 import {
   computeSpeechKWeightedEnergyDb,
+  measurePlannerDeliverySafetyEvidence,
+  resolveBlendDeliverySafetyEvidence,
+  resolveEvidenceAwarePlannerDeliveryMakeupDb,
   resolvePlannerGainFrameRange,
-  resolvePlannerDeliveryMakeupDb,
+  resolveSafePositiveDeliveryGainDb,
   resolveSourceRelativeFinalTone,
+  type PlannerDeliverySafetyEvidence,
 } from "../lib/plannerDelivery";
 import {
   AUDIBILITY_SAFE_STRATEGY_LABEL,
@@ -114,6 +117,7 @@ import {
   shouldRecycleFfmpegBeforeOperation,
 } from "../lib/ffmpegLifecyclePolicy";
 import { resolveGainPlannerOutcome } from "../lib/plannerFallbackPolicy";
+import { resolveSegmentRenderWindow } from "../lib/segmentRenderContinuity";
 import {
   formatLongFormPartTag,
   planLongFormChunks,
@@ -428,6 +432,8 @@ type OutputEntry = {
   sourceName?: string;
   partIndex?: number;
   partTotal?: number;
+  /** Same-domain evidence that bounds any later positive batch scalar. */
+  deliverySafetyEvidence?: PlannerDeliverySafetyEvidence | null;
 };
 
 type ReviewBundleAsset = {
@@ -492,6 +498,8 @@ type FileAnalysis = {
   speechBandSpectrumDb: number[] | null;
   /** K-weighted energy averaged only across speech-selected analysis samples. */
   speechKWeightedEnergyDb: number | null;
+  /** Nonzero-bed and whole-buffer peak evidence for later static gain authority. */
+  plannerDeliverySafetyEvidence: PlannerDeliverySafetyEvidence | null;
   sibilanceScore: number | null;
   noiseFloorDb: number | null;
   pauseNoiseFloorDb: number | null;
@@ -533,7 +541,7 @@ type FileAnalysis = {
 
 type FinalPolishEvidence = Pick<
   FileAnalysis,
-  "speechBandSpectrumDb" | "speechKWeightedEnergyDb"
+  "speechBandSpectrumDb" | "speechKWeightedEnergyDb" | "plannerDeliverySafetyEvidence"
 > & {
   /** Optional native-rate speech spectrum used only for the 10-16 kHz shelf. */
   nativeFinalToneSpectrumDb?: number[] | null;
@@ -665,6 +673,7 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   bandSpectrumDb: null,
   speechBandSpectrumDb: null,
   speechKWeightedEnergyDb: null,
+  plannerDeliverySafetyEvidence: null,
   sibilanceScore: null,
   noiseFloorDb: null,
   pauseNoiseFloorDb: null,
@@ -728,6 +737,12 @@ const measureFinalPolishEvidenceFromAnalysisSamples = (
     });
     if (!activityMask.some(Boolean)) return null;
 
+    const plannerDeliverySafetyEvidence = measurePlannerDeliverySafetyEvidence(
+      samples,
+      sampleRate,
+      activityMask,
+      ENVELOPE_FRAME_MS,
+    );
     const speechKWeightedEnergyDb = computeSpeechKWeightedEnergyDb(
       samples,
       sampleRate,
@@ -754,6 +769,7 @@ const measureFinalPolishEvidenceFromAnalysisSamples = (
     return {
       speechBandSpectrumDb,
       speechKWeightedEnergyDb,
+      plannerDeliverySafetyEvidence,
     };
   } catch {
     return null;
@@ -767,10 +783,42 @@ const mergeNativeFinalToneEvidence = (
   const nativeFinalToneSpectrumDb = decoded
     ? measureNativeFinalToneSpectrumDb(decoded.monoSamples, decoded.sampleRate)
     : null;
-  if (!evidence && !nativeFinalToneSpectrumDb) return null;
+  let exactPlannerDeliverySafetyEvidence: PlannerDeliverySafetyEvidence | null = null;
+  if (decoded) {
+    try {
+      const frameDb = frameDbFromFloatSamples(
+        decoded.monoSamples,
+        decoded.sampleRate,
+        ENVELOPE_FRAME_MS,
+      );
+      if (frameDb.length >= 20) {
+        const activityNoiseFloorDb = percentile(frameDb, 25) ?? -72;
+        const activityMask = buildSpeechMask(frameDb, activityNoiseFloorDb, {
+          frameMs: ENVELOPE_FRAME_MS,
+        });
+        if (activityMask.some(Boolean)) {
+          exactPlannerDeliverySafetyEvidence = measurePlannerDeliverySafetyEvidence(
+            decoded.monoSamples,
+            decoded.sampleRate,
+            activityMask,
+            ENVELOPE_FRAME_MS,
+          );
+        }
+      }
+    } catch {
+      exactPlannerDeliverySafetyEvidence = null;
+    }
+  }
+  if (!evidence && !nativeFinalToneSpectrumDb && !exactPlannerDeliverySafetyEvidence) {
+    return null;
+  }
   return {
     speechBandSpectrumDb: evidence?.speechBandSpectrumDb ?? null,
     speechKWeightedEnergyDb: evidence?.speechKWeightedEnergyDb ?? null,
+    plannerDeliverySafetyEvidence:
+      exactPlannerDeliverySafetyEvidence ??
+      evidence?.plannerDeliverySafetyEvidence ??
+      null,
     nativeFinalToneSpectrumDb,
   };
 };
@@ -1474,6 +1522,8 @@ const summarizeFailureReason = (error: unknown) => {
         inputName,
         "-ac",
         "1",
+        "-af",
+        AUDIBILITY_GUARD_SPEECH_BAND_FILTER,
         "-ar",
         `${AUDIBILITY_GUARD_SAMPLE_RATE}`,
         "-f",
@@ -1909,10 +1959,11 @@ const summarizeFailureReason = (error: unknown) => {
         GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
         GAIN_PLANNER_FRAME_MS,
       );
-      const fricativeNoiseFloorDb =
+      const fricativeCalibration =
         fricativeFrameDb.length === frameDb.length
-          ? estimatePlannerEnvelopeNoiseFloorDb(fricativeFrameDb)
-          : undefined;
+          ? resolvePlannerCalibration(fricativeFrameDb, null, null)
+          : null;
+      const fricativeNoiseFloorDb = fricativeCalibration?.noiseFloorDb;
 
       const analysisNoiseFloorDb =
         profile?.noiseFloorDb ?? analysis?.pauseNoiseFloorDb ?? analysis?.noiseFloorDb ?? -70;
@@ -2074,6 +2125,10 @@ const summarizeFailureReason = (error: unknown) => {
   const AUDIBILITY_GUARD_SAMPLE_RATE = 16000;
   const AUDIBILITY_GUARD_FRAME_MS = 20;
   const AUDIBILITY_GUARD_MAX_DURATION_SECONDS = 1800;
+  // Audibility is a speech-presence question. Measuring the same band on the
+  // candidate input and render keeps low-frequency thumps, handling noise, and
+  // intentional high-pass cleanup from masquerading as missing dialogue.
+  const AUDIBILITY_GUARD_SPEECH_BAND_FILTER = "highpass=f=120,lowpass=f=7500";
 
   type PlannerRangeReferenceCapture = Readonly<{
     referenceAccumulator: NativeConsonantReferenceAccumulator;
@@ -2449,6 +2504,7 @@ const summarizeFailureReason = (error: unknown) => {
         bandSpectrumDb: null,
         speechBandSpectrumDb: null,
         speechKWeightedEnergyDb: null,
+        plannerDeliverySafetyEvidence: null,
         sibilanceScore: null,
       };
     }
@@ -2461,6 +2517,8 @@ const summarizeFailureReason = (error: unknown) => {
     let bandSpectrumDb: number[] | null = null;
     let speechBandSpectrumDb: number[] | null = null;
     let speechKWeightedEnergyDb: number | null = null;
+    let plannerDeliverySafetyEvidence: PlannerDeliverySafetyEvidence | null = null;
+    let deliveryActivityMask: boolean[] | null = null;
     let eventSibilanceAuthority = 0;
     let sibilanceScore: number | null = null;
     if (samples.length >= ANALYSIS_SAMPLE_RATE) {
@@ -2480,6 +2538,7 @@ const summarizeFailureReason = (error: unknown) => {
           frameMs: ENVELOPE_FRAME_MS,
         });
         if (activityMask.some(Boolean)) {
+          deliveryActivityMask = activityMask;
           speechKWeightedEnergyDb = computeSpeechKWeightedEnergyDb(
             samples,
             ANALYSIS_SAMPLE_RATE,
@@ -2500,6 +2559,14 @@ const summarizeFailureReason = (error: unknown) => {
         speechKWeightedEnergyDb = null;
       }
     }
+    if (deliveryActivityMask) {
+      plannerDeliverySafetyEvidence = measurePlannerDeliverySafetyEvidence(
+        samples,
+        ANALYSIS_SAMPLE_RATE,
+        deliveryActivityMask,
+        ENVELOPE_FRAME_MS,
+      );
+    }
     const spectralDecisionDb = speechBandSpectrumDb ?? bandSpectrumDb;
     sibilanceScore = spectralDecisionDb
       ? Math.max(computeSibilanceScore(spectralDecisionDb), eventSibilanceAuthority)
@@ -2511,6 +2578,7 @@ const summarizeFailureReason = (error: unknown) => {
       bandSpectrumDb,
       speechBandSpectrumDb,
       speechKWeightedEnergyDb,
+      plannerDeliverySafetyEvidence,
       sibilanceScore,
     };
   };
@@ -2943,6 +3011,7 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.bandSpectrumDb = envelope.bandSpectrumDb;
       analysis.speechBandSpectrumDb = envelope.speechBandSpectrumDb;
       analysis.speechKWeightedEnergyDb = envelope.speechKWeightedEnergyDb;
+      analysis.plannerDeliverySafetyEvidence = envelope.plannerDeliverySafetyEvidence;
       analysis.sibilanceScore = envelope.sibilanceScore;
     } finally {
       await safeDeleteFile(ffmpeg, analysisName);
@@ -3039,9 +3108,22 @@ const summarizeFailureReason = (error: unknown) => {
 
     for (const key of Object.keys(baseAnalysis) as Array<keyof FileAnalysis>) {
       if (aggregated[key] !== null) continue;
-      (aggregated as Record<string, number | number[] | boolean | null>)[key] =
-        (baseAnalysis as Record<string, number | number[] | boolean | null>)[key];
+      (
+        aggregated as Record<
+          string,
+          number | number[] | boolean | PlannerDeliverySafetyEvidence | null
+        >
+      )[key] = (
+        baseAnalysis as Record<
+          string,
+          number | number[] | boolean | PlannerDeliverySafetyEvidence | null
+        >
+      )[key];
     }
+    // Window samples can describe tone and typical energy, but they cannot
+    // prove a whole-file peak. Do not turn sampled evidence into authority for
+    // a later positive file-wide scalar.
+    aggregated.plannerDeliverySafetyEvidence = null;
 
     return aggregated;
   };
@@ -4046,8 +4128,14 @@ const summarizeFailureReason = (error: unknown) => {
     const dyn = sourceSafeMode ? null : levelerSettings.dyna;
     const gainPlannerActive = options?.gainPlannerActive === true;
     const roomCleanupEnabled =
-      controls.roomCleanup && !options?.disableRoomCleanup && !minimalStabilityChain && !sourceSafeMode;
-    const adaptiveNoiseReductionFilter = resolveAdaptiveNoiseReductionFilter(profile, options);
+      !gainPlannerActive &&
+      controls.roomCleanup &&
+      !options?.disableRoomCleanup &&
+      !minimalStabilityChain &&
+      !sourceSafeMode;
+    const adaptiveNoiseReductionFilter = gainPlannerActive
+      ? null
+      : resolveAdaptiveNoiseReductionFilter(profile, options);
     const useAdaptiveNoiseReduction = adaptiveNoiseReductionFilter !== null;
     const instabilityScore = profile?.instabilityScore ?? 0;
     const clickTameStrength = profile?.clickTameStrength ?? 0;
@@ -4067,16 +4155,19 @@ const summarizeFailureReason = (error: unknown) => {
       !minimalStabilityChain &&
       !disableSpikeTamers &&
       !sourceSafeMode &&
+      !gainPlannerActive &&
       clickTameStrength >= (continuitySafeMode ? 0.38 : pauseSafeMode ? 0.42 : 0.46);
     const useOnsetTamer =
       !minimalStabilityChain &&
       !disableSpikeTamers &&
       !sourceSafeMode &&
+      !gainPlannerActive &&
       onsetTameStrength >= (continuitySafeMode ? 0.24 : 0.35);
     const useBreathSpikeTamer =
       !minimalStabilityChain &&
       !disableSpikeTamers &&
       !sourceSafeMode &&
+      !gainPlannerActive &&
       activeBreathControl !== "Off" &&
       breathTameStrength >= (continuitySafeMode ? 0.18 : 0.24);
 
@@ -4338,7 +4429,7 @@ const summarizeFailureReason = (error: unknown) => {
         breathSpikeRisk >= 0.38 ||
         continuitySafeMode);
     const breath =
-      sourceSafeMode || activeBreathControl === "Off"
+      gainPlannerActive || sourceSafeMode || activeBreathControl === "Off"
         ? null
         : pauseSafeMode && pauseNoiseRisk >= 0.38
           ? null
@@ -4357,6 +4448,7 @@ const summarizeFailureReason = (error: unknown) => {
     const useRoomGate = roomGateFilter !== null;
     const endingProtectedDialogue = strictEndingProtection || (profile?.preserveEndings ?? false);
     const preferFloorGuard =
+      !gainPlannerActive &&
       !sourceSafeMode &&
       controls.floorGuard &&
       (pauseSafeMode ||
@@ -4364,12 +4456,14 @@ const summarizeFailureReason = (error: unknown) => {
         profile?.noiseRisk === "high" ||
         (controls.noiseGuard && profile?.noiseRisk === "medium"));
     const useFloorGuard =
+      !gainPlannerActive &&
       !sourceSafeMode &&
       !useRoomGate &&
       controls.floorGuard &&
       (breath === null || preferFloorGuard) &&
       !(endingProtectedDialogue && profile?.noiseRisk === "low" && pauseNoiseRisk < 0.36);
     const useBreathCompand =
+      !gainPlannerActive &&
       !sourceSafeMode &&
       !useRoomGate &&
       breath !== null &&
@@ -4629,36 +4723,6 @@ const summarizeFailureReason = (error: unknown) => {
 
     if (sourceSafeMode) {
       // Core-safe candidate intentionally leaves dynamics to the planner and final limiter.
-    } else if (gainPlannerActive && !disableSpikeTamers) {
-      // Planner already normalized sentence-to-sentence level. Downstream
-      // compression is now *adaptive*: on clean takes we bypass entirely
-      // (planner + de-esser + alimiter are sufficient), on progressively
-      // messier takes we scale the glue up. Bypass threshold raised from
-      // 0.25 → 0.35 to address the "too_compressed" auto-review tag that
-      // fired on ~60 % of files.
-      const instabilityBlend = clamp(
-        (profile?.instabilityScore ?? 0.5) * 0.5 +
-          (profile?.lineSwingScore ?? 0.5) * 0.3 +
-          (profile?.sentenceJumpScore ?? 0.5) * 0.2,
-        0,
-        1,
-      );
-      if (instabilityBlend < 0.35) {
-        // Fully bypass downstream compression. The planner covers leveling,
-        // the de-esser covers sibilance, the alimiter covers peaks. Done.
-      } else {
-        // Scale softly from 0.35..1.0 so the transition from bypass to glue
-        // doesn't cliff. Also lighter max mix (0.55 → 0.6) and lighter
-        // ratio ceiling (1.7 → 1.6) since the planner has already handled
-        // the bulk of dynamics control.
-        const norm = (instabilityBlend - 0.35) / 0.65; // 0 at 0.35, 1 at 1.0
-        const ratio = clamp(1.3 + norm * 0.3, 1.3, 1.6);
-        const mix = clamp(0.15 + norm * 0.45, 0.15, 0.6);
-        const threshold = clamp(-22 + (1 - norm) * 2, -22, -18);
-        filters.push(
-          `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=25:release=260:mix=${mix.toFixed(2)}:detection=rms`,
-        );
-      }
     } else if (!gainPlannerActive) {
       filters.push(
         `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=${attack}:release=${release}:mix=${compMix.toFixed(2)}:detection=rms`
@@ -4710,7 +4774,12 @@ const summarizeFailureReason = (error: unknown) => {
     processingFlow: OutputEntry["processingFlow"] = "app",
     metadata: Pick<
       OutputEntry,
-      "sourceBase" | "sourceName" | "partIndex" | "partTotal" | "sourcePreservingFallback"
+      | "sourceBase"
+      | "sourceName"
+      | "partIndex"
+      | "partTotal"
+      | "sourcePreservingFallback"
+      | "deliverySafetyEvidence"
     > = {},
   ): Promise<OutputEntry> => {
     const bytes = await readVirtualFileBytes(ffmpeg, name);
@@ -4755,9 +4824,11 @@ const summarizeFailureReason = (error: unknown) => {
         );
     const makeupGainDb = sourceSafePolish
       ? 0
-      : resolvePlannerDeliveryMakeupDb({
+      : resolveEvidenceAwarePlannerDeliveryMakeupDb({
           plannerTargetDb,
           speechKWeightedEnergyDb: renderedAnalysis?.speechKWeightedEnergyDb,
+          sourceSafetyEvidence: sourceAnalysis?.plannerDeliverySafetyEvidence,
+          renderedSafetyEvidence: renderedAnalysis?.plannerDeliverySafetyEvidence,
         });
     const finalPolishFilter = buildFinalPolishFilter(sourceRelativeTone, {
       sourceSafe: sourceSafePolish,
@@ -4775,7 +4846,7 @@ const summarizeFailureReason = (error: unknown) => {
           sourceRelativeTone ? sourceRelativeTone.eightKhzTrimDb.toFixed(2) : "0.00"
         } dB / top octave ${
           sourceRelativeTone ? sourceRelativeTone.topOctaveTrimDb.toFixed(2) : "0.00"
-        } dB, static planner makeup +${makeupGainDb.toFixed(
+        } dB, authorized static planner makeup +${makeupGainDb.toFixed(
           2,
         )} dB, then delivery limiter (${formatBytes(inputByteLength)}).`,
       );
@@ -5171,14 +5242,17 @@ const summarizeFailureReason = (error: unknown) => {
         const nativeSpan = Math.min(MIX_SEGMENT_SECONDS, Math.max(remaining, 0));
         if (nativeSpan <= 0.01) break;
         const isLast = index === segmentCount - 1 || start + nativeSpan >= durationSeconds - 0.01;
-        // Non-last segments include CHUNK_CROSSFADE_SECONDS of overlap so
-        // the downstream acrossfade consumes it without shortening the
-        // total output. Per-segment filter-state restart transients get
-        // blended across the overlap instead of leaving a sample-level
-        // click at the boundary.
-        const span = isLast
-          ? nativeSpan
-          : Math.min(nativeSpan + CHUNK_CROSSFADE_SECONDS, durationSeconds - start);
+        const renderWindow = resolveSegmentRenderWindow({
+          sourceDurationSec: durationSeconds,
+          sampleRate: PLANNER_APPLY_SAMPLE_RATE,
+          segmentStartSec: start,
+          segmentEndSec: start + nativeSpan,
+          isInitialSegment: index === 0,
+          stateHistorySec: HEAD_PRIME_SECONDS,
+          outputOverlapSec: isLast ? 0 : CHUNK_CROSSFADE_SECONDS,
+        });
+        const trimFilter = `atrim=start=${renderWindow.trimStartSec.toFixed(6)}:end=${renderWindow.trimEndSec.toFixed(6)},asetpts=N/SR/TB`;
+        const filterChainWithTrim = `${filterChain},${trimFilter}`;
         const segmentName = `${tempBase}_seg_${index + 1}.wav`;
         segmentNames.push(segmentName);
 
@@ -5195,13 +5269,13 @@ const summarizeFailureReason = (error: unknown) => {
               "1",
               "-y",
               "-ss",
-              start.toFixed(3),
+              renderWindow.readStartSec.toFixed(6),
               "-t",
-              span.toFixed(3),
+              renderWindow.readDurationSec.toFixed(6),
               "-i",
               chainInput,
               "-af",
-              filterChain,
+              filterChainWithTrim,
               "-ar",
               "48000",
               "-ac",
@@ -5219,9 +5293,15 @@ const summarizeFailureReason = (error: unknown) => {
             outputName: segmentName,
             filterChain,
             options,
-            inputReadArgs: ["-ss", start.toFixed(3), "-t", span.toFixed(3)],
-            expectedDurationSec: span,
+            inputReadArgs: [
+              "-ss",
+              renderWindow.readStartSec.toFixed(6),
+              "-t",
+              renderWindow.readDurationSec.toFixed(6),
+            ],
+            expectedDurationSec: renderWindow.outputDurationSec,
             contextLabel: `${sanitizeBase(outputName)} segment 1`,
+            postPrimeFilterChain: trimFilter,
             unprimed: runUnprimed,
           });
         } else {
@@ -5502,21 +5582,22 @@ const summarizeFailureReason = (error: unknown) => {
       for (let index = 0; index < segments.length; index += 1) {
         const segment = segments[index];
         const isLast = index === segments.length - 1;
-        const readStart = Math.max(0, segment.startSec - segment.trimInMs / 1000);
         // Non-last segments include CHUNK_CROSSFADE_SECONDS of overlap past
         // their native end so `runCrossfadeConcat` can consume it without
         // shifting timing.
         const boundaryOverlap = isLast ? 0 : CHUNK_CROSSFADE_SECONDS;
-        const readEnd = Math.min(
-          durationSeconds,
-          segment.endSec + segment.trimOutMs / 1000 + boundaryOverlap,
-        );
-        const readSpan = Math.max(0.05, readEnd - readStart);
-        const trimStartSec = Math.max(0, (segment.startSec - readStart) + ((options?.trimSegmentPadMs ?? 0) / 1000));
-        const trimEndSec = Math.max(
-          trimStartSec + 0.02,
-          (segment.endSec - readStart) - ((options?.trimSegmentPadMs ?? 0) / 1000) + boundaryOverlap,
-        );
+        const renderWindow = resolveSegmentRenderWindow({
+          sourceDurationSec: durationSeconds,
+          sampleRate: PLANNER_APPLY_SAMPLE_RATE,
+          segmentStartSec: segment.startSec,
+          segmentEndSec: segment.endSec,
+          isInitialSegment: index === 0,
+          stateHistorySec: HEAD_PRIME_SECONDS,
+          leadingContextSec: segment.trimInMs / 1000,
+          trailingContextSec: segment.trimOutMs / 1000,
+          outputOverlapSec: boundaryOverlap,
+          trimPadSec: (options?.trimSegmentPadMs ?? 0) / 1000,
+        });
         const segmentName = `${tempBase}_speech_seg_${index + 1}.wav`;
         cleanupNames.push(segmentName);
 
@@ -5529,7 +5610,7 @@ const summarizeFailureReason = (error: unknown) => {
         const processedFilter = buildMixFilter(profile, segmentOptions);
         const silenceFilter = buildSilenceSegmentFilter(profile, segmentOptions);
         const baseFilter = segment.process ? processedFilter : silenceFilter;
-        const trimFilter = `atrim=start=${trimStartSec.toFixed(3)}:end=${trimEndSec.toFixed(3)},asetpts=N/SR/TB`;
+        const trimFilter = `atrim=start=${renderWindow.trimStartSec.toFixed(6)}:end=${renderWindow.trimEndSec.toFixed(6)},asetpts=N/SR/TB`;
         const filterChain = baseFilter ? `${baseFilter},${trimFilter}` : trimFilter;
 
         const runUnprimed = async () => {
@@ -5545,9 +5626,9 @@ const summarizeFailureReason = (error: unknown) => {
               "1",
               "-y",
               "-ss",
-              readStart.toFixed(3),
+              renderWindow.readStartSec.toFixed(6),
               "-t",
-              readSpan.toFixed(3),
+              renderWindow.readDurationSec.toFixed(6),
               "-i",
               chainInput,
               "-af",
@@ -5569,8 +5650,13 @@ const summarizeFailureReason = (error: unknown) => {
             outputName: segmentName,
             filterChain: baseFilter,
             options: segmentOptions,
-            inputReadArgs: ["-ss", readStart.toFixed(3), "-t", readSpan.toFixed(3)],
-            expectedDurationSec: Math.max(0.02, trimEndSec - trimStartSec),
+            inputReadArgs: [
+              "-ss",
+              renderWindow.readStartSec.toFixed(6),
+              "-t",
+              renderWindow.readDurationSec.toFixed(6),
+            ],
+            expectedDurationSec: renderWindow.outputDurationSec,
             contextLabel: `${sanitizeBase(outputName)} speech segment 1`,
             postPrimeFilterChain: trimFilter,
             unprimed: runUnprimed,
@@ -5728,6 +5814,10 @@ const summarizeFailureReason = (error: unknown) => {
   const alignBatchMixReadyOutputs = async (
     ffmpeg: FFmpeg,
     outputEntries: OutputEntry[],
+    sourceSafetyEvidenceByBase: ReadonlyMap<
+      string,
+      PlannerDeliverySafetyEvidence | null
+    >,
   ) => {
     type AlignmentTarget = { entry: OutputEntry; index: number; groupId: string };
 
@@ -5787,6 +5877,7 @@ const summarizeFailureReason = (error: unknown) => {
 
       const stagedEntries: Array<{ index: number; entry: OutputEntry }> = [];
       let alignedCount = 0;
+      let omittedPositiveAlignmentCount = 0;
       for (const [variant, variantTargets] of targetsByVariant.entries()) {
         if (variantTargets.length < 2) {
           appendLog(`[BatchAlign] ${variant} skipped (fewer than 2 outputs).`);
@@ -5846,7 +5937,29 @@ const summarizeFailureReason = (error: unknown) => {
             continue;
           }
 
+          let authorizedGroupCount = 0;
           for (const target of groupTargets) {
+            const requestedOffsetDb = plan.offsetDb;
+            const authorizedOffsetDb =
+              requestedOffsetDb > 0
+                ? resolveSafePositiveDeliveryGainDb({
+                    requestedGainDb: requestedOffsetDb,
+                    sourceSafetyEvidence: target.entry.sourceBase
+                      ? sourceSafetyEvidenceByBase.get(target.entry.sourceBase)
+                      : null,
+                    renderedSafetyEvidence: target.entry.deliverySafetyEvidence,
+                  })
+                : requestedOffsetDb;
+            if (requestedOffsetDb > 0 && authorizedOffsetDb <= 0) {
+              omittedPositiveAlignmentCount += 1;
+              appendLog(
+                `[BatchAlign] ${target.entry.name}: requested ${formatSigned(
+                  requestedOffsetDb,
+                  1,
+                )} dB positive alignment omitted because the selected bytes do not have measured noise-and-peak headroom.`,
+              );
+              continue;
+            }
             await recycleBeforeOperation("render");
             const inputName = `batch_align_${target.index}_in.wav`;
             const outputName = `batch_align_${target.index}_out.wav`;
@@ -5867,7 +5980,7 @@ const summarizeFailureReason = (error: unknown) => {
                   "-i",
                   inputName,
                   "-af",
-                  `volume=${plan.offsetDb.toFixed(2)}dB,${LIMITER_FILTER}`,
+                  `volume=${authorizedOffsetDb.toFixed(2)}dB,${LIMITER_FILTER}`,
                   "-ar",
                   "48000",
                   "-ac",
@@ -5904,14 +6017,14 @@ const summarizeFailureReason = (error: unknown) => {
                 Number.isFinite(alignedLoudness.inputI)
               ) {
                 const movedOppositeDirection =
-                  plan.offsetDb > 0
+                  authorizedOffsetDb > 0
                     ? alignedLoudness.inputI < beforeI - 0.1
                     : alignedLoudness.inputI > beforeI + 0.1;
                 if (movedOppositeDirection) {
                   throw new Error(
                     `loudness moved opposite requested offset (${beforeI.toFixed(1)} -> ${alignedLoudness.inputI.toFixed(
                       1,
-                    )} LUFS, offset ${formatSigned(plan.offsetDb, 1)} dB)`,
+                    )} LUFS, offset ${formatSigned(authorizedOffsetDb, 1)} dB)`,
                   );
                 }
               }
@@ -5928,19 +6041,29 @@ const summarizeFailureReason = (error: unknown) => {
             }
             stagedEntries.push({ index: target.index, entry: nextEntry });
             alignedCount += 1;
+            authorizedGroupCount += 1;
             appendLog(
-              `[BatchAlign] ${target.entry.name}: ${formatSigned(plan.offsetDb, 1)} dB toward ${variant} batch anchor ${alignment.anchorLufs.toFixed(
+              `[BatchAlign] ${target.entry.name}: ${formatSigned(
+                authorizedOffsetDb,
                 1,
-              )} LUFS.`,
+              )} dB authorized toward ${variant} batch anchor ${alignment.anchorLufs.toFixed(
+                1,
+              )} LUFS${
+                authorizedOffsetDb < requestedOffsetDb
+                  ? ` (requested ${formatSigned(requestedOffsetDb, 1)} dB)`
+                  : ""
+              }.`,
             );
             noteProcessedAudio(nextEntry);
           }
-          if (groupTargets.length > 1) {
+          if (groupTargets.length > 1 && authorizedGroupCount > 0) {
             appendLog(
-              `[BatchAlign] ${groupLabel} (${variant}): used one shared ${formatSigned(
+              `[BatchAlign] ${groupLabel} (${variant}): derived ${authorizedGroupCount} measured offset${
+                authorizedGroupCount === 1 ? "" : "s"
+              } from the shared ${formatSigned(
                 plan.offsetDb,
                 1,
-              )} dB offset for ${groupTargets.length} parts.`,
+              )} dB request across ${groupTargets.length} parts.`,
             );
           }
         }
@@ -5951,7 +6074,13 @@ const summarizeFailureReason = (error: unknown) => {
       }
 
       if (alignedCount === 0) {
-        appendLog("[BatchAlign] all mix-ready outputs already within their variant batch anchors.");
+        appendLog(
+          omittedPositiveAlignmentCount > 0
+            ? `[BatchAlign] ${omittedPositiveAlignmentCount} positive alignment request${
+                omittedPositiveAlignmentCount === 1 ? "" : "s"
+              } omitted for unproven headroom; original mix-ready outputs kept.`
+            : "[BatchAlign] all mix-ready outputs already within their variant batch anchors.",
+        );
       }
       return activeFfmpeg;
     } catch (error) {
@@ -6522,6 +6651,9 @@ const summarizeFailureReason = (error: unknown) => {
       consonantReferencesByOutputKey.set(outputName, reference);
     }
     appendLog(
+      `[BatchAlign] ${job.base}: long-form parts retain negative alignment, but optional positive batch gain is omitted because bounded windows cannot prove whole-file peak headroom.`,
+    );
+    appendLog(
       `[LongForm] ${job.base}: complete. Review bundles and duplicate candidate renders were skipped to keep this PC cool and memory-bounded.`,
     );
     return { ffmpeg, chunkCount: chunks.length };
@@ -7077,7 +7209,10 @@ const summarizeFailureReason = (error: unknown) => {
       }
     };
 
-    const assertRenderedAudibility = async (strategyLabel: string, renderPath: RenderPath) => {
+    const assertRenderedAudibility = async (
+      strategyLabel: string,
+      renderPath: RenderPath,
+    ) => {
       const durationSeconds = await ensureInputDuration();
       if (
         durationSeconds === null ||
@@ -7090,7 +7225,11 @@ const summarizeFailureReason = (error: unknown) => {
 
       try {
         if (!sourceAudibilityFrameDb) {
-          sourceAudibilityFrameDb = await renderAudibilityFrameDb(ffmpeg, job.inputName, `${job.base}_source`);
+          sourceAudibilityFrameDb = await renderAudibilityFrameDb(
+            ffmpeg,
+            job.inputName,
+            `${job.base}_source`,
+          );
         }
         const renderedFrameDb = await renderAudibilityFrameDb(ffmpeg, outputName, `${job.base}_${strategyLabel}`);
         if (sourceAudibilityFrameDb.length === 0 || renderedFrameDb.length === 0) return;
@@ -7596,6 +7735,10 @@ const summarizeFailureReason = (error: unknown) => {
       const canEmitPerFileReviewBundle = reviewBundleFinalOutputBlocker === null;
       initializeQueueItems(jobs);
       const analysisByBase = new Map<string, FileAnalysis>();
+      const sourceSafetyEvidenceByBase = new Map<
+        string,
+        PlannerDeliverySafetyEvidence | null
+      >();
       let batchReference: BatchReference | null = null;
       const needsAnalysis = true;
 
@@ -7934,6 +8077,10 @@ const summarizeFailureReason = (error: unknown) => {
           const sourceFinalPolishEvidence = mergeNativeFinalToneEvidence(
             fileAnalysis ?? null,
             sourceDecodedForReview,
+          );
+          sourceSafetyEvidenceByBase.set(
+            job.base,
+            sourceFinalPolishEvidence?.plannerDeliverySafetyEvidence ?? null,
           );
 
           const plannerContext = await preparePlannerRenderContext(
@@ -8572,6 +8719,8 @@ const summarizeFailureReason = (error: unknown) => {
               },
               selectedReason,
             );
+            selectedFinalPolishEvidence =
+              selectedPostPolishArtifact.finalPolishEvidence;
             const postRenderManifest = buildSingleWinnerManifest(selectedPostPolishArtifact, null, selectedReason);
             const postAutoReview = autoReviewBundle(postRenderManifest);
             const hardGateReasons = selectedPostPolishArtifact.ranking.gateReasons;
@@ -8683,6 +8832,8 @@ const summarizeFailureReason = (error: unknown) => {
                     correctivePlannerContext,
                   );
                   ffmpeg = correctiveResult.ffmpeg;
+                  let correctiveProcessingFlow: OutputEntry["processingFlow"] =
+                    "app";
                   if (isAudibilityProtectedRender(correctiveResult.meta)) {
                     appendLog(
                       `[FinalPolish] ${job.base}: skipped corrective final app polish because audibility guard selected a source-safe recovery render.`,
@@ -8791,6 +8942,9 @@ const summarizeFailureReason = (error: unknown) => {
                       },
                     );
                     ffmpeg = correctivePolish.ffmpeg;
+                    correctiveProcessingFlow = correctivePolish.applied
+                      ? "app-final-polish"
+                      : "app";
                     if (ffmpeg !== correctivePolishFfmpeg) {
                       await writeJobInput(ffmpeg, job);
                     }
@@ -8813,8 +8967,11 @@ const summarizeFailureReason = (error: unknown) => {
                     await ffmpeg.writeFile(job.mixName, cloneBytes(correctiveBytes));
                     selectedBytes = correctiveBytes;
                     selectedAnalysis = correctiveArtifact.analysis;
+                    selectedFinalPolishEvidence =
+                      correctiveArtifact.finalPolishEvidence;
                     selectedScore = correctiveArtifact.scoredScore;
                     selectedMeta = correctiveArtifact.meta;
+                    outputProcessingFlow = correctiveProcessingFlow;
                     selectedReason = `corrective pass kept (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points)`;
                     if (canEmitPerFileReviewBundle) {
                       finalReviewChallengerArtifact = selectedPostPolishArtifact;
@@ -8938,6 +9095,9 @@ const summarizeFailureReason = (error: unknown) => {
               sourceBase: job.base,
               sourceName: job.file.name,
               sourcePreservingFallback: selectedSourcePreservingFallback,
+              deliverySafetyEvidence:
+                selectedFinalPolishEvidence?.plannerDeliverySafetyEvidence ??
+                null,
             });
             outputEntries.push(mixOutput);
             if (pendingFinalReviewBundle) {
@@ -8957,6 +9117,19 @@ const summarizeFailureReason = (error: unknown) => {
                 await runBlendMixReady(ffmpeg, job.mixName, job.blendMixName, profile);
                 blendRendered = true;
                 if (shouldEmitMixReadyOutput(loudnessConfig !== null)) {
+                  const blendDeliverySafetyEvidence =
+                    resolveBlendDeliverySafetyEvidence({
+                      inputSafetyEvidence:
+                        selectedFinalPolishEvidence?.plannerDeliverySafetyEvidence ??
+                        null,
+                      indoorGain,
+                      outdoorGain,
+                    });
+                  if (!blendDeliverySafetyEvidence) {
+                    appendLog(
+                      `[BatchAlign] ${job.base}/blend: source-relative delivery envelope unavailable; any later positive alignment will be omitted.`,
+                    );
+                  }
                   const blendMixOutput = await writeOutput(
                     ffmpeg,
                     job.blendMixName,
@@ -8966,6 +9139,7 @@ const summarizeFailureReason = (error: unknown) => {
                   {
                     sourceBase: job.base,
                     sourceName: job.file.name,
+                    deliverySafetyEvidence: blendDeliverySafetyEvidence,
                   },
                 );
                   outputEntries.push(blendMixOutput);
@@ -9102,7 +9276,11 @@ const summarizeFailureReason = (error: unknown) => {
 
       if (loudnessConfig === null) {
         try {
-          ffmpeg = await alignBatchMixReadyOutputs(ffmpeg, outputEntries);
+          ffmpeg = await alignBatchMixReadyOutputs(
+            ffmpeg,
+            outputEntries,
+            sourceSafetyEvidenceByBase,
+          );
         } catch (error) {
           hadErrors = true;
           appendLog(

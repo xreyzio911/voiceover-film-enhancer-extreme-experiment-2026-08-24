@@ -323,6 +323,36 @@ test("keeps zero-latency intact speech at zero alignment offset", () => {
   assert.equal(result.finalReport.severe, false);
 });
 
+test("subtle planned attenuation stays audible against the raw source while downstream deletion remains severe", () => {
+  const rawSourceFrameDb = makeFrames(260, -94);
+  const intactRenderedFrameDb = makeFrames(260, -110);
+  for (let frame = 40; frame < 220; frame += 1) {
+    const sourceDb = frame >= 110 && frame < 150 ? -32 : -28;
+    rawSourceFrameDb[frame] = sourceDb;
+    intactRenderedFrameDb[frame] = sourceDb - 6;
+  }
+
+  const intactComparison = detectAlignedAudibilityDropouts({
+    sourceFrameDb: rawSourceFrameDb,
+    renderedFrameDb: intactRenderedFrameDb,
+    frameMs: 20,
+    maxAlignmentMs: 60,
+  });
+  const deletedAfterPlannerFrameDb = intactRenderedFrameDb.slice();
+  for (let frame = 120; frame < 136; frame += 1) {
+    deletedAfterPlannerFrameDb[frame] = -140;
+  }
+  const downstreamDeletionComparison = detectAlignedAudibilityDropouts({
+    sourceFrameDb: rawSourceFrameDb,
+    renderedFrameDb: deletedAfterPlannerFrameDb,
+    frameMs: 20,
+    maxAlignmentMs: 60,
+  });
+
+  assert.equal(intactComparison.finalReport.severe, false);
+  assert.equal(downstreamDeletionComparison.finalReport.severe, true);
+});
+
 test("invalid frame duration fails safe without entering an unbounded alignment loop", () => {
   const { sourceFrameDb, renderedFrameDb } = makeShiftedSpeechPair(2);
 
