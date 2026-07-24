@@ -24,6 +24,7 @@ import {
   applyGainCurveToSamples,
   buildRenderedConsonantReference,
   computeFricativeFrameDb,
+  computeSpeechBodyFrameDb,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
   resolvePlannerCalibration,
@@ -146,6 +147,7 @@ import {
   deriveEarlyEchoCancelStrength,
   type RoomCleanupRisk,
 } from "../lib/roomCleanupPolicy";
+import { resolveAdaptiveVoicingPolicy } from "../lib/adaptiveVoicingPolicy";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -594,6 +596,11 @@ type AdaptiveProfile = {
   sibilanceScore: number;
   /** When true, include the cinematic color shelves in the mix. */
   cinematicColorEnabled: boolean;
+  cinematicWarmthGainDb: number;
+  cinematicPresenceGainDb: number;
+  cinematicAirGainDb: number;
+  voicingColorAuthority: number;
+  sceneFitAuthority: number;
   useTailGate: boolean;
   tailGateStrength: number;
   echoNotchCutDb: number;
@@ -1954,6 +1961,11 @@ const summarizeFailureReason = (error: unknown) => {
       const loudnessFrameDb = PLANNER_K_WEIGHTING
         ? buildFrameDb(applyKWeighting(samples, GAIN_PLANNER_ANALYSIS_SAMPLE_RATE))
         : undefined;
+      const speechBodyFrameDb = computeSpeechBodyFrameDb(
+        samples,
+        GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
+        GAIN_PLANNER_FRAME_MS,
+      );
       const fricativeFrameDb = computeFricativeFrameDb(
         samples,
         GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
@@ -2037,6 +2049,7 @@ const summarizeFailureReason = (error: unknown) => {
         fricativeFrameDb,
         fricativeNoiseFloorDb,
         loudnessFrameDb,
+        speechBodyFrameDb,
         speechRuns,
         noiseFloorDb,
         speechThresholdDb,
@@ -3594,7 +3607,7 @@ const summarizeFailureReason = (error: unknown) => {
     const dynamicsFactor = smartDynamicsEnabled ? activeSmartMatchConfig.dynamics : 0;
 
     let highpassHz = Math.round(clamp(80 + lowTiltDiff * 2.2 * toneFactor, 65, 105));
-    const lowMidGainDb = clamp(-2 - lowTiltDiff * 0.28 * toneFactor + directives.warmthDb, -3.8, 1.6);
+    const lowMidGainDb = clamp(-lowTiltDiff * 0.28 * toneFactor + directives.warmthDb, -3.8, 1.6);
 
     let presenceGainDb = clamp(-highTiltDiff * 0.45 * toneFactor + directives.presenceDb, -2.8, 2.2);
     let airGainDb = clamp(-highTiltDiff * 0.25 * toneFactor + directives.airDb, -2.0, 1.3);
@@ -3840,23 +3853,6 @@ const summarizeFailureReason = (error: unknown) => {
       1
     );
 
-    const blendRiskDamp = roomRisk === "high" ? 0.012 : roomRisk === "medium" ? 0.12 : 1;
-    const blendEchoDamp = clamp(1 - echoScore * 0.85, 0.08, 1);
-    const blendNoiseDamp = noiseRisk === "high" ? 0.22 : noiseRisk === "medium" ? 0.55 : 1;
-    const blendInstabilityDamp = instabilityScore >= 0.7 ? 0.65 : 1;
-    const blendConfidenceScale = clamp(0.35 + analysisConfidence * 0.65, 0.35, 1);
-    const blendBase = clamp(0.018 + dryness * 0.018, 0.012, 0.036);
-    let blendAmount = controls.sceneBlend
-      ? blendBase * blendRiskDamp * blendConfidenceScale * blendEchoDamp * blendNoiseDamp * blendInstabilityDamp
-      : 0;
-    if (roomRisk === "high" || echoScore >= 0.72) {
-      blendAmount = Math.min(blendAmount, 0.0012);
-    }
-    const blendIndoorGain = clamp(blendAmount * 0.62, 0, 0.07);
-    const blendOutdoorGain = clamp(blendAmount * 0.42, 0, 0.055);
-    const blendIndoorDelayMs = Math.round(clamp(24 + (1 - dryness) * 8, 22, 36));
-    const blendOutdoorDelayMs = Math.round(clamp(52 + (1 - dryness) * 18, 48, 74));
-
     // Compute per-band tone delta vs the batch reference (if we have both).
     const toneSpectrumDb = analysis.speechBandSpectrumDb ?? analysis.bandSpectrumDb;
     const toneMatchDeltaDb =
@@ -3869,6 +3865,19 @@ const summarizeFailureReason = (error: unknown) => {
           })
         : null;
     const deEsserSpectrumDb = analysis.speechBandSpectrumDb ?? analysis.bandSpectrumDb;
+    const voicingDecision = resolveAdaptiveVoicingPolicy({
+      cinematicColorRequested: controls.cinematicColor,
+      sceneFitRequested: controls.sceneBlend,
+      drynessScore: dryness,
+      roomScore: rawRoomScore,
+      echoScore,
+      analysisConfidence,
+      emotionProtection,
+      profileLowMidGainDb: lowMidGainDb,
+      profilePresenceGainDb: presenceGainDb,
+      profileAirGainDb: airGainDb,
+      toneMatchDeltaDb,
+    });
 
     return {
       highpassHz,
@@ -3898,6 +3907,11 @@ const summarizeFailureReason = (error: unknown) => {
       toneMatchDeltaDb,
       sibilanceScore: analysis.sibilanceScore ?? 0,
       cinematicColorEnabled: controls.cinematicColor,
+      cinematicWarmthGainDb: voicingDecision.warmthGainDb,
+      cinematicPresenceGainDb: voicingDecision.presenceGainDb,
+      cinematicAirGainDb: voicingDecision.airGainDb,
+      voicingColorAuthority: voicingDecision.colorAuthority,
+      sceneFitAuthority: voicingDecision.sceneFitAuthority,
       useTailGate,
       tailGateStrength,
       echoNotchCutDb,
@@ -3928,10 +3942,10 @@ const summarizeFailureReason = (error: unknown) => {
       useSpeechPauseSegmentation,
       segmentTargetSec: SPEECH_ALIGNED_SEGMENT_TARGET_SECONDS,
       segmentMaxSec: SPEECH_ALIGNED_SEGMENT_MAX_SECONDS,
-      blendIndoorGain,
-      blendOutdoorGain,
-      blendIndoorDelayMs,
-      blendOutdoorDelayMs,
+      blendIndoorGain: voicingDecision.syntheticReflectionIndoorGain,
+      blendOutdoorGain: voicingDecision.syntheticReflectionOutdoorGain,
+      blendIndoorDelayMs: voicingDecision.syntheticReflectionIndoorDelayMs,
+      blendOutdoorDelayMs: voicingDecision.syntheticReflectionOutdoorDelayMs,
     } satisfies AdaptiveProfile;
   };
 
@@ -4173,7 +4187,7 @@ const summarizeFailureReason = (error: unknown) => {
 
     if (controls.eqCleanup) {
       const highpassHz = profile?.highpassHz ?? 80;
-      const lowMidGainDb = sourceSafeMode ? clamp(profile?.lowMidGainDb ?? -0.8, -1.2, 0) : (profile?.lowMidGainDb ?? -2);
+      const lowMidGainDb = sourceSafeMode ? clamp(profile?.lowMidGainDb ?? -0.8, -1.2, 0) : (profile?.lowMidGainDb ?? 0);
       filters.push(`highpass=f=${highpassHz}`);
       filters.push(`equalizer=f=250:width_type=q:width=1.0:g=${lowMidGainDb.toFixed(2)}`);
       if (useAdaptiveNoiseReduction && adaptiveNoiseReductionFilter) {
@@ -4480,18 +4494,19 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(profile?.floorGuardFilter ?? FLOOR_GUARD);
     }
 
-    // Merge static harshness softening with smart-match tone offsets to avoid
-    // competing EQ moves on the same bands.
-    const basePresenceCut = controls.softenHarshness ? -2.0 : 0;
-    const baseAirCut = controls.softenHarshness ? -1.1 : 0;
-    const harshPresenceCut = profile?.emotionalHarshnessCutDb ?? 0;
-    const harshAirCut = profile?.topEndHarshnessCutDb ?? 0;
+    // Soften only measured harshness; clean sources keep their native tilt.
+    const harshPresenceCut = controls.softenHarshness
+      ? profile?.emotionalHarshnessCutDb ?? 0
+      : 0;
+    const harshAirCut = controls.softenHarshness
+      ? profile?.topEndHarshnessCutDb ?? 0
+      : 0;
     const netPresenceGain = clamp(
-      basePresenceCut + (profile?.presenceGainDb ?? 0) - harshPresenceCut,
+      (profile?.presenceGainDb ?? 0) - harshPresenceCut,
       -4.0,
       0.7
     );
-    const netAirGain = clamp(baseAirCut + (profile?.airGainDb ?? 0) - harshAirCut, -2.7, 0.45);
+    const netAirGain = clamp((profile?.airGainDb ?? 0) - harshAirCut, -2.7, 0.45);
 
     if (!minimalStabilityChain && !sourceSafeMode && Math.abs(netPresenceGain) >= 0.2) {
       filters.push(`equalizer=f=3500:width_type=q:width=1.15:g=${netPresenceGain.toFixed(2)}`);
@@ -4546,17 +4561,22 @@ const summarizeFailureReason = (error: unknown) => {
       }
     }
 
-    // Cinematic color — subtle dub-room voicing. Skip when emotionProtection is
-    // high so dramatic takes aren't processed flat.
-    const cinematicColorOn =
-      !minimalStabilityChain &&
-      !sourceSafeMode &&
-      !!profile?.cinematicColorEnabled &&
-      (profile?.emotionProtection ?? 0) < 0.5;
-    if (cinematicColorOn) {
-      filters.push("equalizer=f=180:width_type=q:width=1.1:g=0.8"); // warmth
-      filters.push("equalizer=f=4500:width_type=q:width=1.2:g=0.6"); // intelligibility
-      filters.push("equalizer=f=10000:width_type=q:width=0.7:g=-0.5"); // take glassy edge off
+    // Cinematic color and dry-safe scene fit share one continuous source
+    // policy. Tone-match/profile moves, room, echo, and emotion continuously
+    // reduce these already-subtle gains instead of switching at one threshold.
+    if (!minimalStabilityChain && !sourceSafeMode) {
+      const cinematicWarmthGainDb = profile?.cinematicWarmthGainDb ?? 0;
+      const cinematicPresenceGainDb = profile?.cinematicPresenceGainDb ?? 0;
+      const cinematicAirGainDb = profile?.cinematicAirGainDb ?? 0;
+      filters.push(
+        `equalizer=f=180:width_type=q:width=1.1:g=${cinematicWarmthGainDb.toFixed(3)}`,
+      );
+      filters.push(
+        `equalizer=f=4500:width_type=q:width=1.2:g=${cinematicPresenceGainDb.toFixed(3)}`,
+      );
+      filters.push(
+        `equalizer=f=10000:width_type=q:width=0.7:g=${cinematicAirGainDb.toFixed(3)}`,
+      );
     }
 
     // De-esser — narrow notches at the two measured sibilance bands. A
@@ -4737,33 +4757,11 @@ const summarizeFailureReason = (error: unknown) => {
   };
 
   const buildBlendFilter = (profile: AdaptiveProfile | null) => {
-    const indoorGain = profile?.blendIndoorGain ?? 0.015;
-    const outdoorGain = profile?.blendOutdoorGain ?? 0.01;
-    const indoorDelay = Math.round(profile?.blendIndoorDelayMs ?? 28);
-    const outdoorDelay = Math.round(profile?.blendOutdoorDelayMs ?? 58);
-
-    const wetTotal = indoorGain + outdoorGain;
-    const dryGain = clamp(1 - wetTotal * 0.55, 0.93, 1);
-    const wetGateThreshold = clamp(0.00045 + wetTotal * 0.028, 0.00055, 0.0024);
-    const wetGateRatio = clamp(1.16 + wetTotal * 8, 1.16, 1.34);
-    const wetGateRange = clamp(0.86 - wetTotal * 2.6, 0.68, 0.86);
-
-    return [
-      "asplit=3[dry][ind_src][out_src]",
-      `[ind_src]adelay=${indoorDelay}:all=1,highpass=f=280,lowpass=f=4600,volume=${indoorGain.toFixed(
-        4
-      )}[ind]`,
-      `[out_src]adelay=${outdoorDelay}:all=1,highpass=f=220,lowpass=f=3000,volume=${outdoorGain.toFixed(
-        4
-      )}[out]`,
-      `[ind][out]amix=inputs=2:normalize=0,agate=mode=downward:threshold=${wetGateThreshold.toFixed(
-        5
-      )}:ratio=${wetGateRatio.toFixed(2)}:range=${wetGateRange.toFixed(
-        3
-      )}:attack=10:release=180:makeup=1.00:detection=rms:link=average[wet]`,
-      `[dry]volume=${dryGain.toFixed(4)}[dryv]`,
-      "[dryv][wet]amix=inputs=2:duration=first:normalize=0,alimiter=limit=-2dB:level=disabled",
-    ].join(";");
+    // Scene fit is now applied as adaptive tone inside buildMixFilter. Keep
+    // this legacy renderer harmless if an older call site reaches it: no
+    // delayed copy, no room synthesis, and no level change.
+    void profile;
+    return "anull";
   };
 
   const writeOutput = async (
@@ -6554,7 +6552,9 @@ const summarizeFailureReason = (error: unknown) => {
           const indoorGain = profile?.blendIndoorGain ?? 0;
           const outdoorGain = profile?.blendOutdoorGain ?? 0;
           if (indoorGain + outdoorGain <= 0.0001) {
-            appendLog(`[Blend] ${job.base} ${partTag}: bypassed (adaptive blend gain near zero).`);
+            appendLog(
+              `[SceneFit] ${job.base} ${partTag}: dry-safe tone applied in the clean render; no delayed-reflection variant.`,
+            );
           } else {
             setStatus(`Long-form blend: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
             setActiveQueueStage(job.base, "Long-form blend", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
@@ -7727,7 +7727,6 @@ const summarizeFailureReason = (error: unknown) => {
       let ffmpeg = await ensureFfmpeg();
       const jobs = buildJobs(files);
       const reviewBundleFinalOutputBlocker = (() => {
-        if (sceneBlend) return "scene-blend deliverables are rendered after the per-file review point";
         if (loudnessConfig !== null) return "loudness-target deliverables are rendered after the per-file review point";
         if (jobs.length > 1) return "batch alignment can adjust mix-ready bytes after all files render";
         return null;
@@ -9109,7 +9108,9 @@ const summarizeFailureReason = (error: unknown) => {
             const indoorGain = profile?.blendIndoorGain ?? 0;
             const outdoorGain = profile?.blendOutdoorGain ?? 0;
             if (indoorGain + outdoorGain <= 0.0001) {
-              appendLog(`[Blend] ${job.base}: bypassed (adaptive blend gain near zero for room/noise safety).`);
+              appendLog(
+                `[SceneFit] ${job.base}: dry-safe tone applied in the clean render; no delayed-reflection variant.`,
+              );
             } else {
               try {
                 setStatus(`Blend: ${job.base} (${i + 1}/${jobs.length})`);
@@ -9808,8 +9809,8 @@ const summarizeFailureReason = (error: unknown) => {
             <div>
               <strong>Cinematic color</strong>
               <div className={styles.label}>
-                Subtle dub-room voicing: +0.8 dB @180 Hz warmth, +0.6 dB @4.5 kHz intelligibility, -0.5 dB
-                @10 kHz. Automatically bypassed on emotional takes.
+                Subtle bounded warmth, intelligibility, and edge control that continuously adapts to the
+                measured source, existing tone moves, room, echo, and performance emotion.
               </div>
             </div>
             <input
@@ -9854,8 +9855,8 @@ const summarizeFailureReason = (error: unknown) => {
                 <div>
                   <strong>Soften harshness</strong>
                   <div className={styles.label}>
-                    Legacy: presence + air softening for bright/emotional lines. Cinematic color covers
-                    most of this; enable both if you want extra softening.
+                    Cuts only measured presence and top-end harshness on bright or emotional lines;
+                    clean sources receive no fixed darkening.
                   </div>
                 </div>
                 <input
@@ -9879,10 +9880,10 @@ const summarizeFailureReason = (error: unknown) => {
               </label>
               <label className={styles.toggleRow}>
                 <div>
-                  <strong>Scene blend (adaptive subtle)</strong>
+                  <strong>Scene fit (dry-safe tone)</strong>
                   <div className={styles.label}>
-                    Legacy: adds very light mono early reflections so VO sits in-picture. Off by default
-                    now that cinematic color handles room-sit cues.
+                    Adds only a tiny source-adaptive tonal fit so VO sits in-picture; it never adds
+                    delayed reflections. Off by default.
                   </div>
                 </div>
                 <input

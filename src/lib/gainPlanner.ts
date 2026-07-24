@@ -35,6 +35,12 @@ export type GainPlannerInput = {
    * and body-relative spike guards whose thresholds were tuned in raw RMS.
    */
   loudnessFrameDb?: number[];
+  /**
+   * Optional same-length 180-3000 Hz speech-body envelope. Embedded-event
+   * recovery uses this narrower evidence so LF impacts or bright consonants
+   * cannot withdraw gain from a steady voiced body.
+   */
+  speechBodyFrameDb?: number[];
   /** Speech runs (frame index ranges) already detected by the analyzer. */
   speechRuns: SpeechRun[];
   /** Noise floor of the source in dB (pauseNoiseFloorDb). */
@@ -167,6 +173,8 @@ const POSITIVE_ATTACK_FRICATIVE_ENTRY_BONUS_DB = 1.25;
 const POSITIVE_ATTACK_EXCESS_SLEW_DB_PER_100_MS = 4;
 const FRICATIVE_BAND_LOW_HZ = 3500;
 const FRICATIVE_BAND_HIGH_HZ = 7400;
+const SPEECH_BODY_BAND_LOW_HZ = 180;
+const SPEECH_BODY_BAND_HIGH_HZ = 3000;
 const FRICATIVE_EVIDENCE_MARGIN_DB = 10;
 const FRICATIVE_TAIL_RESCUE_MAX_MS = 240;
 const SOFT_TAIL_RESCUE_MAX_MS = 500;
@@ -183,7 +191,10 @@ const QUIET_BODY_FLOOR_LOUDNESS_OFFSET_DB = 1.0;
 const QUIET_BODY_FLOOR_MAX_LIFT_DB = 3.5;
 const QUIET_BODY_FLOOR_HIGH_CREST_DB = 20;
 const QUIET_BODY_FLOOR_EXTREME_CREST_DB = 24;
-const PLANNER_NEGATIVE_GAIN_SOFT_LIMIT_DB = 6;
+// Phrase-scale gain may legitimately exceed 6 dB on extremely uneven takes.
+// This budget applies only to additional time-local peak/residual decisions so
+// a narrow detector response cannot stack into a broadband hole.
+const LOCAL_PLANNER_DIP_SOFT_LIMIT_DB = 6;
 const BODY_SPIKE_MAX_RUN_LOSS_DB = 10;
 const BODY_SPIKE_RUN_FLOOR_OFFSET_DB = 9;
 // Absolute peak safety is useful, but its frame-wide envelope must not turn a
@@ -249,6 +260,8 @@ const BODY_GAIN_VALLEY_INNER_SHOULDER_MS = 60;
 const BODY_GAIN_VALLEY_OUTER_SHOULDER_MS = 140;
 const BODY_GAIN_VALLEY_RELAXATION_BLEND = 0.7;
 const EMBEDDED_PERFORMANCE_CONTEXT_MS = 240;
+const EMBEDDED_PERFORMANCE_CONTEXT_LENDING = 0.25;
+const EMBEDDED_PERFORMANCE_SPECTRAL_OFFSET_SOFT_LIMIT_DB = 4;
 const EMBEDDED_PERFORMANCE_GAIN_KNEE_DB = 0.35;
 const EMBEDDED_PERFORMANCE_GAIN_AUTHORITY_KNEE_DB = 6;
 const EMBEDDED_PERFORMANCE_RECOVERY_HEADROOM_DB = 0.5;
@@ -557,18 +570,13 @@ export const applyKWeighting = (samples: Float32Array, sampleRate: number) => {
   return applyBiquad(applyBiquad(samples, shelf), highPass);
 };
 
-/**
- * Measure a narrow high-frequency envelope for unvoiced consonant evidence.
- *
- * The filter is streamed directly into frame accumulators so long-form
- * analysis does not allocate filtered copies of the source. The result is
- * intentionally not a speech detector or a quality score; the planner can
- * only use it next to a run already detected by the broadband speech mask.
- */
-export const computeFricativeFrameDb = (
+/** Stream a two-pole-per-edge band-pass directly into frame RMS bins. */
+const computeBandFrameDb = (
   samples: Float32Array,
   sampleRate: number,
-  frameMs = 10,
+  frameMs: number,
+  lowFrequencyHz: number,
+  highFrequencyHz: number,
 ): number[] => {
   if (!Number.isFinite(sampleRate) || sampleRate <= 0 || !Number.isFinite(frameMs) || frameMs <= 0) {
     return [];
@@ -579,10 +587,10 @@ export const computeFricativeFrameDb = (
   const frameDb = new Array<number>(frameCount).fill(-120);
   if (frameCount === 0) return frameDb;
 
-  const upperFrequencyHz = Math.min(FRICATIVE_BAND_HIGH_HZ, sampleRate * 0.4625);
-  if (upperFrequencyHz <= FRICATIVE_BAND_LOW_HZ * 1.05) return frameDb;
+  const upperFrequencyHz = Math.min(highFrequencyHz, sampleRate * 0.4625);
+  if (upperFrequencyHz <= lowFrequencyHz * 1.05) return frameDb;
 
-  const highPass = buildHighPassBiquad(sampleRate, FRICATIVE_BAND_LOW_HZ, Math.SQRT1_2);
+  const highPass = buildHighPassBiquad(sampleRate, lowFrequencyHz, Math.SQRT1_2);
   const lowPass = buildLowPassBiquad(sampleRate, upperFrequencyHz, Math.SQRT1_2);
   let hpX1 = 0;
   let hpX2 = 0;
@@ -627,6 +635,43 @@ export const computeFricativeFrameDb = (
 
   return frameDb;
 };
+
+/**
+ * Measure a narrow high-frequency envelope for unvoiced consonant evidence.
+ *
+ * The result is edge evidence only: it may extend an existing speech run, but
+ * it never creates a speech run or a quality decision by itself.
+ */
+export const computeFricativeFrameDb = (
+  samples: Float32Array,
+  sampleRate: number,
+  frameMs = 10,
+): number[] =>
+  computeBandFrameDb(
+    samples,
+    sampleRate,
+    frameMs,
+    FRICATIVE_BAND_LOW_HZ,
+    FRICATIVE_BAND_HIGH_HZ,
+  );
+
+/**
+ * Measure the voiced speech-body band used only for embedded-event gain
+ * ownership. This prevents energy outside the intelligible body from opening
+ * a millisecond-scale recovery notch.
+ */
+export const computeSpeechBodyFrameDb = (
+  samples: Float32Array,
+  sampleRate: number,
+  frameMs = 10,
+): number[] =>
+  computeBandFrameDb(
+    samples,
+    sampleRate,
+    frameMs,
+    SPEECH_BODY_BAND_LOW_HZ,
+    SPEECH_BODY_BAND_HIGH_HZ,
+  );
 
 const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => {
   const a = Math.max(0, start);
@@ -822,10 +867,22 @@ export const limitEmbeddedPerformancePositiveGainAuthority = (
       if (totalWeight <= 0) continue;
 
       const localEventDb = 10 * Math.log10(weightedPower / totalWeight + 1e-30);
+      const currentSourceDb = sourceFrameDb[frame];
+      // Context establishes that an event exists, but the current frame keeps
+      // most of the recovery decision. This prevents a future loud syllable
+      // from pre-ducking its quiet voiced lead-in while still controlling the
+      // loud syllable itself. The fixed blend is continuous at every source
+      // level and leaves sustained events unchanged because current≈context.
+      const frameSupportedEventDb =
+        currentSourceDb +
+        (localEventDb - currentSourceDb)
+          * EMBEDDED_PERFORMANCE_CONTEXT_LENDING;
       const positiveGainDb = Math.max(0, originalGainDb);
       const negativeGainDb = Math.min(0, originalGainDb);
       const recoveryBudgetDb = softPositiveDb(
-        targetDb + EMBEDDED_PERFORMANCE_RECOVERY_HEADROOM_DB - localEventDb,
+        targetDb
+          + EMBEDDED_PERFORMANCE_RECOVERY_HEADROOM_DB
+          - frameSupportedEventDb,
         EMBEDDED_PERFORMANCE_GAIN_KNEE_DB,
       );
       const unauthorizedPositiveGainDb = softPositiveDb(
@@ -856,10 +913,6 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const sourceTargetBlend = clamp(input.sourceTargetBlend ?? 0.15, 0, 1);
   const maxGainDb = input.maxGainDb ?? 14;
   const minGainDb = input.minGainDb ?? -14;
-  const negativeGainSoftLimitDb = Math.min(
-    PLANNER_NEGATIVE_GAIN_SOFT_LIMIT_DB,
-    Math.max(0.1, Math.abs(minGainDb)),
-  );
   const coldOpenLiftToleranceDb = input.coldOpenLiftToleranceDb ?? COLD_OPEN_LIFT_TOLERANCE_DB;
   const coldOpenLiftMaxAllowedDb = input.coldOpenLiftMaxDb ?? COLD_OPEN_LIFT_MAX_DB;
   // -4 dBFS ceiling gives the downstream `alimiter=limit=-2dB` genuine
@@ -870,6 +923,30 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const frameCount = input.frameDb.length;
   const loudnessFrameDb =
     input.loudnessFrameDb?.length === frameCount ? input.loudnessFrameDb : input.frameDb;
+  const speechBodyFrameDb =
+    input.speechBodyFrameDb?.length === frameCount
+      ? input.speechBodyFrameDb
+      : loudnessFrameDb;
+  // K-weighted energy still owns broadband event control, but its offset from
+  // the voiced body is soft-saturated. This continuously preserves genuine
+  // emotional energy while preventing an LF impact or bright consonant from
+  // withdrawing the full body recovery in one 10 ms frame.
+  const embeddedPerformanceFrameDb =
+    speechBodyFrameDb === loudnessFrameDb
+      ? loudnessFrameDb
+      : Array.from({ length: frameCount }, (_, frame) => {
+          const loudnessDb = loudnessFrameDb[frame];
+          const speechBodyDb = speechBodyFrameDb[frame];
+          if (!Number.isFinite(loudnessDb)) return speechBodyDb;
+          if (!Number.isFinite(speechBodyDb)) return loudnessDb;
+          const spectralOffsetDb = loudnessDb - speechBodyDb;
+          return speechBodyDb
+            + EMBEDDED_PERFORMANCE_SPECTRAL_OFFSET_SOFT_LIMIT_DB
+              * Math.tanh(
+                spectralOffsetDb
+                  / EMBEDDED_PERFORMANCE_SPECTRAL_OFFSET_SOFT_LIMIT_DB,
+              );
+        });
   const fricativeFrameDb =
     input.fricativeFrameDb?.length === frameCount && Number.isFinite(input.fricativeNoiseFloorDb)
       ? input.fricativeFrameDb
@@ -1094,21 +1171,29 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // Quiet breaths stay tight (+4 max) so a silent inhale isn't amplified
   // into audibility.
   //
-  // PSYCHO-ACOUSTIC SUB-TARGETING for body-speech runs.
+  // SOURCE-ADAPTIVE PERFORMANCE RETENTION for body-speech runs.
   //
-  // A long run that classifies as body-speech (≥ 400 ms) but has high
-  // crest factor (≥ 13 dB) is almost always a SCREAM / SHOUT / LAUGH /
-  // sustained vocalization, not normal dialogue. The ear perceives high-
-  // crest content as louder than equal-RMS dialogue because:
-  //   1. peaks integrate above body in the loudness window
-  //   2. screams have richer high-frequency content
-  //   3. tonal vs noisy balance shifts toward "louder"
-  //
-  // We compensate by targeting these runs 1-3 dB BELOW dialogue body.
-  // The exact offset scales with crest excess. We also widen the
-  // attenuation clamp to -18 dB so extremely loud sources (source body
-  // > target + 14 dB) can be brought down further.
+  // A loud emotional phrase must be controlled without being flattened to
+  // ordinary dialogue. Retained emphasis grows continuously with source
+  // excess and sustained-performance evidence (crest, hot-frame density and
+  // duration), then saturates at a modest 5.5 dB. There is no detector
+  // engagement threshold. The same evidence continuously widens the body
+  // attenuation window from the configured minimum toward -18 dB.
   const breathTargetDb = targetDb - 3.2;
+  const resolveBodyPerformanceAuthority = (m: RunEntry) => {
+    const runLenMs = (m.endFrame - m.startFrame) * frameMs;
+    const crestAuthority = smoothUnitRamp(m.crestDb, 11, 21);
+    const hotFrameAuthority = smoothUnitRamp(m.hotFrameRatio, 0, 0.75);
+    const durationAuthority = smoothUnitRamp(runLenMs, 200, 1_200);
+    return clamp(
+      crestAuthority * Math.sqrt(hotFrameAuthority * durationAuthority),
+      0,
+      1,
+    );
+  };
+  const bodyPerformanceAuthority = runMeta.map((m) =>
+    m.runClass === "body-speech" ? resolveBodyPerformanceAuthority(m) : 0
+  );
   const plannedRunGainDb: number[] = runMeta.map((m) => {
     if (m.runClass === "transient-breath") {
       const targetClassGain = breathTargetDb - m.loudnessMeanDb;
@@ -1122,61 +1207,43 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         m.isColdOpen && targetClassGain > 0 ? Math.min(maxGainDb, Math.max(4, targetClassGain)) : 4;
       return clamp(targetClassGain, -4, positiveClamp);
     }
-    // Body-speech: psycho-acoustic adjustment for SUSTAINED high-crest
-    // vocalizations. We require BOTH:
-    //   - crest ≥ 13 dB (peak sits well above body)
-    //   - hotFrameRatio ≥ 0.20 (at least 20 % of frames are loud — this
-    //     filters out single-plosive sentences whose crest is high only
-    //     because of one outlier frame)
-    //   - run length ≥ 600 ms (the perceptual loudness penalty needs
-    //     time to accumulate)
-    // When all three are true, target shifts down 0.6–3.5 dB to
-    // compensate for the extra perceived loudness. Normal dialogue
-    // (lower crest, low hot ratio) is unaffected.
-    const runLenMs = (m.endFrame - m.startFrame) * frameMs;
-    const sustainedHighCrest =
-      m.crestDb >= 13 && m.hotFrameRatio >= 0.2 && runLenMs >= 600;
-    const crestShift = sustainedHighCrest
-      ? Math.max(0, Math.min(3.5, (m.crestDb - 11) * 0.4))
-      : 0;
-    const adjustedTarget = targetDb - crestShift;
-    // High-crest sustained runs get a wider attenuation window so very
-    // loud sources can be brought down further than the standard ±14 dB.
-    const lowerClamp = sustainedHighCrest ? Math.min(minGainDb, -18) : minGainDb;
+    const performanceAuthority = resolveBodyPerformanceAuthority(m);
+    const sourceExcessDb = Math.max(0, m.loudnessMeanDb - targetDb);
+    const retainedEmphasisDb = clamp(
+      sourceExcessDb * (0.16 + 0.06 * performanceAuthority) +
+        2 * performanceAuthority,
+      0,
+      5.5,
+    );
+    const adjustedTarget = targetDb + retainedEmphasisDb;
+    const widestLowerClamp = Math.min(minGainDb, -18);
+    const lowerClamp =
+      minGainDb + (widestLowerClamp - minGainDb) * performanceAuthority;
     return clamp(adjustedTarget - m.loudnessMeanDb, lowerClamp, maxGainDb);
   });
   // Cross-run smoothing on adjacent body-speech pairs only.
   //
-  // Skipped when:
-  //   - either side is NOT body-speech (transient-breath has its own
-  //     intentionally-different target; smoothing would defeat that)
-  //   - either side is a sustained-high-crest body-speech run (a yell or
-  //     scream — its lower target is intentional, we don't want a
-  //     neighbor pulling it back up toward dialogue)
-  //   - the bodies differ by > 8 dB (these aren't "neighboring sentences
-  //     at similar level" — they're dialogue meeting onomatopoeia /
-  //     loud beat / abrupt mood change, where a step is correct)
-  //
-  // For pairs that do qualify, blend 35 % toward midpoint when planned
-  // gains differ by > 3 dB.
-  const isSustainedHighCrest = (idx: number): boolean => {
-    const m = runMeta[idx];
-    if (m.runClass !== "body-speech") return false;
-    const lenMs = (m.endFrame - m.startFrame) * frameMs;
-    return m.crestDb >= 13 && m.hotFrameRatio >= 0.2 && lenMs >= 600;
-  };
+  // Transient/edge classes retain their intentionally different targets.
+  // Body pairs influence each other continuously: similarity decays with
+  // source-level distance, large planned differences earn more smoothing,
+  // and emotional evidence continuously protects the retained contour.
   for (let i = 1; i < plannedRunGainDb.length; i += 1) {
     const cur = runMeta[i];
     const prev = runMeta[i - 1];
     if (cur.runClass !== "body-speech" || prev.runClass !== "body-speech") continue;
-    if (isSustainedHighCrest(i) || isSustainedHighCrest(i - 1)) continue;
-    if (Math.abs(cur.loudnessMeanDb - prev.loudnessMeanDb) > 8) continue;
     const diff = plannedRunGainDb[i] - plannedRunGainDb[i - 1];
-    if (Math.abs(diff) > 3) {
-      const mid = (plannedRunGainDb[i] + plannedRunGainDb[i - 1]) / 2;
-      plannedRunGainDb[i - 1] = plannedRunGainDb[i - 1] + (mid - plannedRunGainDb[i - 1]) * 0.35;
-      plannedRunGainDb[i] = plannedRunGainDb[i] + (mid - plannedRunGainDb[i]) * 0.35;
-    }
+    const sourceDeltaDb = Math.abs(cur.loudnessMeanDb - prev.loudnessMeanDb);
+    const sourceSimilarity = 1 / (1 + (sourceDeltaDb / 8) ** 2);
+    const differenceAuthority = Math.abs(diff) / (Math.abs(diff) + 3);
+    const performanceProtection =
+      1 - 0.9 * Math.max(bodyPerformanceAuthority[i], bodyPerformanceAuthority[i - 1]);
+    const blend =
+      0.35 * sourceSimilarity * differenceAuthority * performanceProtection;
+    const mid = (plannedRunGainDb[i] + plannedRunGainDb[i - 1]) / 2;
+    plannedRunGainDb[i - 1] =
+      plannedRunGainDb[i - 1] + (mid - plannedRunGainDb[i - 1]) * blend;
+    plannedRunGainDb[i] =
+      plannedRunGainDb[i] + (mid - plannedRunGainDb[i]) * blend;
   }
 
   // Conservative opener guard. It only acts when the first few body-speech
@@ -1263,16 +1330,6 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     if (liftDb > 0) {
       plannedRunGainDb[index] += liftDb;
     }
-  }
-
-  // Keep downward planner authority continuous and bounded. Extreme source
-  // events may still sit below ordinary dialogue, but one detector decision
-  // must never turn them into a crushed word or a millisecond-scale hole.
-  for (let index = 0; index < plannedRunGainDb.length; index += 1) {
-    plannedRunGainDb[index] = softLimitNegativePlannerGainDb(
-      plannedRunGainDb[index],
-      negativeGainSoftLimitDb,
-    );
   }
 
   // 4) Unclassified-frame trim. Detector misses are uncertainty, not proof of
@@ -1517,7 +1574,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //      positive gain to the source-owned event; never apply negative gain.
   const slewed = limitEmbeddedPerformancePositiveGainAuthority(
     valleyRelaxed,
-    input.frameDb,
+    embeddedPerformanceFrameDb,
     runMeta
       .filter(({ runClass }) => runClass === "body-speech")
       .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
@@ -1614,10 +1671,9 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // planned gain and raw-domain frame body, both of which are always
   // available.
   //
-  // The high-crest sub-targeting plus the ±18 dB attenuation window
-  // catches MOST loud vocalizations, but for an EXTREMELY loud source
-  // (body > target + 18 dB after sub-target shift) the clamp still
-  // saturates and the run plays back above dialogue. This pass detects
+  // The source-adaptive macro target plus its continuously widened attenuation
+  // window catches MOST loud vocalizations, but for an EXTREMELY loud source
+  // the class-aware clamp can still saturate. This pass detects
   // post-clamp residual loudness per-run and applies a uniform
   // additional attenuation (with cosine fade at run edges).
   //
@@ -1714,14 +1770,15 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   }
 
   // Final dip application covers absolute-peak safety and the uniform residual
-  // pass. Reapply the same continuous negative-authority limit after combining
-  // decisions so independently reasonable stages cannot stack into a hole.
+  // pass. Phrase-scale gain is already bounded by its class-aware run clamp.
+  // Soft-limit only the additional local/residual decision so the former 6 dB
+  // safety budget cannot accidentally cap an entire loud phrase.
   for (let f = 0; f < frameCount; f += 1) {
-    const combinedGainDb = slewed[f] - Math.max(0, dipDbByFrame[f]);
-    slewed[f] = softLimitNegativePlannerGainDb(
-      combinedGainDb,
-      negativeGainSoftLimitDb,
+    const boundedAdditionalDipDb = -softLimitNegativePlannerGainDb(
+      -Math.max(0, dipDbByFrame[f]),
+      LOCAL_PLANNER_DIP_SOFT_LIMIT_DB,
     );
+    slewed[f] -= boundedAdditionalDipDb;
   }
 
   // Stash diagnostics for the caller (logged via PlannedGain output).

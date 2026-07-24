@@ -6,6 +6,7 @@ import {
   applyGainCurveToSamples,
   buildRenderedConsonantReference,
   computeFricativeFrameDb,
+  computeSpeechBodyFrameDb,
   emitSendcmdScript,
   limitEmbeddedPerformancePositiveGainAuthority,
   planGainCurve,
@@ -125,6 +126,28 @@ describe("fricative-band envelope", () => {
     assert.ok(
       highEnvelope[stableFrame] > lowEnvelope[stableFrame] + 24,
       `expected HF-selective envelope, got low ${lowEnvelope[stableFrame].toFixed(2)} dB and high ${highEnvelope[stableFrame].toFixed(2)} dB`,
+    );
+  });
+
+  it("isolates speech-body energy from LF impacts and bright consonants", () => {
+    const lowImpact = makeTone(80, 0.2, 1);
+    const speechBody = makeTone(500, 0.2, 1);
+    const brightConsonant = makeTone(6000, 0.2, 1);
+
+    const lowEnvelope = computeSpeechBodyFrameDb(lowImpact, SAMPLE_RATE, FRAME_MS);
+    const bodyEnvelope = computeSpeechBodyFrameDb(speechBody, SAMPLE_RATE, FRAME_MS);
+    const brightEnvelope = computeSpeechBodyFrameDb(brightConsonant, SAMPLE_RATE, FRAME_MS);
+    const stableFrame = 20;
+
+    assert.equal(bodyEnvelope.length, lowEnvelope.length);
+    assert.equal(bodyEnvelope.length, brightEnvelope.length);
+    assert.ok(
+      bodyEnvelope[stableFrame] > lowEnvelope[stableFrame] + 10,
+      `speech body should outrank LF-only energy: ${bodyEnvelope[stableFrame].toFixed(2)} vs ${lowEnvelope[stableFrame].toFixed(2)} dB`,
+    );
+    assert.ok(
+      bodyEnvelope[stableFrame] > brightEnvelope[stableFrame] + 8,
+      `speech body should outrank consonant-only energy: ${bodyEnvelope[stableFrame].toFixed(2)} vs ${brightEnvelope[stableFrame].toFixed(2)} dB`,
     );
   });
 });
@@ -482,7 +505,12 @@ describe("gainPlanner", () => {
     const sourceDb = measureRmsDb(samples, run.startFrame * FRAME_SAMPLES, run.endFrame * FRAME_SAMPLES);
     const leveledDb = measureRmsDb(leveled, run.startFrame * FRAME_SAMPLES, run.endFrame * FRAME_SAMPLES);
 
-    assert.ok(plan.runs[0].peakReducedDb < 0, "fixture should engage the spike guard");
+    const ordinaryBodyGainDb = gainDbAtFrame(plan.gainCurve, run.startFrame + 1);
+    const spikeFrameGainDb = gainDbAtFrame(plan.gainCurve, run.startFrame + 3);
+    assert.ok(
+      Math.abs(spikeFrameGainDb - ordinaryBodyGainDb) < 0.8,
+      `sample peaks must not create a local body notch: ${ordinaryBodyGainDb.toFixed(2)} vs ${spikeFrameGainDb.toFixed(2)} dB`,
+    );
     assert.ok(
       leveledDb >= sourceDb - 10.2,
       `spike guard should not crush the run body: source ${sourceDb.toFixed(2)} dB, leveled ${leveledDb.toFixed(2)} dB`,
@@ -624,15 +652,28 @@ describe("gainPlanner", () => {
       });
     };
 
+    const assertOpenerSupported = (plan: ReturnType<typeof planGainCurve>) => {
+      const firstAppliedBodyDb = plan.runs[0].meanDb + plan.runs[0].plannedGainDb;
+      const laterAppliedBodies = plan.runs
+        .slice(1)
+        .map((run) => run.meanDb + run.plannedGainDb)
+        .sort((a, b) => a - b);
+      const laterAnchorDb = laterAppliedBodies[Math.floor(laterAppliedBodies.length / 2)];
+      assert.ok(
+        firstAppliedBodyDb >= laterAnchorDb - 1.5,
+        `quiet opener should be supported whether continuity or the explicit lift owns it: ${firstAppliedBodyDb.toFixed(2)} vs ${laterAnchorDb.toFixed(2)} dB`,
+      );
+    };
+
     const lifted = buildPlan(8);
-    assert.ok(lifted.coldOpenLiftCount >= 1, `expected cold-open lift, got ${lifted.coldOpenLiftCount}`);
+    assertOpenerSupported(lifted);
     assert.ok(
       lifted.coldOpenLiftMaxDb <= 5,
       `cold-open lift must stay capped at 5 dB, got ${lifted.coldOpenLiftMaxDb.toFixed(2)} dB`,
     );
 
     const shortTake = buildPlan(3);
-    assert.ok(shortTake.coldOpenLiftCount >= 1, `expected short-take cold-open lift, got ${shortTake.coldOpenLiftCount}`);
+    assertOpenerSupported(shortTake);
 
     const tooFewBodies = buildPlan(2);
     assert.equal(tooFewBodies.coldOpenLiftCount, 0);
@@ -696,8 +737,8 @@ describe("gainPlanner", () => {
     assert.ok(plan.earlyRunCapCount >= 2, `expected early caps, got ${plan.earlyRunCapCount}`);
     const appliedBodies = plan.runs.map((run) => run.meanDb + run.plannedGainDb);
     assert.ok(
-      plan.runs[0].plannedGainDb <= -4 && plan.runs[0].plannedGainDb >= -6.05,
-      `hot opener control should be meaningful but continuously bounded: ${plan.runs[0].plannedGainDb.toFixed(2)} dB`,
+      appliedBodies[0] >= plan.targetDb + 1 && appliedBodies[0] <= plan.targetDb + 4,
+      `hot opener should remain emphasized but controlled: ${appliedBodies[0].toFixed(2)} dB`,
     );
     assert.ok(
       appliedBodies[0] <= -7.5,
@@ -1026,7 +1067,154 @@ describe("run classification", () => {
 });
 
 describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
-  it("targets long high-crest body-speech runs below dialogue and applies post-clamp residual when the source is extremely loud", () => {
+  it("materially narrows extreme phrase spread while retaining quiet-dialogue-emotion order", () => {
+    const frameMs = 10;
+    const frameDb = new Array<number>(1_600).fill(-70);
+    const speechRuns: Array<{ startFrame: number; endFrame: number }> = [];
+    let cursor = 40;
+    const appendRun = (bodyDb: number, peakDb?: number) => {
+      const run = { startFrame: cursor, endFrame: cursor + 100 };
+      speechRuns.push(run);
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+        frameDb[frame] = bodyDb;
+      }
+      if (peakDb !== undefined) frameDb[run.startFrame + 50] = peakDb;
+      cursor = run.endFrame + 30;
+      return run;
+    };
+    for (let index = 0; index < 8; index += 1) appendRun(-22);
+    const quietRun = appendRun(-38);
+    const emotionalRun = appendRun(-6, 4);
+    const frameDbBefore = frameDb.slice();
+    const speechRunsBefore = speechRuns.map((run) => ({ ...run }));
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.8,
+    });
+
+    const typicalRun = speechRuns[4];
+    const outputBodyDb = (run: { startFrame: number; endFrame: number }) =>
+      frameDb[run.startFrame + 25] + gainDbAtFrame(plan.gainCurve, run.startFrame + 25);
+    const quietOutputDb = outputBodyDb(quietRun);
+    const typicalOutputDb = outputBodyDb(typicalRun);
+    const emotionalOutputDb = outputBodyDb(emotionalRun);
+    const sourceSpreadDb = -6 - -38;
+    const outputSpreadDb = emotionalOutputDb - quietOutputDb;
+
+    assert.ok(sourceSpreadDb >= 30, `fixture must remain extreme, got ${sourceSpreadDb.toFixed(2)} dB`);
+    assert.ok(
+      outputSpreadDb < 8,
+      `phrase-scale leveling should materially narrow the 32 dB source spread, got ${outputSpreadDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      quietOutputDb < typicalOutputDb && typicalOutputDb < emotionalOutputDb,
+      `performance order must remain quiet < dialogue < emotion, got ${quietOutputDb.toFixed(2)}, ${typicalOutputDb.toFixed(2)}, ${emotionalOutputDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      emotionalOutputDb - typicalOutputDb >= 2,
+      `the emotional phrase must retain audible emphasis, got ${(emotionalOutputDb - typicalOutputDb).toFixed(2)} dB`,
+    );
+    assert.deepEqual(frameDb, frameDbBefore, "planner must not mutate frame evidence");
+    assert.deepEqual(speechRuns, speechRunsBefore, "planner must not mutate run boundaries");
+  });
+
+  it("spends deep correction as a smooth phrase-scale move, never a mid-word notch", () => {
+    const frameMs = 10;
+    const frameDb = new Array<number>(420).fill(-70);
+    const speechRuns = [
+      { startFrame: 40, endFrame: 140 },
+      { startFrame: 190, endFrame: 340 },
+    ];
+    for (let frame = 40; frame < 140; frame += 1) frameDb[frame] = -22;
+    for (let frame = 190; frame < 340; frame += 1) frameDb[frame] = -5;
+    frameDb[265] = 3;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.8,
+    });
+
+    const bodyGainDb = Array.from(
+      { length: 90 },
+      (_, offset) => gainDbAtFrame(plan.gainCurve, 220 + offset),
+    );
+    const deepestGainDb = Math.min(...bodyGainDb);
+    const shallowestGainDb = Math.max(...bodyGainDb);
+    let maxAdjacentStepDb = 0;
+    for (let index = 1; index < bodyGainDb.length; index += 1) {
+      maxAdjacentStepDb = Math.max(
+        maxAdjacentStepDb,
+        Math.abs(bodyGainDb[index] - bodyGainDb[index - 1]),
+      );
+    }
+
+    assert.ok(
+      shallowestGainDb < -9,
+      `extreme loudness needs phrase authority beyond the old 6 dB ceiling, got ${shallowestGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      shallowestGainDb - deepestGainDb < 0.8,
+      `a uniform loud phrase must not contain a local gain notch, range ${(shallowestGainDb - deepestGainDb).toFixed(3)} dB`,
+    );
+    assert.ok(
+      maxAdjacentStepDb < 0.15,
+      `body gain must not jump down/up between 10 ms frames, got ${maxAdjacentStepDb.toFixed(3)} dB`,
+    );
+  });
+
+  it("changes continuously when adjacent phrase contrast crosses the former 8 dB boundary", () => {
+    const planSecondRunGainDb = (secondBodyDb: number) => {
+      const frameDb = new Array<number>(300).fill(-70);
+      const speechRuns = [
+        { startFrame: 30, endFrame: 130 },
+        { startFrame: 160, endFrame: 260 },
+      ];
+      for (let frame = 30; frame < 130; frame += 1) frameDb[frame] = -24;
+      for (let frame = 160; frame < 260; frame += 1) frameDb[frame] = secondBodyDb;
+      const frameDbBefore = frameDb.slice();
+      const speechRunsBefore = speechRuns.map((run) => ({ ...run }));
+
+      const plan = planGainCurve({
+        frameDb,
+        speechRuns,
+        noiseFloorDb: -70,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.1,
+        frameMs: 10,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        instabilityHint: 0.5,
+      });
+
+      assert.deepEqual(frameDb, frameDbBefore);
+      assert.deepEqual(speechRuns, speechRunsBefore);
+      return gainDbAtFrame(plan.gainCurve, 210);
+    };
+
+    const justInsideGainDb = planSecondRunGainDb(-16.01);
+    const justOutsideGainDb = planSecondRunGainDb(-15.99);
+    assert.ok(
+      Math.abs(justOutsideGainDb - justInsideGainDb) < 0.15,
+      `0.02 dB of source contrast must not cause a gain-policy cliff: ${justInsideGainDb.toFixed(3)} -> ${justOutsideGainDb.toFixed(3)} dB`,
+    );
+  });
+
+  it("controls long high-crest body-speech runs without flattening them to dialogue", () => {
     const frameMs = 10;
     // 8 dialogue runs at body -22 dB anchor the trimmed-mean target near
     // -22 dB. One LOUD vocalization run with body +0 dB (extreme — well
@@ -1090,15 +1278,17 @@ describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
     );
 
     // Even an extreme vocalization is tamed continuously, not flattened to
-    // dialogue. The final limiter owns remaining absolute peak safety.
+    // dialogue. Phrase-scale authority may exceed 6 dB; the emotional body
+    // still retains a small level advantage over ordinary dialogue.
     assert.ok(
-      yellRun!.plannedGainDb >= -6.05 && yellRun!.plannedGainDb <= -4,
-      `high-crest yell attenuation must stay subtle; got ${yellRun!.plannedGainDb.toFixed(2)} dB`,
+      yellRun!.plannedGainDb <= -12 && yellRun!.plannedGainDb >= -18.1,
+      `high-crest yell needs phrase-scale attenuation, got ${yellRun!.plannedGainDb.toFixed(2)} dB`,
     );
     const yellCenterGainDb = gainDbAtFrame(plan.gainCurve, yellStart + 75);
+    const yellOutputBodyDb = frameDb[yellStart + 75] + yellCenterGainDb;
     assert.ok(
-      yellCenterGainDb >= -6.05,
-      `post-planner shaping must not exceed the same continuous authority; got ${yellCenterGainDb.toFixed(2)} dB`,
+      yellOutputBodyDb >= plan.targetDb + 2 && yellOutputBodyDb <= plan.targetDb + 6.5,
+      `the controlled yell must remain above dialogue without dominating it; got ${yellOutputBodyDb.toFixed(2)} dB`,
     );
 
     // Dialogue frames untouched.
@@ -1110,11 +1300,9 @@ describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
     );
   });
 
-  it("psycho-acoustically targets normal-body high-crest screams BELOW dialogue (not at it)", () => {
-    // Test the high-crest sub-targeting in isolation. Yell body is
-    // RELATIVELY moderate (-12) but crest is high — typical scream where
-    // the planner could otherwise level body to dialogue and leave the
-    // run perceptually louder.
+  it("retains a controlled level advantage for a normal-body high-crest scream", () => {
+    // Yell body is relatively moderate (-12) but crest is high. It should
+    // be controlled strongly while retaining the source's emotional order.
     const frameMs = 10;
     const dialogueRuns: Array<{ startFrame: number; endFrame: number }> = [];
     let cursor = 50;
@@ -1153,20 +1341,14 @@ describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
 
     const yellRun = plan.runs.find((r) => r.startFrame === yellStart)!;
     assert.equal(yellRun.runClass, "body-speech");
-    // Without sub-targeting, gain would be exactly -22 - (-12) = -10 dB
-    // and applied body would equal dialogue (-22). High-crest sub-target
-    // shifts target by ~(crest - 11) * 0.4. For crest 18 → -2.8 dB shift,
-    // adjusted target -24.8, gain -24.8 - (-12) = -12.8.
     assert.ok(
-      yellRun.plannedGainDb >= -6.05 && yellRun.plannedGainDb <= -4,
-      `high-crest sub-targeting should remain subtly bounded; got ${yellRun.plannedGainDb.toFixed(2)} dB`,
+      yellRun.plannedGainDb < -6 && yellRun.plannedGainDb > -10,
+      `high-crest phrase should be controlled beyond the old ceiling without flattening, got ${yellRun.plannedGainDb.toFixed(2)} dB`,
     );
-    // Applied body is now BELOW dialogue (compensates psycho-acoustic
-    // overload from high-crest content).
     const yellAppliedBodyDb = -12 + yellRun.plannedGainDb;
     assert.ok(
-      yellAppliedBodyDb > -20 && yellAppliedBodyDb < -16,
-      `high-crest yell should remain expressive but controlled; got ${yellAppliedBodyDb.toFixed(2)} dB`,
+      yellAppliedBodyDb > -21 && yellAppliedBodyDb < -18,
+      `high-crest yell should remain above dialogue but controlled; got ${yellAppliedBodyDb.toFixed(2)} dB`,
     );
   });
 });
@@ -3316,6 +3498,86 @@ describe("localized peak guard", () => {
       largestEventStepDb < 1.5,
       `event ownership should move as a phrase envelope, not a millisecond notch; largest step ${largestEventStepDb.toFixed(2)} dB`,
     );
+  });
+
+  it("does not let a future embedded burst pre-duck its quiet voiced lead-in", () => {
+    const gainDbCurve = new Float32Array(320).fill(12);
+    const sourceFrameDb = new Array<number>(gainDbCurve.length).fill(-34);
+    for (let frame = 150; frame < 155; frame += 1) {
+      sourceFrameDb[frame] = -14;
+    }
+    const runs = [{ startFrame: 0, endFrame: gainDbCurve.length }];
+    const gainSnapshot = new Float32Array(gainDbCurve);
+    const sourceSnapshot = [...sourceFrameDb];
+    const runSnapshot = runs.map((run) => ({ ...run }));
+
+    const result = limitEmbeddedPerformancePositiveGainAuthority(
+      gainDbCurve,
+      sourceFrameDb,
+      runs,
+      -22,
+      FRAME_MS,
+    );
+    const settledQuietOutputDb = sourceFrameDb[130] + result[130];
+    const quietLeadOutputDb = sourceFrameDb[146] + result[146];
+    const eventOutputDb = sourceFrameDb[152] + result[152];
+
+    assert.ok(
+      quietLeadOutputDb >= settledQuietOutputDb - 3,
+      `future energy must not create an anticipatory quiet-word hole: ${quietLeadOutputDb.toFixed(2)} vs ${settledQuietOutputDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      result[152] <= 3,
+      `the source-owned burst must still shed inappropriate broad-run lift, got ${result[152].toFixed(2)} dB`,
+    );
+    assert.ok(
+      eventOutputDb >= settledQuietOutputDb + 2,
+      `the controlled burst should retain emotional emphasis: ${eventOutputDb.toFixed(2)} vs ${settledQuietOutputDb.toFixed(2)} dB`,
+    );
+    assert.deepEqual(gainDbCurve, gainSnapshot);
+    assert.deepEqual(sourceFrameDb, sourceSnapshot);
+    assert.deepEqual(runs, runSnapshot);
+  });
+
+  it("does not let an out-of-band burst remove recovery from a steady speech body", () => {
+    const totalFrames = 320;
+    const frameDb = new Array<number>(totalFrames).fill(-34);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-34);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-34);
+    for (let frame = 150; frame < 152; frame += 1) {
+      frameDb[frame] = -14;
+      loudnessFrameDb[frame] = -16;
+    }
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const speechBodySnapshot = [...speechBodyFrameDb];
+    const speechRuns = [{ startFrame: 0, endFrame: totalFrames }];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      noiseFloorDb: -75,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.7,
+    });
+    const ordinaryVoiceGainDb = gainDbAtFrame(plan.gainCurve, 130);
+    const lfBurstGainDb = gainDbAtFrame(plan.gainCurve, 150);
+
+    assert.ok(
+      lfBurstGainDb >= ordinaryVoiceGainDb - 3,
+      `energy outside the speech body must not open a mid-word gain hole: ${ordinaryVoiceGainDb.toFixed(2)} -> ${lfBurstGainDb.toFixed(2)} dB`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, speechBodySnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
   });
 
   it("retains recovery for a quiet voiced high-frequency island and keeps inputs immutable", () => {

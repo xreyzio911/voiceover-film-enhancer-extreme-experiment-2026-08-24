@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-07-24 - Judge Micro-Dips In The Speech Body, Not Gain Motion Alone
+
+- What went wrong: A 100 ms source-relative gain jump looked like a new dip even where the output level stayed stable, while a separate 12 ms 180-3000 Hz V was real but hidden inside a broadband emotional impact.
+- Rule to prevent it: Use gain motion only as a locator. Confirm a defect against the aligned source and rendered speech-body envelopes at a fine enough hop, then make the creating planner stage use speech-body evidence with a continuous soft spectral offset instead of treating all K-weighted out-of-band energy as voiced-body authority.
+- How to verify next time: Keep synthetic RED coverage for future pre-duck and out-of-band bursts, then rerender the exact browser WAV and compare source/output micro-shapes, whole-file dynamics, peaks, timing, and the human level-matched audition boundary.
+
 ## 2026-07-22 - Quality Metrics Must Not Become New Hard Gates
 
 - What went wrong: The implementation plan inherited language about preserving hard gates without making the user's current preference explicit, which could be read as permission to add stricter automatic rejection rules.

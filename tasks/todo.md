@@ -1,3 +1,42 @@
+# Final Experimental VO Hardening
+
+## Checklist
+
+- [x] Read the final pre-production review, current project contracts, prior VO lessons, active Git state, and the exact planner/tone/spatial processing paths.
+- [x] Freeze the untouched baseline with the complete audio-QC suite.
+- [x] Classify the review recommendations against current source instead of treating its thresholds as release gates.
+- [x] Add failing regression coverage for extreme phrase-scale dynamics, clean/dry source voicing, future-event pre-duck, and out-of-band micro-dip authority.
+- [x] Implement the smallest continuous, source-adaptive corrections without adding a hard quality gate or another dynamics/tamer stage.
+- [x] Run focused and full verification, then render the exact long-form bug fixtures and a clean/dry fixture for source-relative diagnostics and level-matched audition.
+- [x] Complete independent correctness/audio/security review and prepare only the scoped experiment changes for release.
+
+## Scope Boundaries
+
+- Preserve one input to one output, 48 kHz mono mix-ready delivery, speech timing, emotional contour, consonants, onsets, and tails.
+- Add no hard quality gate, fixed release blocker, stricter acceptance threshold, or iterative quality loop; diagnostics remain advisory.
+- Do not re-enable the legacy dynaudnorm/compressor/gate/tamer stack after the gain planner.
+- Do not add synthetic ambience to clean/dry speech or brighten/warm a source merely to prove that processing occurred.
+- Keep private WAV evidence local. Do not upload source or rendered audio to Gemini or another external provider.
+- Change and deploy only this experimental project. Do not stage, promote, or modify the stable app.
+
+## Final Review Verdict
+
+- **Keep:** rerender the exact Seth/Simone long-form fixtures; compare source and output phrase levels; retain source-preserving fallback; keep the faster planner-owned path that avoids stacked stateful DSP; use human level-matched audition for subjective quality.
+- **Correct:** numeric targets from the review are listening/diagnostic targets, never hard gates. Planner-active cleanup controls need truthful status, but legacy cleanup must not be re-enabled by default. Long-form makeup needs full-stream evidence before positive gain, not sampled-window authority.
+- **Reject:** failing a speech-bearing file solely because adaptive planning is unavailable; enforcing fixed LUFS/tilt/drift thresholds; adding another compressor, limiter, gate, consonant tamer, or blind ambience layer.
+- **Direction:** separate phrase-scale macro authority from millisecond/local safety, continuously preserve emotional emphasis, protect clean/dry sources from delayed reflections and stacked cinematic EQ, and keep the final source-preserving path as the non-destructive fallback.
+
+## Exact Final Evidence
+
+- Seth browser WAV: 48 kHz mono float, 1013.933313 s, SHA-256 `FF79D0DEA51B668E512CB7B710DBC83E7C39F0668F2C1D320197F31EA47D1891`.
+- Matthew/Simone browser WAV: 48 kHz mono float, 963.456729 s, SHA-256 `3BDCAE055786E8C266E9A0CE30229495A5113EA5CF82841EA405750113038FAC`.
+- German Angi browser WAV: 48 kHz mono float, 60.000000 s, SHA-256 `A16624DF745CA5B09F2859E5E3FBB0F17A42288017F6DEE7EA61D5B1613AAC1C`.
+- Seth's prior 2.38 dB, 12 ms processing-added speech-body V at 331.122 s is absent in the final rerender; the largest remaining processing-added body-band micro-V in the inspected 330.2-331.4 s window is 0.69 dB in a very low-level frame. Whole-file 100 ms max voice/body gain motion is 5.53/5.96 dB with no events at or above 6 dB.
+- Matthew's strong voice-band P90-P10 narrows from 17.74 dB to 12.98 dB while retaining zero gain jumps at or above 6 dB.
+- German tone movement stays source-relative and modest: maximum body-normalized band delta 1.80 dB; browser evidence reports delayed-reflection blend `0.0/0.0%`.
+- Diagnostics are advisory only. Subjective echo, tone, emotional contour, and naturalness still require human level-matched audition of the delivered WAVs.
+- Verification: 408 tests passed with 1 intentional skip, TypeScript passed, lint passed with 2 warnings only in the user's untracked diagnostic, and the production build passed with the existing Audio Splitter NFT trace warning.
+
 # Film Enhancer Audio Quality Upgrade
 
 ## Checklist
