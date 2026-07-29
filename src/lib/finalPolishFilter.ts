@@ -3,7 +3,8 @@ import {
   type SourceRelativeFinalTone,
 } from "./plannerDelivery.ts";
 
-export const FINAL_POLISH_LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
+export const FINAL_POLISH_LIMITER_FILTER =
+  "alimiter=limit=-2dB:level=disabled:latency=1";
 
 export type FinalPolishFilterOptions = Readonly<{
   sourceSafe: boolean;
@@ -18,9 +19,9 @@ const finiteOr = (value: number, fallback: number) => (Number.isFinite(value) ? 
  * Build the deliberately linear final delivery pass.
  *
  * Earlier render stages own cleanup, voicing, and time-varying dynamics. This
- * pass applies only measured source-relative HF reconciliation plus one
- * file-wide planner makeup scalar, then the delivery limiter. It never replays
- * the primary tone profile.
+ * pass applies only measured source-relative body/HF reconciliation plus one
+ * file-wide planner makeup scalar, then the latency-compensated delivery
+ * limiter. It never replays the primary tone profile.
  */
 export const buildFinalPolishFilter = (
   tone: SourceRelativeFinalTone | null,
@@ -29,6 +30,14 @@ export const buildFinalPolishFilter = (
   if (options.sourceSafe) return FINAL_POLISH_LIMITER_FILTER;
 
   const filters: string[] = [];
+  const bodyPreservationTiltDb = tone
+    ? clamp(finiteOr(tone.bodyPreservationTiltDb, 0), -0.75, 0)
+    : 0;
+  if (bodyPreservationTiltDb < -0.005) {
+    filters.push(
+      `highshelf=f=950:width_type=q:width=0.7:g=${bodyPreservationTiltDb.toFixed(2)}`,
+    );
+  }
   const fourKhzTrimDb = tone ? clamp(finiteOr(tone.fourKhzTrimDb, 0), -0.7, 0) : 0;
   const eightKhzTrimDb = tone ? clamp(finiteOr(tone.eightKhzTrimDb, 0), -0.9, 0) : 0;
   const topOctaveTrimDb = tone ? clamp(finiteOr(tone.topOctaveTrimDb, 0), -2, 0) : 0;

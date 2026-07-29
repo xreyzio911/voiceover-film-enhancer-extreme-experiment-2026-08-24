@@ -4418,3 +4418,500 @@ describe("spectrum", () => {
     assert.ok(highSib > lowSib + 0.2, `expected sibilance score to rise with HF content: low=${lowSib.toFixed(2)} high=${highSib.toFixed(2)}`);
   });
 });
+
+describe("actor-decay regressions", () => {
+  it("actor-decay: gives a verified quiet later onset its settled recovery without lifting detector-negative pre-roll", () => {
+    const totalFrames = 300;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const fricativeFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [
+      { startFrame: 20, endFrame: 90 },
+      { startFrame: 150, endFrame: 230 },
+    ];
+
+    for (let frame = 20; frame < 90; frame += 1) {
+      frameDb[frame] = -22;
+      loudnessFrameDb[frame] = -22;
+      speechBodyFrameDb[frame] = -22;
+    }
+    // The detector starts the quiet line at frame 150, but the six preceding
+    // frames carry contiguous raw, voiced-body, and consonant-band evidence.
+    // They are speech ownership evidence, unlike the bed at frame 143.
+    for (let frame = 144; frame < 150; frame += 1) {
+      frameDb[frame] = -60;
+      loudnessFrameDb[frame] = -58;
+      speechBodyFrameDb[frame] = -52;
+      fricativeFrameDb[frame] = -44;
+    }
+    for (let frame = 150; frame < 230; frame += 1) {
+      frameDb[frame] = -38;
+      loudnessFrameDb[frame] = -38;
+      speechBodyFrameDb[frame] = -40;
+      fricativeFrameDb[frame] = -75;
+    }
+
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const fricativeSnapshot = [...fricativeFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+      speechRuns,
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.1,
+    });
+
+    assert.equal(plan.runs[1].startFrame, 144, "contiguous source evidence should own the onset");
+    assert.ok(
+      plan.runs[1].plannedGainDb >= 12 && plan.runs[1].plannedGainDb <= 14.1,
+      `fixture must request 12-14 dB of quiet-line recovery, got ${plan.runs[1].plannedGainDb.toFixed(2)} dB`,
+    );
+    const detectorNegativePreRollGainDb = gainDbAtFrame(plan.gainCurve, 143);
+    const onsetGainDb = gainDbAtFrame(plan.gainCurve, 144);
+    const settledBodyGainDb = gainDbAtFrame(plan.gainCurve, 180);
+    assert.ok(
+      detectorNegativePreRollGainDb <= 5.5,
+      `detector-negative recording bed must stay conservative, got ${detectorNegativePreRollGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      settledBodyGainDb - onsetGainDb <= 1.5,
+      `verified onset must not spend hundreds of milliseconds climbing from ${onsetGainDb.toFixed(2)} to ${settledBodyGainDb.toFixed(2)} dB`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(fricativeFrameDb, fricativeSnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+  });
+
+  it("actor-decay: partially recovers an extreme voiced decrescendo while preserving an ordinary fade", () => {
+    const planFade = (startDb: number, endDb: number) => {
+      const totalFrames = 260;
+      const frameDb = new Array<number>(totalFrames).fill(-82);
+      const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechRuns = [{ startFrame: 30, endFrame: 230 }];
+      for (let frame = 30; frame < 230; frame += 1) {
+        const progress = (frame - 30) / 199;
+        const levelDb = startDb + (endDb - startDb) * progress;
+        frameDb[frame] = levelDb;
+        loudnessFrameDb[frame] = levelDb;
+        speechBodyFrameDb[frame] = levelDb;
+      }
+      const frameSnapshot = [...frameDb];
+      const loudnessSnapshot = [...loudnessFrameDb];
+      const bodySnapshot = [...speechBodyFrameDb];
+      const runSnapshot = speechRuns.map((run) => ({ ...run }));
+      const plan = planGainCurve({
+        frameDb,
+        loudnessFrameDb,
+        speechBodyFrameDb,
+        speechRuns,
+        noiseFloorDb: -82,
+        speechThresholdDb: -60,
+        pauseNoiseRisk: 0.1,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.1,
+      });
+      assert.deepEqual(frameDb, frameSnapshot);
+      assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+      assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+      assert.deepEqual(speechRuns, runSnapshot);
+      return { frameDb, plan };
+    };
+
+    const measureFade = (
+      frameDb: number[],
+      gainCurve: Float32Array,
+      headFrame = 50,
+      tailFrame = 210,
+    ) => {
+      const sourceFadeDb = frameDb[headFrame] - frameDb[tailFrame];
+      const outputHeadDb = frameDb[headFrame] + gainDbAtFrame(gainCurve, headFrame);
+      const outputTailDb = frameDb[tailFrame] + gainDbAtFrame(gainCurve, tailFrame);
+      return {
+        sourceFadeDb,
+        outputFadeDb: outputHeadDb - outputTailDb,
+        recoveryDb: sourceFadeDb - (outputHeadDb - outputTailDb),
+      };
+    };
+
+    const extreme = planFade(-16, -44);
+    const extremeFade = measureFade(extreme.frameDb, extreme.plan.gainCurve);
+    assert.ok(
+      extremeFade.recoveryDb >= 4.5 && extremeFade.recoveryDb <= 7,
+      `extreme monotonic body fade needs bounded partial recovery, got ${extremeFade.recoveryDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      extremeFade.outputFadeDb >= 16,
+      `intentional decrescendo must remain clearly descending, got ${extremeFade.outputFadeDb.toFixed(2)} dB`,
+    );
+    let largestGainStepDb = 0;
+    for (let frame = 51; frame <= 210; frame += 1) {
+      largestGainStepDb = Math.max(
+        largestGainStepDb,
+        Math.abs(
+          gainDbAtFrame(extreme.plan.gainCurve, frame) -
+            gainDbAtFrame(extreme.plan.gainCurve, frame - 1),
+        ),
+      );
+    }
+    assert.ok(
+      largestGainStepDb <= 0.3,
+      `decrescendo recovery must move as a smooth ride, largest 10 ms step ${largestGainStepDb.toFixed(3)} dB`,
+    );
+
+    const ordinary = planFade(-26, -31);
+    const ordinaryFade = measureFade(ordinary.frameDb, ordinary.plan.gainCurve);
+    assert.ok(
+      ordinaryFade.recoveryDb <= 2,
+      `an ordinary 3-5 dB performance fade should stay essentially intact, planner removed ${ordinaryFade.recoveryDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      ordinaryFade.outputFadeDb >= 2,
+      `ordinary fade must remain audible as a fade, got ${ordinaryFade.outputFadeDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("actor-decay: restores a body-dominant 400 ms event after phrase-wide absolute-peak handling", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 520;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const fricativeFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [
+      { startFrame: 20, endFrame: 100 },
+      { startFrame: 130, endFrame: 210 },
+      { startFrame: 240, endFrame: 320 },
+      { startFrame: 400, endFrame: 440 },
+    ];
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    const paintVoicedFrame = (frame: number, rmsDb: number) => {
+      const amplitude = dbToLin(rmsDb) * Math.SQRT2;
+      const startSample = frame * samplesPerFrame;
+      for (let offset = 0; offset < samplesPerFrame; offset += 1) {
+        const sampleIndex = startSample + offset;
+        samples[sampleIndex] =
+          Math.sin((2 * Math.PI * 300 * sampleIndex) / sampleRate) * amplitude;
+      }
+    };
+
+    for (const run of speechRuns.slice(0, 3)) {
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+        frameDb[frame] = -22;
+        loudnessFrameDb[frame] = -22;
+        speechBodyFrameDb[frame] = -22;
+        paintVoicedFrame(frame, -22);
+      }
+    }
+    // Ethan-derived short event: raw/body are about -20.9/-22.2 dB, with a
+    // -4.5 dBFS crest in roughly one third of frames. The low fricative
+    // envelope makes this explicitly voiced/body-dominant, not an HF burst.
+    for (let frame = 400; frame < 440; frame += 1) {
+      frameDb[frame] = -20.91;
+      loudnessFrameDb[frame] = -20.1;
+      speechBodyFrameDb[frame] = -22.15;
+      fricativeFrameDb[frame] = -32.15;
+      paintVoicedFrame(frame, -20.91);
+      if ((frame - 400) % 3 === 0) {
+        samples[frame * samplesPerFrame + 80] = dbToLin(-4.49);
+      }
+    }
+
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const fricativeSnapshot = [...fricativeFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const sampleSnapshot = new Float32Array(samples);
+    const peakCeilingDb = -3;
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+      speechRuns,
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      samples,
+      sampleRate,
+      peakCeilingDb,
+      instabilityHint: 0.7,
+    });
+
+    const eventRun = plan.runs[3];
+    assert.equal(eventRun.runClass, "transient-breath");
+    assert.ok(
+      eventRun.crestDb >= 16 && eventRun.crestDb <= 17,
+      `fixture must reproduce the measured short-event crest, got ${eventRun.crestDb.toFixed(2)} dB`,
+    );
+    const legacyBreathGainDb = plan.targetDb - 3.2 - -20.1;
+    assert.ok(
+      eventRun.plannedGainDb >= legacyBreathGainDb + 1.5,
+      `body-owned word must not inherit the full breath target: ${eventRun.plannedGainDb.toFixed(2)} vs legacy ${legacyBreathGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      eventRun.peakReducedDb <= -3.5,
+      `fixture must request phrase-wide absolute-peak handling, got ${eventRun.peakReducedDb.toFixed(2)} dB`,
+    );
+
+    const prePeakBodyPlanDb = -22.15 + eventRun.plannedGainDb;
+    let projectedBodyPower = 0;
+    for (let frame = 400; frame < 440; frame += 1) {
+      const gainDb = gainDbAtFrame(plan.gainCurve, frame);
+      projectedBodyPower += Math.pow(10, (-22.15 + gainDb) / 10);
+      assert.ok(
+        gainDb <= eventRun.plannedGainDb + 0.05,
+        `peak restoration must be lift-only and never exceed the class plan at frame ${frame}`,
+      );
+    }
+    const projectedBodyDb = 10 * Math.log10(projectedBodyPower / 40 + 1e-30);
+    const projectedBodyLossDb = projectedBodyDb - -22.15;
+    assert.ok(
+      projectedBodyLossDb >= -4.8 && projectedBodyLossDb <= -1.5,
+      `body-owned word must stay controlled without becoming a hole, got ${projectedBodyLossDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      projectedBodyDb >= prePeakBodyPlanDb - 1,
+      `body-dominant short event must finish within 1 dB of its own pre-peak plan, got ${projectedBodyDb.toFixed(2)} vs ${prePeakBodyPlanDb.toFixed(2)} dB`,
+    );
+
+    const rendered = applyGainCurveToSamples(
+      samples,
+      plan.gainCurve,
+      sampleRate,
+      1,
+      frameMs,
+    );
+    let renderedEventPeak = 0;
+    for (
+      let sample = 400 * samplesPerFrame;
+      sample < 440 * samplesPerFrame;
+      sample += 1
+    ) {
+      renderedEventPeak = Math.max(renderedEventPeak, Math.abs(rendered[sample]));
+    }
+    const renderedEventPeakDb = 20 * Math.log10(renderedEventPeak + 1e-9);
+    assert.ok(
+      renderedEventPeakDb <= peakCeilingDb + 0.05,
+      `restoration must retain the absolute peak ceiling, got ${renderedEventPeakDb.toFixed(2)} dBFS`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(fricativeFrameDb, fricativeSnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+    assert.deepEqual(samples, sampleSnapshot);
+  });
+
+  it("actor-decay: continuously distinguishes a body-owned short word from a breath-shaped transient", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 520;
+    const eventStartFrame = 400;
+    const eventFrames = 54;
+    const eventEndFrame = eventStartFrame + eventFrames;
+    const rawDb = -18.755;
+    const loudnessDb = -17.8;
+    const peakDb = -2.465;
+    const peakCeilingDb = -3;
+    const speechRuns = [
+      { startFrame: 20, endFrame: 100 },
+      { startFrame: 130, endFrame: 210 },
+      { startFrame: 240, endFrame: 320 },
+      { startFrame: eventStartFrame, endFrame: eventEndFrame },
+    ];
+
+    const buildPlan = (
+      bodyDb: number,
+      fricativeDb: number,
+      includeBodyEvidence = true,
+      eventShape: "tone" | "lowpass-noise" = "tone",
+    ) => {
+      const frameDb = new Array<number>(totalFrames).fill(-82);
+      const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+      const fricativeFrameDb = new Array<number>(totalFrames).fill(-82);
+      const samples = new Float32Array(totalFrames * samplesPerFrame);
+      const paintTone = (frame: number, rmsDb: number, hz: number) => {
+        const amplitude = dbToLin(rmsDb) * Math.SQRT2;
+        const startSample = frame * samplesPerFrame;
+        for (let offset = 0; offset < samplesPerFrame; offset += 1) {
+          const sampleIndex = startSample + offset;
+          samples[sampleIndex] =
+            Math.sin((2 * Math.PI * hz * sampleIndex) / sampleRate) * amplitude;
+        }
+      };
+
+      for (const run of speechRuns.slice(0, 3)) {
+        for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+          frameDb[frame] = -22.3;
+          loudnessFrameDb[frame] = -22.3;
+          speechBodyFrameDb[frame] = -22.3;
+          fricativeFrameDb[frame] = -38;
+          paintTone(frame, -22.3, 260);
+        }
+      }
+      const eventHz = bodyDb > fricativeDb ? 300 : 6000;
+      let noiseState = 0x5eed1234;
+      let lowpassState = 0;
+      for (let frame = eventStartFrame; frame < eventEndFrame; frame += 1) {
+        frameDb[frame] = rawDb;
+        loudnessFrameDb[frame] = loudnessDb;
+        speechBodyFrameDb[frame] = bodyDb;
+        fricativeFrameDb[frame] = fricativeDb;
+        if (eventShape === "tone") {
+          paintTone(frame, rawDb, eventHz);
+        } else {
+          const startSample = frame * samplesPerFrame;
+          const noiseFrame = new Float32Array(samplesPerFrame);
+          let noisePower = 0;
+          for (let offset = 0; offset < samplesPerFrame; offset += 1) {
+            noiseState = (Math.imul(noiseState, 1664525) + 1013904223) >>> 0;
+            const white = (noiseState / 0xffffffff) * 2 - 1;
+            lowpassState = lowpassState * 0.94 + white * 0.06;
+            noiseFrame[offset] = lowpassState;
+            noisePower += lowpassState * lowpassState;
+          }
+          const scale =
+            dbToLin(rawDb) / Math.sqrt(noisePower / samplesPerFrame + 1e-30);
+          for (let offset = 0; offset < samplesPerFrame; offset += 1) {
+            samples[startSample + offset] = noiseFrame[offset] * scale;
+          }
+        }
+        if ((frame - eventStartFrame) % 3 === 0) {
+          samples[frame * samplesPerFrame + 80] = dbToLin(peakDb);
+        }
+      }
+
+      const plan = planGainCurve({
+        frameDb,
+        loudnessFrameDb,
+        ...(includeBodyEvidence ? { speechBodyFrameDb } : {}),
+        fricativeFrameDb,
+        fricativeNoiseFloorDb: -82,
+        speechRuns,
+        noiseFloorDb: -82,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.1,
+        frameMs,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        samples,
+        sampleRate,
+        peakCeilingDb,
+        instabilityHint: 0.7,
+      });
+      const eventRun = plan.runs[3];
+      let projectedBodyPower = 0;
+      for (let frame = eventStartFrame; frame < eventEndFrame; frame += 1) {
+        projectedBodyPower += Math.pow(
+          10,
+          (bodyDb + gainDbAtFrame(plan.gainCurve, frame)) / 10,
+        );
+      }
+      return {
+        plan,
+        eventRun,
+        projectedBodyLossDb:
+          10 * Math.log10(projectedBodyPower / eventFrames + 1e-30) - bodyDb,
+      };
+    };
+
+    const bodyOwned = buildPlan(-19.179, -29.13);
+    const breathShaped = buildPlan(-33, -18);
+    const lowpassBreath = buildPlan(
+      rawDb + 10 * Math.log10(0.7),
+      rawDb - 14,
+      true,
+      "lowpass-noise",
+    );
+    const missingBodyEvidence = buildPlan(-19.179, -29.13, false);
+    const legacyBreathGainDb = bodyOwned.plan.targetDb - 3.2 - loudnessDb;
+
+    assert.equal(bodyOwned.eventRun.runClass, "transient-breath");
+    assert.equal(breathShaped.eventRun.runClass, "transient-breath");
+    assert.ok(
+      bodyOwned.eventRun.plannedGainDb >= legacyBreathGainDb + 2.25,
+      `body-owned event needs bounded class-plan restoration, got ${bodyOwned.eventRun.plannedGainDb.toFixed(2)} vs legacy ${legacyBreathGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      bodyOwned.eventRun.transientBodyRecoveryDb >= 0 &&
+        bodyOwned.eventRun.transientBodyRecoveryDb <= 3.2 &&
+        bodyOwned.eventRun.plannedGainDb <= 0,
+      `transient restoration must only withdraw at most 3.2 dB of attenuation, got ${bodyOwned.eventRun.transientBodyRecoveryDb.toFixed(2)} dB recovery and ${bodyOwned.eventRun.plannedGainDb.toFixed(2)} dB plan`,
+    );
+    assert.ok(
+      bodyOwned.projectedBodyLossDb >= -6.25 && bodyOwned.projectedBodyLossDb <= -2.5,
+      `body-owned event must remain controlled without a 6-10 dB hole, got ${bodyOwned.projectedBodyLossDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      breathShaped.eventRun.plannedGainDb <= legacyBreathGainDb + 0.5,
+      `low-body HF transient must retain breath control, got ${breathShaped.eventRun.plannedGainDb.toFixed(2)} dB`,
+    );
+    assert.equal(lowpassBreath.eventRun.runClass, "transient-breath");
+    assert.ok(
+      lowpassBreath.eventRun.plannedGainDb <= legacyBreathGainDb + 0.5,
+      `aperiodic low-passed breath must not borrow voiced-body recovery, got ${lowpassBreath.eventRun.plannedGainDb.toFixed(2)} dB (authority ${lowpassBreath.eventRun.bodyOwnershipAuthority.toFixed(3)}, recovery ${lowpassBreath.eventRun.transientBodyRecoveryDb.toFixed(2)} dB)`,
+    );
+    assert.ok(
+      Math.abs(missingBodyEvidence.eventRun.plannedGainDb - legacyBreathGainDb) <= 0.05,
+      `missing body evidence must fail soft to the legacy plan, got ${missingBodyEvidence.eventRun.plannedGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      Math.abs(
+        bodyOwned.eventRun.peakReducedDb -
+          missingBodyEvidence.eventRun.peakReducedDb,
+      ) <= 0.01,
+      `paired ceiling lift must retain the original peak-owner reduction: ${bodyOwned.eventRun.peakReducedDb.toFixed(2)} vs ${missingBodyEvidence.eventRun.peakReducedDb.toFixed(2)} dB`,
+    );
+
+    const restorations: number[] = [];
+    for (let step = 0; step <= 30; step += 1) {
+      const progress = step / 30;
+      const bodyDb = rawDb - (14 - 13.55 * progress);
+      const fricativeDb = rawDb - (0.5 + 10 * progress);
+      restorations.push(buildPlan(bodyDb, fricativeDb).eventRun.plannedGainDb - legacyBreathGainDb);
+    }
+    assert.ok(restorations[0] <= 0.5, `breath-shaped endpoint changed ${restorations[0].toFixed(2)} dB`);
+    assert.ok(
+      restorations.at(-1)! >= 2.25,
+      `body-owned endpoint restored only ${restorations.at(-1)!.toFixed(2)} dB`,
+    );
+    for (let index = 1; index < restorations.length; index += 1) {
+      assert.ok(
+        restorations[index] >= restorations[index - 1] - 0.05,
+        `body evidence response must be monotone at step ${index}`,
+      );
+      assert.ok(
+        restorations[index] - restorations[index - 1] <= 0.6,
+        `body evidence response must have no hard engagement jump at step ${index}: ${restorations[index - 1].toFixed(2)} -> ${restorations[index].toFixed(2)} dB`,
+      );
+    }
+  });
+});

@@ -274,7 +274,7 @@ const WATCHDOG_BASE_SECONDS = 90;
  */
 const AUTO_LOAD_LOCAL_REVIEW_WEIGHTS = false;
 const WATCHDOG_DURATION_FACTOR = 4;
-const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
+const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled:latency=1";
 const HEAD_PRIME_ENABLED = true;
 const HEAD_PRIME_SECONDS = 1.0;
 const HEAD_PRIME_DURATION_TOLERANCE_SECONDS = 0.05;
@@ -3982,7 +3982,7 @@ const summarizeFailureReason = (error: unknown) => {
     const limit = clamp(-3.6 + strength * 0.7, -3.6, -2.8);
     return `alimiter=limit=${limit.toFixed(
       1
-    )}dB:attack=${attack}:release=${release}:level=disabled`;
+    )}dB:attack=${attack}:release=${release}:level=disabled:latency=1`;
   };
 
   const buildOnsetTamerFilter = (strength: number) => {
@@ -4838,7 +4838,9 @@ const summarizeFailureReason = (error: unknown) => {
       setActiveQueueStage(context.base, "Final app polish", `${context.detail}, static delivery pass`);
       await safeDeleteFile(activeFfmpeg, appPassName);
       appendLog(
-        `[FinalPolish] ${context.base}: source-relative 4 kHz ${
+        `[FinalPolish] ${context.base}: source-relative body tilt ${
+          sourceRelativeTone ? sourceRelativeTone.bodyPreservationTiltDb.toFixed(2) : "0.00"
+        } dB / 4 kHz ${
           sourceRelativeTone ? sourceRelativeTone.fourKhzTrimDb.toFixed(2) : "0.00"
         } dB / 8 kHz ${
           sourceRelativeTone ? sourceRelativeTone.eightKhzTrimDb.toFixed(2) : "0.00"
@@ -5796,7 +5798,7 @@ const summarizeFailureReason = (error: unknown) => {
         "-i",
         inputName,
         "-af",
-        `volume=${safeOffset.toFixed(3)}dB,alimiter=limit=${cfg.TP}dB:level=disabled`,
+        `volume=${safeOffset.toFixed(3)}dB,alimiter=limit=${cfg.TP}dB:level=disabled:latency=1`,
         "-ar",
         "48000",
         "-ac",

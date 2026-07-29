@@ -1,3 +1,36 @@
+# Actor Decrescendo and Cinematic Body Recovery
+
+## Checklist
+
+- [x] Read the Hollywood VO contract, processing guidance, prior planner lessons, exact screenshots, private Ethan/Tony source-result pairs, and current dirty Git state.
+- [x] Freeze focused gain-planner and voicing-policy tests and capture source-relative baseline measurements without uploading audio.
+- [x] Convert the measured cold-onset and intentional-decrescendo defects into failing planner regressions.
+- [x] Implement the smallest continuous, source-adaptive correction inside the existing planner; add no hard quality gate or parallel dynamics/tamer stage.
+- [x] Strengthen cinematic body only where measured source/output tone evidence supports it, while continuously damping boom, room, echo, and stacked EQ risk.
+- [x] Run focused and full verification, then render the exact Ethan and Tony fixtures through the browser-delivered path.
+- [x] Compare exact final WAVs to their sources and prior outputs, complete independent review, and approve the scoped experiment for publication only because the evidence supports it.
+
+## Scope Boundaries
+
+- Preserve intentional dramatic decline and actor emphasis; recover only the portion that becomes unintelligible or that the processing path makes worse.
+- Protect the first consonant without lifting pre-speech room tone or introducing a blind gain hold.
+- Add no hard quality gate, stricter release blocker, compressor, expander, limiter, gate, consonant tamer, ambience, or recursive corrective loop.
+- Keep private WAVs and diagnostic artifacts local. Kimi receives only bounded textual findings, never audio bytes.
+- Preserve every earlier onset, tail, anti-spike, pause-noise, echo, room, timing, and one-input/one-output fix unless exact evidence proves a conflict.
+
+## Exact Final Evidence
+
+- Root cause: two remaining Ethan word-body losses were short, voiced words sharing the existing `transient-breath` class. Its `target - 3.2 dB` macro bias and paired peak ceiling—not final polish or the consonant tamer—owned the loss.
+- The correction keeps the original class and peak ownership. Continuous 180-3000 Hz body power plus periodic voicing can withdraw only existing attenuation, never create positive gain, and raises the transient ceiling by exactly the same recovery amount.
+- Exact browser-delivered Ethan recovery: event E1 improves by `+2.4200 dB` (`-6.710` to `-4.290 dB` source-relative body), and E2 by `+3.0126 dB` (`-9.947` to `-6.935 dB`).
+- The quiet-onset decoded samples are SHA-identical. Intra-event 20 ms body shape is unchanged within `0.00004 dB`; no new millisecond gain shimmer is present.
+- Ethan delivery remains exact at 943.346 seconds / 45,280,608 samples, float32 mono 48 kHz, and `-1.9 dBTP`. Tony contains no transient-body recovery candidates and was rerendered separately through the final browser code path.
+- Final Tony delivery remains exact at 1828.700 seconds / 87,777,600 samples, float32 mono 48 kHz, and `-3.3 dBTP`. It aligns with the prior render at zero samples across active windows; 1 ms speech-frame movement is small and coherent (median `+0.019 dB`, P95 `+0.267 dB`, adjacent-delta P95 `0.112 dB`) rather than new gain flutter.
+- Tony's final tone reconciliation is one static `-0.70 dB` body-preservation shelf with 4/8/top-octave trims all at `0.00 dB`, so the final shared-credit refinement does not stack another high-frequency cut.
+- Genuine HF-heavy and low-passed aperiodic breath controls remain within `0.5 dB` of the legacy plan. Missing body/sample evidence fails soft to the legacy behavior.
+- The final pass adds only source-relative, subtractive body/HF reconciliation. The broad body shelf spends shared correction credit at 4/8/top-octave bands instead of stacking, and every delivery limiter is latency compensated. No compressor, expander, gate, extra limiter, new tamer, or hard quality gate was added.
+- Kimi K3's highest available `xhigh` review supported paired macro/peak authority and fail-soft behavior. Its proposed fixed labeled-corpus prerequisite was rejected in favor of deterministic breath controls plus exact browser render evidence.
+
 # Final Experimental VO Hardening
 
 ## Checklist

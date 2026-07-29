@@ -12,6 +12,10 @@ const chunkedConsonantTamerSource = readFileSync(
   new URL("./chunkedConsonantTamer.ts", import.meta.url),
   "utf8",
 );
+const finalPolishFilterSource = readFileSync(
+  new URL("./finalPolishFilter.ts", import.meta.url),
+  "utf8",
+);
 
 const textBetween = (source: string, startMarker: string, endMarker: string) => {
   const start = source.indexOf(startMarker);
@@ -182,6 +186,28 @@ test("final app polish uses the isolated linear filter instead of rerunning the 
   assert.doesNotMatch(finalPolishBlock, /buildFinalPolishProfile/);
   assert.doesNotMatch(finalPolishBlock, /getActiveAudioReviewAdaptiveDirectives/);
   assert.doesNotMatch(finalPolishBlock, /runMixReady\(/);
+});
+
+test("every delivered limiter path compensates lookahead latency", () => {
+  assert.match(
+    voLevelerSource,
+    /const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled:latency=1"/,
+    "the primary mix limiter must preserve source timing",
+  );
+  assert.match(
+    finalPolishFilterSource,
+    /FINAL_POLISH_LIMITER_FILTER\s*=\s*"alimiter=limit=-2dB:level=disabled:latency=1"/,
+    "the final-polish limiter must preserve source timing",
+  );
+  const staticFallbackBlock = sourceBetween(
+    "const runStaticLoudnessFallback = async",
+    "const alignBatchMixReadyOutputs = async",
+  );
+  assert.match(
+    staticFallbackBlock,
+    /alimiter=limit=\$\{cfg\.TP\}dB:level=disabled:latency=1/,
+    "the static loudness fallback limiter must preserve source timing",
+  );
 });
 
 test("planner delivery uses the existing speech mask and the selected pre-polish measurement", () => {

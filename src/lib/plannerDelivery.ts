@@ -6,6 +6,7 @@ export const FINAL_TONE_FOUR_KHZ_MAX_TRIM_DB = 0.7;
 export const FINAL_TONE_EIGHT_KHZ_MAX_TRIM_DB = 0.9;
 export const FINAL_TONE_COMBINED_MAX_TRIM_DB = 1.4;
 export const FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB = 2;
+export const FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB = 0.75;
 const FINAL_TONE_TOP_OCTAVE_KNEE_DB = 1.65;
 export const PLANNER_DELIVERY_SOURCE_RELATIVE_NOISE_BUDGET_DB = 0.85;
 export const PLANNER_DELIVERY_CLEAN_FLOOR_DB = -60;
@@ -13,6 +14,7 @@ export const PLANNER_DELIVERY_LIMITER_CEILING_DB = -2;
 export const PLANNER_DELIVERY_ALLOWED_LIMITER_DRIVE_DB = 1.5;
 
 export type SourceRelativeFinalTone = Readonly<{
+  bodyPreservationTiltDb: number;
   fourKhzExcessDb: number;
   eightKhzExcessDb: number;
   topOctaveExcessDb: number;
@@ -581,10 +583,21 @@ export const resolveEvidenceAwarePlannerDeliveryMakeupDb = ({
 const meanBodyDb = (spectrumDb: readonly number[]) =>
   (spectrumDb[2] + spectrumDb[3] + spectrumDb[4] + spectrumDb[5]) / 4;
 
+const meanLowBodyDb = (spectrumDb: readonly number[]) =>
+  (spectrumDb[1] + spectrumDb[2] + spectrumDb[3]) / 3;
+
+const meanUpperBodyDb = (spectrumDb: readonly number[]) =>
+  (spectrumDb[4] + spectrumDb[5]) / 2;
+
 const meanNativeBodyDb = (spectrumDb: readonly number[]) =>
   (spectrumDb[0] + spectrumDb[1] + spectrumDb[2] + spectrumDb[3]) / 4;
 
 const normalizedZero = (value: number) => (Math.abs(value) < 1e-12 ? 0 : value);
+
+const smoothUnitRamp = (value: number, start: number, full: number) => {
+  const normalized = clamp((value - start) / Math.max(full - start, Number.EPSILON), 0, 1);
+  return normalized * normalized * (3 - 2 * normalized);
+};
 
 const hasFiniteNativeFinalToneDomain = (
   spectrumDb: readonly number[] | null | undefined,
@@ -596,11 +609,12 @@ const hasFiniteNativeFinalToneDomain = (
   );
 
 /**
- * Reconcile only high-frequency tone that the app added relative to source.
+ * Reconcile only tone that the app moved away from the measured source.
  *
- * The response starts continuously at zero, never brightens, saturates
- * smoothly, and shares a small combined budget across 4 and 8 kHz. Natural
- * actor brightness therefore remains untouched.
+ * The response starts continuously at zero and never adds energy. A body-rich
+ * source whose low body was reduced relative to its upper body receives one
+ * subtle high-side tilt; body-light or already-preserved sources remain exact
+ * no-ops. The existing 4/8 kHz lanes likewise only remove app-added excess.
  */
 export const resolveSourceRelativeFinalTone = (
   sourceSpeechBandSpectrumDb: readonly number[] | null | undefined,
@@ -621,6 +635,23 @@ export const resolveSourceRelativeFinalTone = (
 
   const sourceBodyDb = meanBodyDb(sourceSpeechBandSpectrumDb);
   const renderedBodyDb = meanBodyDb(renderedSpeechBandSpectrumDb);
+  const sourceBodyRichnessDb =
+    meanLowBodyDb(sourceSpeechBandSpectrumDb) -
+    meanUpperBodyDb(sourceSpeechBandSpectrumDb);
+  const renderedBodyRichnessDb =
+    meanLowBodyDb(renderedSpeechBandSpectrumDb) -
+    meanUpperBodyDb(renderedSpeechBandSpectrumDb);
+  const processingAddedBodyLossDb = Math.max(
+    0,
+    sourceBodyRichnessDb - renderedBodyRichnessDb,
+  );
+  const bodyRichnessAuthority = smoothUnitRamp(sourceBodyRichnessDb, 0, 6);
+  const bodyPreservationTiltDb =
+    -FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB *
+    Math.tanh(
+      (0.5 * processingAddedBodyLossDb * bodyRichnessAuthority) /
+        FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB,
+    );
   const fourKhzExcessDb = Math.max(
     0,
     renderedSpeechBandSpectrumDb[6] -
@@ -640,7 +671,20 @@ export const resolveSourceRelativeFinalTone = (
   const rawEightKhzTrimDb =
     FINAL_TONE_EIGHT_KHZ_MAX_TRIM_DB *
     Math.tanh((0.6 * eightKhzExcessDb) / FINAL_TONE_EIGHT_KHZ_MAX_TRIM_DB);
-  const combinedTrimDb = rawFourKhzTrimDb + rawEightKhzTrimDb;
+  // The broad body shelf already supplies the same subtractive correction at
+  // each higher band. Spend it as shared credit instead of stacking every
+  // narrower lane on top; at zero body tilt this is exactly the legacy path.
+  const bodyCorrectionCreditDb = Math.abs(bodyPreservationTiltDb);
+  const bodyCreditedFourKhzTrimDb = Math.max(
+    0,
+    rawFourKhzTrimDb - bodyCorrectionCreditDb,
+  );
+  const bodyCreditedEightKhzTrimDb = Math.max(
+    0,
+    rawEightKhzTrimDb - bodyCorrectionCreditDb,
+  );
+  const combinedTrimDb =
+    bodyCreditedFourKhzTrimDb + bodyCreditedEightKhzTrimDb;
   const budgetScale =
     combinedTrimDb > 0
       ? Math.min(1, FINAL_TONE_COMBINED_MAX_TRIM_DB / combinedTrimDb)
@@ -664,17 +708,22 @@ export const resolveSourceRelativeFinalTone = (
     // measured 2.8 dB production excess receives ~1.9 dB of static correction.
     const ratio = topOctaveExcessDb / FINAL_TONE_TOP_OCTAVE_KNEE_DB;
     const ratioPower = ratio ** 6;
-    topOctaveTrimDb =
-      -FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB *
+    const rawTopOctaveTrimDb =
+      FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB *
       (ratioPower / (1 + ratioPower));
+    topOctaveTrimDb = -Math.max(
+      0,
+      rawTopOctaveTrimDb - bodyCorrectionCreditDb,
+    );
   }
 
   return {
+    bodyPreservationTiltDb: normalizedZero(bodyPreservationTiltDb),
     fourKhzExcessDb: normalizedZero(fourKhzExcessDb),
     eightKhzExcessDb: normalizedZero(eightKhzExcessDb),
     topOctaveExcessDb: normalizedZero(topOctaveExcessDb),
-    fourKhzTrimDb: normalizedZero(-rawFourKhzTrimDb * budgetScale),
-    eightKhzTrimDb: normalizedZero(-rawEightKhzTrimDb * budgetScale),
+    fourKhzTrimDb: normalizedZero(-bodyCreditedFourKhzTrimDb * budgetScale),
+    eightKhzTrimDb: normalizedZero(-bodyCreditedEightKhzTrimDb * budgetScale),
     topOctaveTrimDb:
       topOctaveExcessDb > 0
         ? topOctaveTrimDb

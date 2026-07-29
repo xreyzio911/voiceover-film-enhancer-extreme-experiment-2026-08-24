@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB,
+  FINAL_TONE_EIGHT_KHZ_MAX_TRIM_DB,
+  FINAL_TONE_FOUR_KHZ_MAX_TRIM_DB,
+  FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB,
   computeSpeechKWeightedEnergyDb,
   measurePlannerDeliverySafetyEvidence,
   resolveBlendDeliverySafetyEvidence,
@@ -620,6 +624,7 @@ test("source-relative final tone is level-invariant and never brightens", () => 
   const identical = resolveSourceRelativeFinalTone(source, levelShifted);
 
   assert.deepEqual(identical, {
+    bodyPreservationTiltDb: 0,
     fourKhzExcessDb: 0,
     eightKhzExcessDb: 0,
     topOctaveExcessDb: 0,
@@ -632,6 +637,102 @@ test("source-relative final tone is level-invariant and never brightens", () => 
   darker[6] -= 3;
   darker[7] -= 4;
   assert.deepEqual(resolveSourceRelativeFinalTone(source, darker), identical);
+});
+
+test("source-relative final tone preserves body-rich source weight with subtractive-only tilt", () => {
+  // Bands: 60, 120, 250, 500, 1000, 2000, 4000, 8000 Hz.
+  const bodyRichSource = [-44, -27, -24, -25, -32, -34, -40, -45];
+  const preservedTransfer = bodyRichSource.map((value) => value + 6);
+  const lowBodyLost = [...preservedTransfer];
+  lowBodyLost[1] -= 2;
+  lowBodyLost[2] -= 2;
+  lowBodyLost[3] -= 2;
+
+  const lostBodyDecision = resolveSourceRelativeFinalTone(
+    bodyRichSource,
+    lowBodyLost,
+  );
+  assert.ok(lostBodyDecision);
+  assert.ok(
+    (lostBodyDecision?.bodyPreservationTiltDb ?? 0) < 0,
+    "processing-added low-body loss on a body-rich actor should receive a subtractive high-side tilt",
+  );
+  assert.ok(
+    (lostBodyDecision?.bodyPreservationTiltDb ?? -Infinity) >= -0.75,
+    "body preservation must stay inside subtle subtractive authority",
+  );
+
+  assert.equal(
+    resolveSourceRelativeFinalTone(
+      bodyRichSource,
+      preservedTransfer,
+    )?.bodyPreservationTiltDb,
+    0,
+    "a level-shifted but otherwise preserved body transfer must remain untouched",
+  );
+
+  const bodyLightSource = [-45, -39, -36, -34, -28, -27, -32, -38];
+  const bodyLightRenderWithLowLoss = bodyLightSource.map(
+    (value, index) => value + 6 - (index >= 1 && index <= 3 ? 2 : 0),
+  );
+  assert.equal(
+    resolveSourceRelativeFinalTone(
+      bodyLightSource,
+      bodyLightRenderWithLowLoss,
+    )?.bodyPreservationTiltDb,
+    0,
+    "body-light source tone must not be made generically darker",
+  );
+});
+
+test("body preservation shares correction authority with every higher-frequency trim", () => {
+  const source = [-46, -24, -22, -23, -31, -34, -42, -48];
+  const rendered = source.map((value) => value + 6);
+  rendered[1] -= 8;
+  rendered[2] -= 8;
+  rendered[3] -= 8;
+  rendered[6] += 12;
+  rendered[7] += 14;
+  const nativeSource = [-24, -22, -23, -31, -34, -42, -52];
+  const nativeRendered = nativeSource.map((value) => value + 6);
+  nativeRendered[6] += 16;
+
+  const decision = resolveSourceRelativeFinalTone(
+    source,
+    rendered,
+    nativeSource,
+    nativeRendered,
+  );
+  assert.ok(decision);
+  const bodyTiltDb = Math.abs(decision?.bodyPreservationTiltDb ?? 0);
+  assert.ok(bodyTiltDb > 0.7, "fixture must spend most of the body-preservation authority");
+  assert.ok(
+    bodyTiltDb + Math.abs(decision?.fourKhzTrimDb ?? 0) <=
+      Math.max(
+        FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB,
+        FINAL_TONE_FOUR_KHZ_MAX_TRIM_DB,
+      ) +
+        1e-9,
+    "the broad body shelf must replace, not stack on top of, the 4 kHz correction",
+  );
+  assert.ok(
+    bodyTiltDb + Math.abs(decision?.eightKhzTrimDb ?? 0) <=
+      Math.max(
+        FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB,
+        FINAL_TONE_EIGHT_KHZ_MAX_TRIM_DB,
+      ) +
+        1e-9,
+    "the broad body shelf must replace, not stack on top of, the 8 kHz correction",
+  );
+  assert.ok(
+    bodyTiltDb + Math.abs(decision?.topOctaveTrimDb ?? 0) <=
+      Math.max(
+        FINAL_TONE_BODY_PRESERVATION_MAX_TILT_DB,
+        FINAL_TONE_TOP_OCTAVE_MAX_TRIM_DB,
+      ) +
+        1e-9,
+    "the broad body shelf must replace, not stack on top of, the top-octave correction",
+  );
 });
 
 test("source-relative final tone responds continuously and stays subtly bounded", () => {
