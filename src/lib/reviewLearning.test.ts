@@ -5,6 +5,7 @@ import {
   REVIEW_BUNDLE_SCHEMA_VERSION,
   autoReviewBundle,
   buildReviewMetricDelta,
+  claimCorrectivePassForFile,
   estimateAlignmentMetrics,
   fitLearnedReviewWeights,
   formatCandidateAcousticReviewValue,
@@ -13,7 +14,6 @@ import {
   parseLearnedReviewWeights,
   parseReviewDecisionJsonl,
   resolveAutomatedReviewDraftVerdict,
-  resolveCorrectiveMaxFilesPerBatch,
   scoreCandidateWithLearnedWeights,
   serializeReviewDecisionJsonl,
   shouldAttemptCorrectivePassForAssessment,
@@ -531,12 +531,41 @@ test("shouldAttemptCorrectivePassForAssessment ignores measurement-availability 
   );
 });
 
-test("resolveCorrectiveMaxFilesPerBatch keeps a two-file floor and forty percent ceiling", () => {
-  assert.equal(resolveCorrectiveMaxFilesPerBatch(1), 2);
-  assert.equal(resolveCorrectiveMaxFilesPerBatch(4), 2);
-  assert.equal(resolveCorrectiveMaxFilesPerBatch(5), 2);
-  assert.equal(resolveCorrectiveMaxFilesPerBatch(6), 3);
-  assert.equal(resolveCorrectiveMaxFilesPerBatch(20), 8);
+test("claimCorrectivePassForFile grants every unique file once without order-dependent starvation", () => {
+  const runClaims = (fileKeys: readonly string[]) => {
+    let attemptedFiles: ReadonlySet<string> = new Set();
+    let claimedFiles: readonly string[] = [];
+
+    for (const fileKey of fileKeys) {
+      const previousAttemptedFiles = attemptedFiles;
+      const previousFileKeys = [...previousAttemptedFiles];
+      const claim = claimCorrectivePassForFile(previousAttemptedFiles, fileKey);
+
+      assert.notStrictEqual(
+        claim.attemptedFiles,
+        previousAttemptedFiles,
+        "ownership state must be replaced instead of mutating the previous Set",
+      );
+      assert.deepEqual(
+        [...previousAttemptedFiles],
+        previousFileKeys,
+        "claiming must leave the caller's previous ownership snapshot unchanged",
+      );
+      attemptedFiles = claim.attemptedFiles;
+      claimedFiles = claim.claimed ? [...claimedFiles, fileKey] : claimedFiles;
+    }
+
+    return claimedFiles;
+  };
+
+  assert.deepEqual(
+    runClaims(["early", "early", "middle", "late", "late"]),
+    ["early", "middle", "late"],
+  );
+  assert.deepEqual(
+    runClaims(["late", "middle", "early", "middle", "early"]),
+    ["late", "middle", "early"],
+  );
 });
 
 test("review decision JSONL round-trips", () => {

@@ -292,9 +292,15 @@ export const shouldAttemptCorrectivePassForAssessment = (
   );
 };
 
-export const resolveCorrectiveMaxFilesPerBatch = (fileCount: number) => {
-  const safeFileCount = Number.isFinite(fileCount) ? Math.max(0, fileCount) : 0;
-  return Math.max(2, Math.ceil(safeFileCount * 0.4));
+export const claimCorrectivePassForFile = (
+  attemptedFiles: ReadonlySet<string>,
+  fileKey: string,
+) => {
+  const claimed = !attemptedFiles.has(fileKey);
+  return {
+    claimed,
+    attemptedFiles: new Set(claimed ? [...attemptedFiles, fileKey] : attemptedFiles),
+  };
 };
 
 type MetricSource = Partial<ReviewMetricSnapshot> | null | undefined;

@@ -11,6 +11,7 @@ import {
   limitEmbeddedPerformancePositiveGainAuthority,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
+  recoverRecurrentBodySpeechValleys,
   relaxNarrowBodySpeechGainValleys,
   relaxNarrowConsonantOwnerCaps,
   resolvePlannerCalibration,
@@ -1989,6 +1990,116 @@ describe("narrow body-speech planner-gain valley relaxation", () => {
         `only the extra 1 dB processing dip should be relaxed, got ${liftDb.toFixed(6)} dB`,
       );
     }
+  });
+});
+
+describe("recurrent voiced-body continuity", () => {
+  it("fails open on mismatched, non-finite, or invalid evidence without mutating inputs", () => {
+    const gain = Float32Array.from(
+      { length: 300 },
+      (_, frame) => Math.sin(frame / 19) * 1.25,
+    );
+    const source = new Float32Array(300).fill(-24);
+    const body = new Float32Array(300).fill(-25);
+    const runs = [{ startFrame: 20, endFrame: 280 }];
+    const gainSnapshot = new Float32Array(gain);
+    const sourceSnapshot = new Float32Array(source);
+    const bodySnapshot = new Float32Array(body);
+    const runSnapshot = runs.map((run) => ({ ...run }));
+
+    const mismatched = recoverRecurrentBodySpeechValleys(
+      gain,
+      source,
+      body.subarray(0, body.length - 1),
+      runs,
+      14,
+      10,
+    );
+    const invalidDuration = recoverRecurrentBodySpeechValleys(
+      gain,
+      source,
+      body,
+      runs,
+      14,
+      0,
+    );
+    const nonFiniteSource = new Float32Array(source);
+    const nonFiniteBody = new Float32Array(body);
+    for (let frame = 20; frame < 280; frame += 1) {
+      if ((frame - 20) % 24 < 8) {
+        nonFiniteSource[frame] -= 10;
+        nonFiniteBody[frame] -= 10;
+      }
+    }
+    nonFiniteBody[150] = Number.NaN;
+    const nonFiniteSourceSnapshot = new Float32Array(nonFiniteSource);
+    const nonFiniteBodySnapshot = new Float32Array(nonFiniteBody);
+    const nonFinite = recoverRecurrentBodySpeechValleys(
+      gain,
+      nonFiniteSource,
+      nonFiniteBody,
+      runs,
+      14,
+      10,
+    );
+
+    for (const result of [mismatched, invalidDuration, nonFinite]) {
+      assert.notEqual(result, gain);
+      assert.deepEqual(result, gainSnapshot);
+      assert.ok([...result].every(Number.isFinite));
+    }
+    assert.deepEqual(gain, gainSnapshot);
+    assert.deepEqual(source, sourceSnapshot);
+    assert.deepEqual(body, bodySnapshot);
+    assert.deepEqual(nonFiniteSource, nonFiniteSourceSnapshot);
+    assert.deepEqual(nonFiniteBody, nonFiniteBodySnapshot);
+    assert.deepEqual(runs, runSnapshot);
+  });
+
+  it("does not turn one native upward event or modest voiced vibrato into body fill", () => {
+    const frameCount = 400;
+    const flatGain = new Float32Array(frameCount);
+    const nativeEvent = new Float32Array(frameCount).fill(-24);
+    nativeEvent.fill(-17, 198, 202);
+    const nativeResult = recoverRecurrentBodySpeechValleys(
+      flatGain,
+      nativeEvent,
+      nativeEvent,
+      [{ startFrame: 50, endFrame: 350 }],
+      14,
+      10,
+    );
+    assert.ok(
+      Math.max(...nativeResult.map(Math.abs)) <= 0.05,
+      "a native upward event must not create gain in its surrounding body",
+    );
+
+    const vibrato = Float32Array.from(
+      { length: frameCount },
+      (_, frame) => -24 + 1.5 * Math.sin(2 * Math.PI * 5.5 * frame * 0.01),
+    );
+    const vibratoResult = recoverRecurrentBodySpeechValleys(
+      flatGain,
+      vibrato,
+      vibrato,
+      [{ startFrame: 50, endFrame: 350 }],
+      14,
+      10,
+    );
+    const sourceSlice = [...vibrato.slice(70, 330)];
+    const outputSlice = sourceSlice.map(
+      (value, index) => value + vibratoResult[index + 70],
+    );
+    const sourceDepthDb = Math.max(...sourceSlice) - Math.min(...sourceSlice);
+    const outputDepthDb = Math.max(...outputSlice) - Math.min(...outputSlice);
+    assert.ok(
+      Math.max(...vibratoResult.map(Math.abs)) <= 0.8,
+      "modest voiced vibrato may receive only a subtle continuity touch",
+    );
+    assert.ok(
+      outputDepthDb >= sourceDepthDb * 0.6,
+      `vibrato depth must remain expressive, source ${sourceDepthDb.toFixed(2)} vs output ${outputDepthDb.toFixed(2)} dB`,
+    );
   });
 });
 
@@ -4697,7 +4808,7 @@ describe("actor-decay regressions", () => {
     );
     assert.ok(
       projectedBodyDb >= prePeakBodyPlanDb - 1,
-      `body-dominant short event must finish within 1 dB of its own pre-peak plan, got ${projectedBodyDb.toFixed(2)} vs ${prePeakBodyPlanDb.toFixed(2)} dB`,
+      `body-dominant short event must finish within 1 dB of its own pre-peak plan, got ${projectedBodyDb.toFixed(2)} vs ${prePeakBodyPlanDb.toFixed(2)} dB (retained advantage ${eventRun.transientRetainedAdvantageDb.toFixed(2)} dB)`,
     );
 
     const rendered = applyGainCurveToSamples(
@@ -4913,5 +5024,675 @@ describe("actor-decay regressions", () => {
         `body evidence response must have no hard engagement jump at step ${index}: ${restorations[index - 1].toFixed(2)} -> ${restorations[index].toFixed(2)} dB`,
       );
     }
+  });
+
+  it("cinematic stability: symmetrically softens extreme rises and falls without flattening ordinary performance trends", () => {
+    const planTrend = (startDb: number, endDb: number) => {
+      const totalFrames = 260;
+      const frameDb = new Array<number>(totalFrames).fill(-82);
+      const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechRuns = [{ startFrame: 30, endFrame: 230 }];
+      for (let frame = 30; frame < 230; frame += 1) {
+        const progress = (frame - 30) / 199;
+        const levelDb = startDb + (endDb - startDb) * progress;
+        frameDb[frame] = levelDb;
+        loudnessFrameDb[frame] = levelDb;
+        speechBodyFrameDb[frame] = levelDb;
+      }
+
+      const frameSnapshot = [...frameDb];
+      const loudnessSnapshot = [...loudnessFrameDb];
+      const bodySnapshot = [...speechBodyFrameDb];
+      const runSnapshot = speechRuns.map((run) => ({ ...run }));
+      const plan = planGainCurve({
+        frameDb,
+        loudnessFrameDb,
+        speechBodyFrameDb,
+        speechRuns,
+        noiseFloorDb: -82,
+        speechThresholdDb: -60,
+        pauseNoiseRisk: 0.1,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.1,
+      });
+
+      assert.deepEqual(frameDb, frameSnapshot);
+      assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+      assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+      assert.deepEqual(speechRuns, runSnapshot);
+
+      const headFrame = 50;
+      const tailFrame = 210;
+      const sourceDeltaDb = frameDb[tailFrame] - frameDb[headFrame];
+      const outputHeadDb = frameDb[headFrame] + gainDbAtFrame(plan.gainCurve, headFrame);
+      const outputTailDb = frameDb[tailFrame] + gainDbAtFrame(plan.gainCurve, tailFrame);
+      const outputDeltaDb = outputTailDb - outputHeadDb;
+      let largestGainStepDb = 0;
+      for (let frame = headFrame + 1; frame <= tailFrame; frame += 1) {
+        largestGainStepDb = Math.max(
+          largestGainStepDb,
+          Math.abs(
+            gainDbAtFrame(plan.gainCurve, frame) -
+              gainDbAtFrame(plan.gainCurve, frame - 1),
+          ),
+        );
+      }
+      return {
+        sourceDeltaDb,
+        outputDeltaDb,
+        recoveryDb: Math.abs(sourceDeltaDb) - Math.abs(outputDeltaDb),
+        largestGainStepDb,
+      };
+    };
+
+    const extremeRise = planTrend(-44, -16);
+    const extremeFall = planTrend(-16, -44);
+    const ordinaryRise = planTrend(-31, -26);
+    const ordinaryFall = planTrend(-26, -31);
+    const trendLedger =
+      `rise recovery ${extremeRise.recoveryDb.toFixed(2)}, fall recovery ${extremeFall.recoveryDb.toFixed(2)}, ` +
+      `rise slew ${extremeRise.largestGainStepDb.toFixed(3)}, fall slew ${extremeFall.largestGainStepDb.toFixed(3)}, ` +
+      `ordinary rise recovery ${ordinaryRise.recoveryDb.toFixed(2)}, ordinary fall recovery ${ordinaryFall.recoveryDb.toFixed(2)} dB`;
+    for (const [direction, result] of [
+      ["rise", extremeRise],
+      ["fall", extremeFall],
+    ] as const) {
+      assert.ok(
+        result.recoveryDb >= 4.5 && result.recoveryDb <= 7,
+        `extreme ${direction} needs bounded partial correction, got ${result.recoveryDb.toFixed(2)} dB (${trendLedger})`,
+      );
+      assert.ok(
+        Math.abs(result.outputDeltaDb) >= 16,
+        `extreme ${direction} must remain an expressive trend, got ${result.outputDeltaDb.toFixed(2)} dB`,
+      );
+      assert.equal(
+        Math.sign(result.outputDeltaDb),
+        Math.sign(result.sourceDeltaDb),
+        `extreme ${direction} must retain its source direction`,
+      );
+      assert.ok(
+        result.largestGainStepDb <= 0.3,
+        `extreme ${direction} correction must slew smoothly, largest 10 ms step ${result.largestGainStepDb.toFixed(3)} dB`,
+      );
+    }
+    assert.ok(
+      Math.abs(extremeRise.recoveryDb - extremeFall.recoveryDb) <= 1.5,
+      `opposite extreme trends need comparable support, rise ${extremeRise.recoveryDb.toFixed(2)} vs fall ${extremeFall.recoveryDb.toFixed(2)} dB`,
+    );
+
+    for (const [direction, result] of [
+      ["rise", ordinaryRise],
+      ["fall", ordinaryFall],
+    ] as const) {
+      assert.ok(
+        result.recoveryDb <= 2,
+        `ordinary ${direction} should stay essentially intact, planner removed ${result.recoveryDb.toFixed(2)} dB`,
+      );
+      assert.ok(
+        Math.abs(result.outputDeltaDb) >= 2,
+        `ordinary ${direction} must remain audible, got ${result.outputDeltaDb.toFixed(2)} dB`,
+      );
+      assert.equal(
+        Math.sign(result.outputDeltaDb),
+        Math.sign(result.sourceDeltaDb),
+        `ordinary ${direction} must retain its source direction`,
+      );
+    }
+  });
+
+  it("cinematic stability: does not spend phrase-wide trend recovery on a localized terminal fade", () => {
+    const totalFrames = 260;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [{ startFrame: 30, endFrame: 230 }];
+    for (let frame = 30; frame < 230; frame += 1) {
+      const progress = (frame - 30) / 199;
+      const terminalProgress = Math.max(0, (progress - 0.75) / 0.25);
+      const levelDb = -20 - 28 * terminalProgress;
+      frameDb[frame] = levelDb;
+      loudnessFrameDb[frame] = levelDb;
+      speechBodyFrameDb[frame] = levelDb;
+    }
+
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      noiseFloorDb: -82,
+      speechThresholdDb: -70,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -60,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.1,
+      levelingConsistency: 0,
+    });
+
+    const headFrame = 50;
+    const tailFrame = 210;
+    const sourceFallDb = frameDb[headFrame] - frameDb[tailFrame];
+    const outputHeadDb = frameDb[headFrame] + gainDbAtFrame(plan.gainCurve, headFrame);
+    const outputTailDb = frameDb[tailFrame] + gainDbAtFrame(plan.gainCurve, tailFrame);
+    const recoveredDb = sourceFallDb - (outputHeadDb - outputTailDb);
+
+    assert.ok(
+      recoveredDb <= 1.25,
+      `a decay confined to the final quarter is an ending, not a sustained trend; recovered ${recoveredDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      outputHeadDb - outputTailDb >= sourceFallDb - 1.25,
+      `the localized terminal fade must remain source-shaped, got ${(outputHeadDb - outputTailDb).toFixed(2)} of ${sourceFallDb.toFixed(2)} dB`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+  });
+
+  it("cinematic stability: fills recurrent 80 ms body micro-sags while preserving a sustained quiet passage", () => {
+    const buildPlan = (mode: "recurrent-sags" | "intentional-passages") => {
+      const totalFrames = 400;
+      const frameDb = new Array<number>(totalFrames).fill(-82);
+      const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechRuns = [{ startFrame: 50, endFrame: 350 }];
+      for (let frame = 50; frame < 350; frame += 1) {
+        let levelDb = -26;
+        if (mode === "recurrent-sags" && (frame - 50) % 24 < 8) levelDb = -36;
+        if (mode === "intentional-passages" && frame >= 150 && frame < 190) levelDb = -32;
+        if (frame >= 250 && frame < 290) levelDb = -14;
+        frameDb[frame] = levelDb;
+        loudnessFrameDb[frame] = levelDb;
+        speechBodyFrameDb[frame] = levelDb;
+      }
+
+      const frameSnapshot = [...frameDb];
+      const loudnessSnapshot = [...loudnessFrameDb];
+      const bodySnapshot = [...speechBodyFrameDb];
+      const runSnapshot = speechRuns.map((run) => ({ ...run }));
+      const plan = planGainCurve({
+        frameDb,
+        loudnessFrameDb,
+        speechBodyFrameDb,
+        speechRuns,
+        noiseFloorDb: -82,
+        speechThresholdDb: -60,
+        pauseNoiseRisk: 0.1,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.8,
+      });
+
+      assert.deepEqual(frameDb, frameSnapshot);
+      assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+      assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+      assert.deepEqual(speechRuns, runSnapshot);
+      return { frameDb, plan };
+    };
+    const percentile = (values: readonly number[], proportion: number) => {
+      const sorted = [...values].sort((a, b) => a - b);
+      const index = Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.floor(proportion * (sorted.length - 1))),
+      );
+      return sorted[index];
+    };
+    const levelsForFrames = (
+      frameDb: readonly number[],
+      curve: Float32Array,
+      frames: readonly number[],
+    ) => frames.map((frame) => frameDb[frame] + gainDbAtFrame(curve, frame));
+
+    const recurrent = buildPlan("recurrent-sags");
+    const recurrentFrames = Array.from({ length: 300 }, (_, index) => 50 + index);
+    const sourceLevels = recurrentFrames.map((frame) => recurrent.frameDb[frame]);
+    const outputLevels = levelsForFrames(
+      recurrent.frameDb,
+      recurrent.plan.gainCurve,
+      recurrentFrames,
+    );
+    const sourceDeficitDb = percentile(sourceLevels, 0.5) - percentile(sourceLevels, 0.2);
+    const outputDeficitDb = percentile(outputLevels, 0.5) - percentile(outputLevels, 0.2);
+    assert.ok(
+      sourceDeficitDb >= 9.5,
+      `fixture needs recurrent source-body holes near 10 dB, got ${sourceDeficitDb.toFixed(2)} dB`,
+    );
+    const sourceExpressiveContrastDb =
+      percentile(sourceLevels, 0.9) - percentile(sourceLevels, 0.5);
+    const outputExpressiveContrastDb =
+      percentile(outputLevels, 0.9) - percentile(outputLevels, 0.5);
+    let largestGainStepDb = 0;
+    // Measure the recurrent support itself. The source-owned +12 dB event at
+    // frame 250 deliberately needs a faster gain-authority handoff and must
+    // not be forced to borrow the quiet bed's positive gain.
+    for (let frame = 60; frame < 230; frame += 1) {
+      largestGainStepDb = Math.max(
+        largestGainStepDb,
+        Math.abs(
+          gainDbAtFrame(recurrent.plan.gainCurve, frame) -
+            gainDbAtFrame(recurrent.plan.gainCurve, frame - 1),
+        ),
+      );
+    }
+    const control = buildPlan("intentional-passages");
+    const sourceQuietContrastDb = control.frameDb[120] - control.frameDb[170];
+    const outputQuietContrastDb =
+      control.frameDb[120] + gainDbAtFrame(control.plan.gainCurve, 120) -
+      (control.frameDb[170] + gainDbAtFrame(control.plan.gainCurve, 170));
+    const stabilityLedger =
+      `source deficit ${sourceDeficitDb.toFixed(4)}, output deficit ${outputDeficitDb.toFixed(4)}, ` +
+      `source expression ${sourceExpressiveContrastDb.toFixed(2)}, output expression ${outputExpressiveContrastDb.toFixed(2)}, ` +
+      `slew ${largestGainStepDb.toFixed(3)}, quiet control ${outputQuietContrastDb.toFixed(2)} dB`;
+    // With a 16-frame clean gap, the strict 0.3 dB/frame two-sided slew can
+    // supply at most 2.4 dB of relative fill without creating a new gain step.
+    assert.ok(
+      outputDeficitDb >= 4.5 && outputDeficitDb <= 7.65,
+      `recurrent 80 ms body holes need bounded fill without hard flattening (${stabilityLedger})`,
+    );
+    assert.ok(
+      outputExpressiveContrastDb >= 9,
+      `the intentional expressive passage must remain clearly dominant (${stabilityLedger})`,
+    );
+    assert.ok(
+      sourceExpressiveContrastDb - outputExpressiveContrastDb <= 3,
+      `planner may withdraw at most 3 dB of expressive contrast (${stabilityLedger})`,
+    );
+    assert.ok(
+      largestGainStepDb <= 0.3,
+      `micro-sag support must remain a smooth ride (${stabilityLedger})`,
+    );
+    assert.ok(
+      outputQuietContrastDb >= 4.5,
+      `intentional 400 ms quiet passage must stay below ordinary body, retained drop ${outputQuietContrastDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      Math.abs(outputQuietContrastDb - sourceQuietContrastDb) <= 1.5,
+      `intentional quiet contrast may change by at most 1.5 dB, source ${sourceQuietContrastDb.toFixed(2)} vs output ${outputQuietContrastDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("cinematic stability: keeps a periodic voiced vocalization prominent, peak-safe, and isolated from dialogue", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 500;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const fricativeFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [
+      { startFrame: 20, endFrame: 100 },
+      { startFrame: 130, endFrame: 210 },
+      { startFrame: 240, endFrame: 320 },
+      { startFrame: 380, endFrame: 425 },
+    ];
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    const paintVoicedFrame = (frame: number, rmsDb: number, frequencyHz: number) => {
+      const amplitude = dbToLin(rmsDb) * Math.SQRT2;
+      for (let offset = 0; offset < samplesPerFrame; offset += 1) {
+        const sampleIndex = frame * samplesPerFrame + offset;
+        samples[sampleIndex] =
+          Math.sin((2 * Math.PI * frequencyHz * sampleIndex) / sampleRate) * amplitude;
+      }
+    };
+
+    for (const run of speechRuns.slice(0, 3)) {
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+        frameDb[frame] = -22.3;
+        loudnessFrameDb[frame] = -22.3;
+        speechBodyFrameDb[frame] = -23.3;
+        fricativeFrameDb[frame] = -34.3;
+        paintVoicedFrame(frame, -22.3, 260);
+      }
+    }
+    for (let frame = 380; frame < 425; frame += 1) {
+      frameDb[frame] = -18.5;
+      loudnessFrameDb[frame] = -18.5;
+      speechBodyFrameDb[frame] = -19.5;
+      fricativeFrameDb[frame] = -30.5;
+      paintVoicedFrame(frame, -18.5, 300);
+      if ((frame - 380) % 3 === 0) samples[frame * samplesPerFrame + 80] = dbToLin(-2.5);
+    }
+
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const fricativeSnapshot = [...fricativeFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const sampleSnapshot = new Float32Array(samples);
+    const peakCeilingDb = -3;
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+      speechRuns,
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      samples,
+      sampleRate,
+      peakCeilingDb,
+      instabilityHint: 0.7,
+    });
+
+    const eventRun = plan.runs[3];
+    assert.equal(eventRun.runClass, "transient-breath");
+    const dialogueOutputDb = frameDb[60] + gainDbAtFrame(plan.gainCurve, 60);
+    const eventOutputDb = frameDb[400] + gainDbAtFrame(plan.gainCurve, 400);
+    const eventAdvantageDb = eventOutputDb - dialogueOutputDb;
+    const rendered = applyGainCurveToSamples(
+      samples,
+      plan.gainCurve,
+      sampleRate,
+      1,
+      frameMs,
+    );
+    let renderedEventPeak = 0;
+    for (let sample = 380 * samplesPerFrame; sample < 425 * samplesPerFrame; sample += 1) {
+      renderedEventPeak = Math.max(renderedEventPeak, Math.abs(rendered[sample]));
+    }
+    const renderedEventPeakDb = 20 * Math.log10(renderedEventPeak + 1e-9);
+    const dialogueGainsDb = [60, 170, 280].map((frame) =>
+      gainDbAtFrame(plan.gainCurve, frame),
+    );
+    const eventLedger =
+      `advantage ${eventAdvantageDb.toFixed(2)}, peak ${renderedEventPeakDb.toFixed(2)} dBFS, ` +
+      `dialogue gains ${dialogueGainsDb.map((value) => value.toFixed(2)).join("/")} dB, ` +
+      `event plan ${eventRun.plannedGainDb.toFixed(2)}, body authority ${eventRun.bodyOwnershipAuthority.toFixed(3)}, ` +
+      `body recovery ${eventRun.transientBodyRecoveryDb.toFixed(2)} dB`;
+    assert.ok(
+      eventAdvantageDb >= 1.5 && eventAdvantageDb <= 4.3,
+      `periodic voiced ah/ugh/hm event needs a controlled advantage (${eventLedger})`,
+    );
+    for (const [index, dialogueFrame] of [60, 170, 280].entries()) {
+      const dialogueGainDb = dialogueGainsDb[index];
+      assert.ok(
+        Math.abs(dialogueGainDb) < 0.8,
+        `neighboring dialogue at frame ${dialogueFrame} must stay stable, got ${dialogueGainDb.toFixed(2)} dB gain`,
+      );
+    }
+    assert.ok(
+      renderedEventPeakDb <= peakCeilingDb + 0.05,
+      `voiced-event authority must retain the absolute peak ceiling, got ${renderedEventPeakDb.toFixed(2)} dBFS`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(fricativeFrameDb, fricativeSnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+    assert.deepEqual(samples, sampleSnapshot);
+  });
+
+  describe("source-adaptive leveling consistency", () => {
+    const buildSparseCinematicPlan = (
+      levelingConsistency: number | undefined,
+      levelNudgeDb = 0,
+      instabilityHint = 0.5,
+    ) => {
+      const totalFrames = 620;
+      const frameDb = new Array<number>(totalFrames).fill(-82);
+      const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+      const speechRuns = [
+        { startFrame: 20, endFrame: 90 },
+        { startFrame: 130, endFrame: 200 },
+        { startFrame: 240, endFrame: 310 },
+        { startFrame: 350, endFrame: 420 },
+        { startFrame: 470, endFrame: 540 },
+      ];
+      // Keep the cold open representative, then place the cinematic whisper
+      // and projected line later so the fixture measures the consistency
+      // control rather than the independent cold-open repair policy.
+      const runLevelsDb = [-24, -22, -23, -36 + levelNudgeDb, -14];
+      for (let runIndex = 0; runIndex < speechRuns.length; runIndex += 1) {
+        const run = speechRuns[runIndex];
+        const levelDb = runLevelsDb[runIndex];
+        for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+          frameDb[frame] = levelDb;
+          loudnessFrameDb[frame] = levelDb;
+          speechBodyFrameDb[frame] = levelDb;
+        }
+      }
+
+      const frameSnapshot = [...frameDb];
+      const loudnessSnapshot = [...loudnessFrameDb];
+      const bodySnapshot = [...speechBodyFrameDb];
+      const runSnapshot = speechRuns.map((run) => ({ ...run }));
+      const plan = planGainCurve({
+        frameDb,
+        loudnessFrameDb,
+        speechBodyFrameDb,
+        speechRuns,
+        noiseFloorDb: -82,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.1,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        minGainDb: -14,
+        instabilityHint,
+        ...(levelingConsistency === undefined ? {} : { levelingConsistency }),
+      });
+
+      assert.deepEqual(frameDb, frameSnapshot);
+      assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+      assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+      assert.deepEqual(speechRuns, runSnapshot);
+
+      const outputLevelsDb = speechRuns.map((run, index) => {
+        const centerFrame = Math.floor((run.startFrame + run.endFrame) / 2);
+        return runLevelsDb[index] + gainDbAtFrame(plan.gainCurve, centerFrame);
+      });
+      return {
+        plan,
+        outputLevelsDb,
+        sourceContrastDb: runLevelsDb[4] - runLevelsDb[3],
+        outputContrastDb: outputLevelsDb[4] - outputLevelsDb[3],
+      };
+    };
+
+    it("retains bounded whisper-to-projected line contrast at Balanced-like 0.65", () => {
+      const legacy = buildSparseCinematicPlan(1);
+      const balanced = buildSparseCinematicPlan(0.65);
+      const ledger =
+        `source ${balanced.sourceContrastDb.toFixed(3)} dB, ` +
+        `consistency=1 ${legacy.outputContrastDb.toFixed(3)} dB, ` +
+        `consistency=0.65 ${balanced.outputContrastDb.toFixed(3)} dB`;
+
+      assert.ok(
+        balanced.outputContrastDb >= legacy.outputContrastDb + 3,
+        `lower consistency should retain meaningfully more actor contrast (${ledger})`,
+      );
+      assert.ok(
+        balanced.outputContrastDb >= 5,
+        `the whisper/projected distinction must not be flattened (${ledger})`,
+      );
+      assert.ok(
+        balanced.outputContrastDb <= balanced.sourceContrastDb - 3,
+        `Balanced should still reduce excessive source line contrast (${ledger})`,
+      );
+      assert.ok(
+        balanced.outputLevelsDb[3] <= -25,
+        `the later quiet-body floor must not undo intentionally retained whisper contrast, got ${balanced.outputLevelsDb[3].toFixed(3)} dB (${ledger})`,
+      );
+      assert.ok(
+        balanced.outputLevelsDb[0] <= legacy.outputLevelsDb[0] - 0.1,
+        `the independent cold-open repair must not add back reduced-consistency gain, got full ${legacy.outputLevelsDb[0].toFixed(3)} vs Balanced ${balanced.outputLevelsDb[0].toFixed(3)} dB (${ledger})`,
+      );
+    });
+
+    it("continuously restores material audibility to extremely quiet body speech", () => {
+      const totalFrames = 160;
+      const frameDb = new Array<number>(totalFrames).fill(-90);
+      const speechRuns = [{ startFrame: 30, endFrame: 130 }];
+      for (let frame = 30; frame < 130; frame += 1) frameDb[frame] = -54;
+      const frameSnapshot = [...frameDb];
+      const runSnapshot = speechRuns.map((run) => ({ ...run }));
+
+      const plan = planGainCurve({
+        frameDb,
+        loudnessFrameDb: [...frameDb],
+        speechBodyFrameDb: [...frameDb],
+        speechRuns,
+        noiseFloorDb: -90,
+        speechThresholdDb: -65,
+        pauseNoiseRisk: 0.1,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        levelingConsistency: 0,
+      });
+      const centerGainDb = gainDbAtFrame(plan.gainCurve, 80);
+
+      assert.ok(Number.isFinite(centerGainDb), `quiet-body gain must be finite, got ${centerGainDb}`);
+      assert.ok(
+        centerGainDb >= 11,
+        `near-inaudible body speech still needs material recovery at consistency 0, got ${centerGainDb.toFixed(3)} dB`,
+      );
+      assert.deepEqual(frameDb, frameSnapshot);
+      assert.deepEqual(speechRuns, runSnapshot);
+    });
+
+    it("continuously returns stronger leveling authority only for severely unstable sources", () => {
+      const ordinaryInstability = buildSparseCinematicPlan(0.35, 0, 0.86);
+      const severeInstability = buildSparseCinematicPlan(0.35, 0, 0.95);
+      const justBelowRecovery = buildSparseCinematicPlan(0.35, 0, 0.8699);
+      const justInsideRecovery = buildSparseCinematicPlan(0.35, 0, 0.8701);
+      const centerFrame = 385;
+      const boundaryDeltaDb = Math.abs(
+        gainDbAtFrame(justInsideRecovery.plan.gainCurve, centerFrame) -
+          gainDbAtFrame(justBelowRecovery.plan.gainCurve, centerFrame),
+      );
+
+      assert.ok(
+        severeInstability.outputContrastDb <= ordinaryInstability.outputContrastDb - 1.5,
+        `severe instability should recover bounded leveling authority, ordinary ${ordinaryInstability.outputContrastDb.toFixed(3)} vs severe ${severeInstability.outputContrastDb.toFixed(3)} dB`,
+      );
+      assert.ok(
+        severeInstability.outputContrastDb >= 3,
+        `even severe instability must retain a clear whisper/projected distinction, got ${severeInstability.outputContrastDb.toFixed(3)} dB`,
+      );
+      assert.ok(
+        boundaryDeltaDb <= 0.01,
+        `instability recovery must enter continuously, boundary delta ${boundaryDeltaDb.toFixed(6)} dB`,
+      );
+    });
+
+    it("preserves already-consistent cinematic line shape while still narrowing a genuinely uneven take", () => {
+      const planRunLevels = (runLevelsDb: readonly number[]) => {
+        const totalFrames = 620;
+        const frameDb = new Array<number>(totalFrames).fill(-82);
+        const speechRuns = runLevelsDb.map((_, index) => ({
+          startFrame: 20 + index * 110,
+          endFrame: 90 + index * 110,
+        }));
+        for (let index = 0; index < speechRuns.length; index += 1) {
+          const run = speechRuns[index];
+          for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+            frameDb[frame] = runLevelsDb[index];
+          }
+        }
+        const plan = planGainCurve({
+          frameDb,
+          loudnessFrameDb: [...frameDb],
+          speechBodyFrameDb: [...frameDb],
+          speechRuns,
+          noiseFloorDb: -82,
+          speechThresholdDb: -55,
+          pauseNoiseRisk: 0.1,
+          frameMs: FRAME_MS,
+          targetDb: -22,
+          sourceTargetBlend: 0,
+          maxGainDb: 14,
+          instabilityHint: 0.86,
+          levelingConsistency: 0.35,
+        });
+        const outputLevelsDb = speechRuns.map((run, index) =>
+          runLevelsDb[index] +
+          gainDbAtFrame(plan.gainCurve, Math.floor((run.startFrame + run.endFrame) / 2)),
+        );
+        return {
+          sourceSpreadDb: Math.max(...runLevelsDb) - Math.min(...runLevelsDb),
+          outputSpreadDb: Math.max(...outputLevelsDb) - Math.min(...outputLevelsDb),
+        };
+      };
+
+      const alreadyConsistent = planRunLevels([-25.8, -28.9, -26.4, -27.6, -26.2]);
+      const genuinelyUneven = planRunLevels([-32, -20, -36, -25, -17]);
+
+      assert.ok(
+        alreadyConsistent.outputSpreadDb >= 2.5,
+        `an already-consistent 3 dB performance must not be collapsed, got ${alreadyConsistent.outputSpreadDb.toFixed(3)} of ${alreadyConsistent.sourceSpreadDb.toFixed(3)} dB`,
+      );
+      assert.ok(
+        genuinelyUneven.outputSpreadDb <= genuinelyUneven.sourceSpreadDb - 4,
+        `a genuinely uneven take still needs material macro narrowing, got ${genuinelyUneven.outputSpreadDb.toFixed(3)} of ${genuinelyUneven.sourceSpreadDb.toFixed(3)} dB`,
+      );
+    });
+
+    it("keeps consistency=1 value-identical to the legacy omitted option", () => {
+      const legacy = buildSparseCinematicPlan(undefined).plan;
+      const explicitFull = buildSparseCinematicPlan(1).plan;
+      assert.deepEqual(explicitFull, legacy);
+    });
+
+    it("responds continuously to tiny consistency and input changes without mutation", () => {
+      const base = buildSparseCinematicPlan(0.65);
+      const consistencyNudge = buildSparseCinematicPlan(0.6501);
+      const nearFull = buildSparseCinematicPlan(0.999999);
+      const full = buildSparseCinematicPlan(1);
+      const inputNudge = buildSparseCinematicPlan(0.65, 0.001);
+      const centerFrame = 385;
+      const consistencyDeltaDb = Math.abs(
+        gainDbAtFrame(consistencyNudge.plan.gainCurve, centerFrame) -
+          gainDbAtFrame(base.plan.gainCurve, centerFrame),
+      );
+      const inputDeltaDb = Math.abs(
+        gainDbAtFrame(inputNudge.plan.gainCurve, centerFrame) -
+          gainDbAtFrame(base.plan.gainCurve, centerFrame),
+      );
+      let fullEndpointDeltaDb = 0;
+      for (let frame = 0; frame < full.plan.gainCurve.length; frame += 1) {
+        fullEndpointDeltaDb = Math.max(
+          fullEndpointDeltaDb,
+          Math.abs(
+            gainDbAtFrame(nearFull.plan.gainCurve, frame) -
+              gainDbAtFrame(full.plan.gainCurve, frame),
+          ),
+        );
+      }
+
+      assert.ok(
+        consistencyDeltaDb > 0 && consistencyDeltaDb < 0.01,
+        `tiny consistency change must produce a tiny nonzero response, got ${consistencyDeltaDb.toFixed(6)} dB`,
+      );
+      assert.ok(
+        inputDeltaDb > 0 && inputDeltaDb < 0.01,
+        `tiny source change must produce a tiny nonzero response, got ${inputDeltaDb.toFixed(6)} dB`,
+      );
+      assert.ok(
+        fullEndpointDeltaDb < 0.01,
+        `consistency must approach the value-identical full endpoint continuously, got ${fullEndpointDeltaDb.toFixed(6)} dB`,
+      );
+    });
   });
 });

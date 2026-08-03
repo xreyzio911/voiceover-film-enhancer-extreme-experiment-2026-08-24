@@ -60,7 +60,6 @@ test("planner no-plan fallback is wired to a truthful source-preserving render i
     "const processFiles = async () =>",
     "const downloadOutputsSequentially = async",
   );
-
   assert.match(plannerContextBlock, /resolveGainPlannerOutcome\(\{/);
   assert.match(plannerContextBlock, /context\.sourcePreservingFallback = true/);
   assert.match(plannerContextBlock, /no adaptive enhancement claimed/);
@@ -69,7 +68,7 @@ test("planner no-plan fallback is wired to a truthful source-preserving render i
     /throw new Error\("speech-aware planner produced no plan on speech-bearing input"\)/,
   );
   assertMarkersInOrder(processFilesBlock, [
-    'const candidateVariants: CandidateVariant[] = plannerContext.sourcePreservingFallback',
+    'let candidateVariants: CandidateVariant[] = plannerContext.sourcePreservingFallback',
     '["source-safe"]',
     "sourcePassthroughChain: plannerContext.sourcePreservingFallback",
     "disableLimiter: plannerContext.sourcePreservingFallback",
@@ -78,6 +77,29 @@ test("planner no-plan fallback is wired to a truthful source-preserving render i
     "final polish skipped; planner produced no usable gain plan",
     "corrective processing skipped; planner produced no usable gain plan",
   ]);
+});
+
+test("the selected leveler preset continuously controls speech-planner consistency", () => {
+  const plannerBlock = sourceBetween(
+    "const planGainForInput = async",
+    "const applyPlannerToFullInput = async",
+  );
+
+  assert.match(
+    plannerBlock,
+    /const activeControls = getActiveAudioReviewControls\(\)[\s\S]*?const activeLeveler = getLevelerForControls\(activeControls\)/,
+    "the planner must read the same active leveler choice as the downstream chain",
+  );
+  assert.match(
+    plannerBlock,
+    /levelingConsistency:\s*LEVELER_CONSISTENCY\[activeLeveler\]/,
+    "the adaptive consistency authority must be passed into the speech-aware gain planner",
+  );
+  assert.match(
+    voLevelerSource,
+    /const LEVELER_CONSISTENCY = \{[\s\S]*?"Minimal \(no auto-leveler\)": 0\.1,[\s\S]*?Gentle: 0\.25,[\s\S]*?Balanced: 0\.35,[\s\S]*?Firm: 0\.65,[\s\S]*?\} as const/,
+    "preset authority should stay ordered while Balanced preserves roughly half of source line contrast",
+  );
 });
 
 test("planner no-plan output stays source-preserving through every later delivery transform", () => {
@@ -101,12 +123,22 @@ test("planner no-plan output stays source-preserving through every later deliver
     "const processFiles = async () =>",
     "const downloadOutputsSequentially = async",
   );
+  const protectedOutputPredicate = sourceBetween(
+    "const isProtectedOutputEntry =",
+    "type ReviewBundleAsset =",
+  );
 
   assert.match(outputEntryBlock, /sourcePreservingFallback\?: boolean/);
+  assert.match(outputEntryBlock, /protectedRecovery\?: boolean/);
+  assertMarkersInOrder(protectedOutputPredicate, [
+    "entry.sourcePreservingFallback",
+    "entry.sourceSafeRecovery",
+    "entry.protectedRecovery",
+  ]);
   assertMarkersInOrder(renderFallbackBlock, [
     "options?.sourcePassthroughChain",
     "source-preserving passthrough",
-    "disableLimiter: true",
+    "disableLimiter: options.disableLimiter === true",
     "if (!options?.sourcePassthroughChain)",
     "room cleanup bypass",
     "stability-safe chain",
@@ -114,19 +146,20 @@ test("planner no-plan output stays source-preserving through every later deliver
   ]);
   assert.match(
     batchAlignmentBlock,
-    /\.filter\(\(\{ entry \}\) => entry\.kind === "mixready" && !entry\.sourcePreservingFallback\)/,
+    /\.filter\(\(\{ entry \}\) => entry\.kind === "mixready" && !isProtectedOutputEntry\(entry\)\)/,
   );
-  assert.match(batchAlignmentBlock, /excluded \(source-preserving planner fallback\)/);
+  assert.match(batchAlignmentBlock, /excluded \(protected recovery\/fallback\)/);
   assertMarkersInOrder(finalResidualBlock, [
-    "if (entry.sourcePreservingFallback)",
-    "source-preserving planner fallback; original bytes kept",
+    "if (isProtectedOutputEntry(entry))",
+    "protected recovery/fallback; selected bytes kept",
     "continue",
   ]);
   assertMarkersInOrder(processFilesBlock, [
-    "shouldEmitMixReadyOutput(loudnessConfig !== null) || selectedSourcePreservingFallback",
-    "sourcePreservingFallback: selectedSourcePreservingFallback",
-    "sceneBlend && !selectedSourcePreservingFallback",
-    "loudnessConfig && !selectedSourcePreservingFallback",
+    "shouldEmitMixReadyOutput(loudnessConfig !== null) || finalSelectedDeliveryProtected",
+    "sourcePreservingFallback: finalSelectedSourcePreservingFallback",
+    "protectedRecovery: finalSelectedProtectedRecovery",
+    "sceneBlend && !finalSelectedDeliveryProtected",
+    "loudnessConfig && !finalSelectedDeliveryProtected",
     "decoded 48 kHz float source-preserving output",
   ]);
   assert.match(
@@ -556,9 +589,10 @@ test("audibility recovery judges the final speech band against the raw source", 
     "`${job.base}_source`",
     "const renderedFrameDb = await renderAudibilityFrameDb(",
     "detectAlignedAudibilityDropouts({",
-    "maxAlignmentMs: 60",
+    "maxAlignmentMs: AUDIBILITY_GUARD_MAX_ALIGNMENT_MS",
     "const report = alignedResult.finalReport",
   ]);
+  assert.match(voLevelerSource, /const AUDIBILITY_GUARD_MAX_ALIGNMENT_MS = 250/);
   assert.equal((renderBlock.match(/await assertRenderedAudibility\(/g) ?? []).length, 4);
   assert.doesNotMatch(guardBlock, /planner-leveled|referenceInputName/);
   assert.doesNotMatch(renderBlock, /assertRenderedAudibility\([^;]*leveled[^;]*\)/);
@@ -812,6 +846,7 @@ test("large rendered-candidate QC analyzes bounded WAV windows without restoring
     "inspectMonoFloat32Wav(inputBytes)",
     "selectDistributedAnalysisWindowsWithConfig(",
     "await safeDeleteFile(ffmpeg, inputName)",
+    "ffmpeg = await refreshFfmpeg(`bounded candidate QC clean worker on ${sanitizeBase(inputName)}`)",
     "sliceMonoFloat32Wav(inputBytes",
     "await analyzeFileWindow(ffmpeg, windowName, 0",
     "aggregateWindowAnalyses(",
@@ -820,6 +855,11 @@ test("large rendered-candidate QC analyzes bounded WAV windows without restoring
     boundedQcBlock,
     /restoreRecoveryInputs|ensureRecoveryInputBytes/,
     "a small-window retry must not rehydrate 100-200 MB source and render WAVs",
+  );
+  assert.doesNotMatch(
+    boundedQcBlock,
+    /writeJobInput/,
+    "the clean QC worker must receive only bounded windows, never the full source file",
   );
   assert.match(
     boundedQcBlock,
@@ -877,6 +917,11 @@ test("bounded QC and JavaScript review decodes share the same memory route", () 
     artifactBuilderBlock,
     /const alignment = useBoundedRenderedReviewMemory[\s\S]*?buildDurationOnlyAlignmentMetrics\(/,
   );
+  assert.match(
+    voLevelerSource,
+    /const BOUNDED_CANDIDATE_QC_MIN_COMBINED_BYTES = 40 \* 1024 \* 1024/,
+    "the measured 41 MiB fourth-file audition footprint must avoid whole-file WASM QC",
+  );
 });
 
 test("bounded post-render QC restores exact selected bytes even when window analysis fails", () => {
@@ -919,6 +964,218 @@ test("sampled candidate QC stays advisory instead of authorizing a file-wide cor
     /analysisWindowsSucceeded[\s\S]{0,100}>= 3/,
     "a successful sample count must not be promoted to file-wide evidence",
   );
+});
+
+test("objective invalidity or the full quality trio schedules one limiter-on enhanced linear recovery", () => {
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+  const renderFallbackBlock = sourceBetween(
+    "const renderMixReadyWithFallbacks = async",
+    "const processFiles = async",
+  );
+
+  assert.match(processFilesBlock, /shouldRunSourceSafeRecoveryForCandidate/);
+  assert.match(processFilesBlock, /shouldRequestEnhancedLinearRecoveryForCandidate/);
+  assert.match(processFilesBlock, /enhancedLinearRecoveryRequested = true/);
+  assert.match(processFilesBlock, /sourcePassthroughChain: plannerContext\.sourcePreservingFallback \|\| enhancedLinearRecovery/);
+  assert.match(processFilesBlock, /disableLimiter: plannerContext\.sourcePreservingFallback,/);
+  assert.doesNotMatch(
+    processFilesBlock,
+    /disableLimiter: plannerContext\.sourcePreservingFallback \|\| enhancedLinearRecovery/,
+    "neither objective nor advisory linear recovery may turn into raw passthrough",
+  );
+  assert.match(processFilesBlock, /disableGainPlanner: plannerContext\.sourcePreservingFallback \|\| enhancedLinearRecovery/);
+  assert.match(
+    processFilesBlock,
+    /disableHeadPriming: plannerContext\.sourcePreservingFallback \|\| enhancedLinearRecovery/,
+    "enhanced linear recovery must not receive a hidden pre-roll transform",
+  );
+  assert.match(processFilesBlock, /candidateVariants = \[\.\.\.candidateVariants, "source-safe"\]/);
+  assert.match(processFilesBlock, /adaptive tail\/source quality evidence requested one enhanced linear recovery/);
+  assert.match(processFilesBlock, /resolveRequestedEnhancedLinearRecoverySelection/);
+  assert.match(processFilesBlock, /linearRecoverySelection\.select/);
+  assert.match(
+    processFilesBlock,
+    /enhanced linear recovery after advisory tail\/source damage/,
+  );
+  assert.match(processFilesBlock, /"source-safe-recovery"/);
+  assert.match(
+    renderFallbackBlock,
+    /label: options\.disableLimiter === true\s*\? "source-preserving passthrough"\s*:\s*ENHANCED_LINEAR_RECOVERY_STRATEGY_LABEL/,
+    "the effective source-linear strategy must distinguish raw fallback from peak-safe recovery",
+  );
+  assert.match(
+    renderFallbackBlock,
+    /disableLimiter: options\.disableLimiter === true/,
+    "the fallback strategy must preserve the caller's limiter policy instead of forcing raw passthrough",
+  );
+  assert.doesNotMatch(
+    renderFallbackBlock,
+    /sourcePassthroughChain: true,[\s\S]{0,120}?disableLimiter: true/,
+    "the strategy merge must not overwrite objective recovery with limiter-off passthrough",
+  );
+  assert.match(
+    renderFallbackBlock,
+    /const effectiveOptions = \{ \.\.\.options, \.\.\.strategy\.options \}/,
+    "the contract covers the exact strategy merge that determines the rendered filter",
+  );
+  assert.match(
+    processFilesBlock,
+    /if \(MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedSourcePreservingFallback\)[\s\S]*?corrective processing skipped; requested enhanced linear recovery must remain untouched[\s\S]*?if \([\s\S]*?!selectedSourcePreservingFallback/,
+    "a selected enhanced linear recovery must be excluded before the small-file corrective branch",
+  );
+});
+
+test("technically valid corrective enhancement stays deliverable after advisory comparison", () => {
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+  const correctiveSelectionBlock = textBetween(
+    processFilesBlock,
+    "const originalRank = selectedPostPolishArtifact.scoredScore.rankingScore",
+    "} catch (error) {",
+  );
+
+  assert.match(correctiveSelectionBlock, /resolveEnhancedDeliveryDecision/);
+  assert.match(correctiveSelectionBlock, /deliveryDecision\.deliverEnhanced/);
+  assert.match(correctiveSelectionBlock, /qualityAdvisoryReasons/);
+  assert.doesNotMatch(correctiveSelectionBlock, /correctiveRank <= originalRank - CORRECTIVE_WIN_MARGIN/);
+  assert.doesNotMatch(correctiveSelectionBlock, /discarded corrective render/);
+});
+
+test("an accepted corrective protected recovery stays immutable through final delivery routing", () => {
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+  const correctiveRenderBlock = textBetween(
+    processFilesBlock,
+    "const correctiveResult = await renderMixReadyWithFallbacks(",
+    "const correctiveBytes = await readVirtualFileBytes(ffmpeg, correctiveName)",
+  );
+  const finalProtectedRoutingBlock = textBetween(
+    processFilesBlock,
+    "const finalSelectedSourceSafeRecovery =",
+    'markQueueDone(job.base, "Outputs ready")',
+  );
+  const batchAlignmentBlock = sourceBetween(
+    "const alignBatchMixReadyOutputs = async",
+    "const applyFinalConsonantResidualToOutputs = async",
+  );
+  const finalResidualBlock = sourceBetween(
+    "const applyFinalConsonantResidualToOutputs = async",
+    "const buildFinalReviewBundles = async",
+  );
+
+  assertMarkersInOrder(correctiveRenderBlock, [
+    "if (isAudibilityProtectedRender(correctiveResult.meta))",
+    "skipped corrective final app polish",
+    "} else {",
+    "runFinalAppPolishPass(",
+  ]);
+  assertMarkersInOrder(processFilesBlock, [
+    "selectedMeta = correctiveArtifact.meta",
+    "const finalSelectedSourceSafeRecovery =",
+    'selectedMeta?.degradeReasons.includes("source-safe-recovery") === true',
+    "const finalSelectedAudibilityProtected = isAudibilityProtectedRender(selectedMeta)",
+    "const finalSelectedSourcePreservingFallback =",
+    "plannerContext.sourcePreservingFallback",
+    "const finalSelectedProtectedRecovery =",
+    "!finalSelectedSourcePreservingFallback &&",
+    "!finalSelectedSourceSafeRecovery &&",
+    "finalSelectedAudibilityProtected",
+    "const finalSelectedDeliveryProtected =",
+    "finalSelectedSourcePreservingFallback ||",
+    "finalSelectedSourceSafeRecovery ||",
+    "finalSelectedProtectedRecovery",
+    "shouldEmitMixReadyOutput(loudnessConfig !== null) || finalSelectedDeliveryProtected",
+    "sourcePreservingFallback: finalSelectedSourcePreservingFallback",
+    "protectedRecovery: finalSelectedProtectedRecovery",
+    "sceneBlend && !finalSelectedDeliveryProtected",
+    "loudnessConfig && !finalSelectedDeliveryProtected",
+  ]);
+  assert.doesNotMatch(
+    finalProtectedRoutingBlock,
+    /shouldTryCorrective|runFinalAppPolishPass/,
+    "once final protection is derived from the accepted artifact, no corrective recursion or final polish may follow",
+  );
+  assert.match(
+    batchAlignmentBlock,
+    /\.filter\(\(\{ entry \}\) => entry\.kind === "mixready" && !isProtectedOutputEntry\(entry\)\)/,
+    "the final protection flag must exclude the accepted corrective from batch alignment",
+  );
+  assertMarkersInOrder(finalResidualBlock, [
+    "if (isProtectedOutputEntry(entry))",
+    "protected recovery/fallback; selected bytes kept",
+    "continue",
+  ]);
+});
+
+test("delivery metadata and UI distinguish raw fallback from protected recovery", () => {
+  const manifestBlock = sourceBetween(
+    "const buildDeliveryManifest = (",
+    "const downloadOutputsSequentially = async",
+  );
+  const outputUiBlock = sourceBetween(
+    "const outputHelpText = output.sourceSafeRecovery",
+    "return (",
+  );
+  const outputBadgeBlock = sourceBetween(
+    "{isProtectedOutputEntry(output) && (",
+    "</span>",
+  );
+
+  assertMarkersInOrder(manifestBlock, [
+    "sourcePreservingFallback: output.sourcePreservingFallback === true",
+    "sourceSafeRecovery: output.sourceSafeRecovery === true",
+    "protectedRecovery: output.protectedRecovery === true",
+  ]);
+  assertMarkersInOrder(outputUiBlock, [
+    "output.sourceSafeRecovery",
+    "Enhanced linear recovery:",
+    "output.protectedRecovery",
+    "Protected recovery:",
+    "output.sourcePreservingFallback",
+    "Source-preserving fallback:",
+  ]);
+  assertMarkersInOrder(outputBadgeBlock, [
+    "output.sourceSafeRecovery",
+    '"Enhanced linear recovery"',
+    "output.protectedRecovery",
+    '"Protected recovery"',
+    '"Source preserved"',
+  ]);
+});
+
+test("corrective ownership is one pass per file and cannot be exhausted by earlier batch entries", () => {
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assert.match(voLevelerSource, /const MAX_CORRECTIVE_PASSES = 1/);
+  assert.match(
+    processFilesBlock,
+    /let correctiveAttemptedFiles: ReadonlySet<string> = new Set\(\)/,
+  );
+  assertMarkersInOrder(processFilesBlock, [
+    "let correctiveAttemptedFiles: ReadonlySet<string> = new Set()",
+    "while (i < jobs.length)",
+    "correctiveAttemptedFiles.has(job.base)",
+    "const correctiveClaim = claimCorrectivePassForFile(correctiveAttemptedFiles, job.base)",
+    "correctiveAttemptedFiles = correctiveClaim.attemptedFiles",
+  ]);
+  assert.match(processFilesBlock, /correctiveAttemptedFiles\.has\(job\.base\)/);
+  assert.match(
+    processFilesBlock,
+    /const correctiveClaim = claimCorrectivePassForFile\(correctiveAttemptedFiles, job\.base\)[\s\S]*?correctiveAttemptedFiles = correctiveClaim\.attemptedFiles/,
+  );
+  assert.doesNotMatch(processFilesBlock, /correctiveRenderAttempts|correctiveRenderBudget/);
+  assert.doesNotMatch(processFilesBlock, /batch render budget|40% cap/);
+  assert.doesNotMatch(voLevelerSource, /resolveCorrectiveMaxFilesPerBatch/);
 });
 
 test("final residual sweep covers every output after optional batch alignment and before exposure", () => {

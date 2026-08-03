@@ -15,6 +15,7 @@ export type DegradeReason =
   | "planner-required"
   | "planner-apply-failed"
   | "audibility-dropout-guard"
+  | "source-safe-recovery"
   | "single-pass-recovery";
 
 export type CandidateScore = {
@@ -284,6 +285,7 @@ export type RenderFallbackStrategyLike = {
 
 export const PLANNER_TAIL_SAFE_STRATEGY_LABEL = "planner-tail-safe single-pass";
 export const AUDIBILITY_SAFE_STRATEGY_LABEL = "audibility-safe single-pass";
+export const ENHANCED_LINEAR_RECOVERY_STRATEGY_LABEL = "peak-safe linear recovery";
 
 type RenderRiskInput = {
   durationSeconds: number;
@@ -306,6 +308,86 @@ const QC_ONLY_DEGRADE_REASONS = new Set<DegradeReason>([
   "analysis-window-drop",
   "qc-unavailable",
 ]);
+const TECHNICAL_SAFETY_GATE_REASONS = new Set([
+  "duration-mismatch",
+  "timing-offset",
+  "peak-violation",
+  "planner-required",
+  "planner-apply-failed",
+]);
+const RECOVERABLE_RENDER_SAFETY_GATE_REASONS = new Set([
+  "duration-mismatch",
+  "timing-offset",
+  "peak-violation",
+]);
+const ENHANCED_LINEAR_RECOVERY_QUALITY_REASONS = Object.freeze([
+  "ending-damage",
+  "end-edge-dip",
+  "source-regression",
+]);
+
+export const partitionCandidateGateReasons = (gateReasons: readonly string[]) => {
+  const technicalSafetyReasons: string[] = [];
+  const qualityAdvisoryReasons: string[] = [];
+  for (const reason of gateReasons) {
+    if (TECHNICAL_SAFETY_GATE_REASONS.has(reason)) technicalSafetyReasons.push(reason);
+    else qualityAdvisoryReasons.push(reason);
+  }
+  return Object.freeze({
+    technicalSafetyReasons: Object.freeze(technicalSafetyReasons),
+    qualityAdvisoryReasons: Object.freeze(qualityAdvisoryReasons),
+  });
+};
+
+export const shouldRequestEnhancedLinearRecoveryForCandidate = (
+  gateReasons: readonly string[],
+) =>
+  ENHANCED_LINEAR_RECOVERY_QUALITY_REASONS.every((reason) =>
+    gateReasons.includes(reason),
+  );
+
+export const resolveRequestedEnhancedLinearRecoverySelection = ({
+  recoveryRequested,
+  recoveryGateReasons,
+}: Readonly<{
+  recoveryRequested: boolean;
+  recoveryGateReasons: readonly string[];
+}>) => {
+  const { technicalSafetyReasons, qualityAdvisoryReasons } =
+    partitionCandidateGateReasons(recoveryGateReasons);
+  return Object.freeze({
+    select: recoveryRequested && technicalSafetyReasons.length === 0,
+    technicalSafetyReasons,
+    qualityAdvisoryReasons,
+  });
+};
+
+export const resolveEnhancedDeliveryDecision = ({
+  gateReasons,
+  previousRankingScore,
+  enhancedRankingScore,
+}: Readonly<{
+  gateReasons: readonly string[];
+  previousRankingScore: number;
+  enhancedRankingScore: number;
+}>) => {
+  const { technicalSafetyReasons, qualityAdvisoryReasons } =
+    partitionCandidateGateReasons(gateReasons);
+  const advisoryPreferredCandidate =
+    Number.isFinite(previousRankingScore) && Number.isFinite(enhancedRankingScore)
+      ? enhancedRankingScore < previousRankingScore
+        ? "enhanced"
+        : enhancedRankingScore > previousRankingScore
+          ? "previous"
+          : "tie"
+      : "unavailable";
+  return Object.freeze({
+    deliverEnhanced: technicalSafetyReasons.length === 0,
+    advisoryPreferredCandidate,
+    technicalSafetyReasons,
+    qualityAdvisoryReasons,
+  });
+};
 
 const roundedScore = (value: number) => Math.round(value * 100);
 
@@ -314,6 +396,19 @@ export const isHealthySegmentedRender = (meta: CandidateRenderMeta) =>
   (meta.renderPath === "speech-pause-segmented" ||
     meta.renderPath === "speech-aligned-segmented" ||
     meta.renderPath === "fixed-segmented");
+
+export const shouldRunSourceSafeRecoveryForCandidate = (input: {
+  meta: CandidateRenderMeta;
+  gateReasons: readonly string[];
+}) => {
+  const hasRecoverableStructuralFailure = input.gateReasons.some((reason) =>
+    RECOVERABLE_RENDER_SAFETY_GATE_REASONS.has(reason),
+  );
+  const hasObjectiveAudibilityFailure = input.meta.degradeReasons.includes(
+    "audibility-dropout-guard",
+  );
+  return hasRecoverableStructuralFailure || hasObjectiveAudibilityFailure;
+};
 
 const isRecoveredSinglePass = (meta: CandidateRenderMeta) => meta.renderPath === "single-pass-recovered";
 
@@ -329,7 +424,6 @@ const materiallyBetterThanHealthySegmented = (recovered: CandidateScore, healthy
 
 const hasUnselectableGate = (score: CandidateScore) =>
   (score.gateReasons ?? []).some((reason) =>
-    reason === "qc-unavailable" ||
     reason === "planner-required" ||
     reason === "planner-apply-failed"
   );

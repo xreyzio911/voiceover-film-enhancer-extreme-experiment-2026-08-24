@@ -912,7 +912,8 @@ export const analyzeFrameAudio = (
     1
   );
 
-  const centered = frameRms.map((value) => value - mean(frameRms));
+  const frameRmsMean = mean(frameRms);
+  const centered = frameRms.map((value) => value - frameRmsMean);
   let bestCorr = 0;
   let bestEchoLagFrames = 0;
   for (let lag = 4; lag <= 20; lag += 1) {
@@ -942,8 +943,8 @@ export const analyzeFrameAudio = (
       continue;
     }
     if (speechRun >= 6) {
-      const early = mean(frameRms.slice(frame + 1, frame + 8));
-      const late = mean(frameRms.slice(frame + 14, frame + 28));
+      const early = meanSlice(frameRms, frame + 1, frame + 8) ?? 0;
+      const late = meanSlice(frameRms, frame + 14, frame + 28) ?? 0;
       const pauseFloorAmp = Math.pow(10, pauseNoiseFloorDb / 20);
       const lateLiftDb = toDb((late + 1e-9) / (pauseFloorAmp + 1e-9));
       const decayDb = toDb((early + 1e-9) / (late + 1e-9));

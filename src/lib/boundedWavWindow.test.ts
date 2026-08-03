@@ -72,7 +72,7 @@ test("routes QC by combined WASM footprint before either WAV is individually hug
   const routing = {
     minDurationSec: 600,
     minRenderedBytes: 96 * mib,
-    minCombinedBytes: 112 * mib,
+    minCombinedBytes: 40 * mib,
   };
 
   assert.equal(shouldUseBoundedWavQc({
@@ -82,8 +82,14 @@ test("routes QC by combined WASM footprint before either WAV is individually hug
     ...routing,
   }), true, "the observed Antonio source+render footprint must avoid whole-file WASM QC");
   assert.equal(shouldUseBoundedWavQc({
-    durationSec: 457,
-    renderedBytes: 48 * mib,
+    durationSec: 90,
+    renderedBytes: 16.5 * mib,
+    companionBytes: 24.8 * mib,
+    ...routing,
+  }), true, "the observed fourth-file audition footprint must take the bounded route");
+  assert.equal(shouldUseBoundedWavQc({
+    durationSec: 90,
+    renderedBytes: 16 * mib,
     companionBytes: 20 * mib,
     ...routing,
   }), false);

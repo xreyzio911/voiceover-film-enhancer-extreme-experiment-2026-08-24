@@ -7,10 +7,15 @@ import {
   buildCandidateScoreFromAnalysis,
   buildRenderRiskProfile,
   compareCandidateScores,
+  partitionCandidateGateReasons,
   resolveCandidateMeasurementStatus,
+  resolveEnhancedDeliveryDecision,
   resolveNextAudibilityFallbackIndex,
+  resolveRequestedEnhancedLinearRecoverySelection,
   selectQcUnavailableFallbackCandidate,
   shouldPreferCandidate,
+  shouldRequestEnhancedLinearRecoveryForCandidate,
+  shouldRunSourceSafeRecoveryForCandidate,
   summarizeCandidateScore,
   type CandidateRenderMeta,
   type CandidateScore,
@@ -159,6 +164,96 @@ test("recovered single-pass candidate must materially beat healthy segmented win
   assert.equal(decision.reason, "protected healthy segmented");
 });
 
+test("quality-only tail/source trio requests enhanced linear recovery without becoming technical invalidity", () => {
+  const qualityTrio = ["ending-damage", "end-edge-dip", "source-regression"];
+
+  assert.equal(
+    shouldRunSourceSafeRecoveryForCandidate({
+      meta: buildMeta({ renderPath: "fixed-segmented" }),
+      gateReasons: qualityTrio,
+    }),
+    false,
+    "quality evidence must not enter the objective-invalidity recovery helper",
+  );
+  assert.equal(shouldRequestEnhancedLinearRecoveryForCandidate(qualityTrio), true);
+  assert.equal(
+    shouldRequestEnhancedLinearRecoveryForCandidate(["ending-damage", "source-regression"]),
+    false,
+    "partial advisory evidence must not request the extra render",
+  );
+  assert.equal(
+    shouldRequestEnhancedLinearRecoveryForCandidate([
+      "qc-unavailable",
+      "ending-damage",
+      "end-edge-dip",
+      "source-regression",
+    ]),
+    true,
+    "additional advisory evidence must not suppress the trio request",
+  );
+});
+
+test("requested enhanced linear recovery is selected by technical validity, never advisory ranking", () => {
+  const qualityReasons = [
+    "ending-damage",
+    "end-edge-dip",
+    "source-regression",
+    "qc-unavailable",
+  ];
+  const selection = resolveRequestedEnhancedLinearRecoverySelection({
+    recoveryRequested: true,
+    recoveryGateReasons: qualityReasons,
+  });
+  const delivery = resolveEnhancedDeliveryDecision({
+    gateReasons: qualityReasons,
+    previousRankingScore: 1,
+    enhancedRankingScore: 999,
+  });
+
+  assert.equal(selection.select, true);
+  assert.deepEqual(selection.technicalSafetyReasons, []);
+  assert.deepEqual(selection.qualityAdvisoryReasons, qualityReasons);
+  assert.equal(delivery.deliverEnhanced, true);
+  assert.equal(delivery.advisoryPreferredCandidate, "previous");
+
+  assert.equal(
+    resolveRequestedEnhancedLinearRecoverySelection({
+      recoveryRequested: true,
+      recoveryGateReasons: [...qualityReasons, "duration-mismatch"],
+    }).select,
+    false,
+    "a genuinely invalid recovery must not be selected",
+  );
+});
+
+test("objective structural invalidity can schedule one source-safe recovery", () => {
+  for (const reason of ["duration-mismatch", "timing-offset", "peak-violation"]) {
+    assert.equal(
+      shouldRunSourceSafeRecoveryForCandidate({
+        meta: buildMeta({ renderPath: "fixed-segmented" }),
+        gateReasons: ["source-regression", reason],
+      }),
+      true,
+      `${reason} should authorize recovery`,
+    );
+  }
+
+  assert.equal(
+    shouldRunSourceSafeRecoveryForCandidate({
+      meta: buildMeta({
+        strategyLabel: "audibility-safe single-pass",
+        renderPath: "single-pass-recovered",
+        segmentedHealthy: false,
+        degraded: true,
+        degradeReasons: ["audibility-dropout-guard"],
+      }),
+      gateReasons: ["source-regression"],
+    }),
+    true,
+    "an objective audibility guard should authorize linear recovery",
+  );
+});
+
 test("raw score deltas still choose a winner when rounded summaries look tied", () => {
   const currentScore = buildScore({ stability: 0.8404, pause: 0.3104, compression: 0.2004, echo: 0.6404 });
   const challengerScore = buildScore({ stability: 0.8402, pause: 0.3104, compression: 0.2004, echo: 0.6404 });
@@ -193,7 +288,7 @@ test("rankingScore overrides raw totals when learned reranking is available", ()
   assert.equal(decision.reason, "winner by learned ranking");
 });
 
-test("unavailable QC candidate cannot become the first winner", () => {
+test("rendered QC-unavailable candidate remains deliverable with advisory evidence", () => {
   const challengerScore = buildScore({
     stability: 0.1,
     pause: 0.1,
@@ -210,8 +305,73 @@ test("unavailable QC candidate cannot become the first winner", () => {
     null,
   );
 
-  assert.equal(decision.select, false);
-  assert.equal(decision.reason, "candidate unavailable for selection");
+  assert.equal(decision.select, true);
+  assert.equal(decision.reason, "first completed candidate");
+});
+
+test("candidate comparison separates technical safety from quality advisories", () => {
+  const partition = partitionCandidateGateReasons([
+    "qc-unavailable",
+    "source-regression",
+    "duration-mismatch",
+    "timing-offset",
+    "peak-violation",
+    "ending-damage",
+    "end-edge-dip",
+    "future-quality-note",
+  ]);
+
+  assert.deepEqual(partition.technicalSafetyReasons, [
+    "duration-mismatch",
+    "timing-offset",
+    "peak-violation",
+  ]);
+  assert.deepEqual(partition.qualityAdvisoryReasons, [
+    "qc-unavailable",
+    "source-regression",
+    "ending-damage",
+    "end-edge-dip",
+    "future-quality-note",
+  ]);
+});
+
+test("worse advisory ranking cannot cancel a technically valid enhanced render", () => {
+  const gateReasons = Object.freeze([
+    "qc-unavailable",
+    "source-regression",
+    "ending-damage",
+    "end-edge-dip",
+  ]);
+
+  const decision = resolveEnhancedDeliveryDecision({
+    gateReasons,
+    previousRankingScore: 10,
+    enhancedRankingScore: 150,
+  });
+
+  assert.equal(decision.deliverEnhanced, true);
+  assert.equal(decision.advisoryPreferredCandidate, "previous");
+  assert.deepEqual(decision.technicalSafetyReasons, []);
+  assert.deepEqual(decision.qualityAdvisoryReasons, gateReasons);
+  assert.deepEqual(gateReasons, [
+    "qc-unavailable",
+    "source-regression",
+    "ending-damage",
+    "end-edge-dip",
+  ]);
+});
+
+test("explicit technical corruption retains the previous render", () => {
+  const decision = resolveEnhancedDeliveryDecision({
+    gateReasons: ["source-regression", "duration-mismatch"],
+    previousRankingScore: 120,
+    enhancedRankingScore: 5,
+  });
+
+  assert.equal(decision.deliverEnhanced, false);
+  assert.equal(decision.advisoryPreferredCandidate, "enhanced");
+  assert.deepEqual(decision.technicalSafetyReasons, ["duration-mismatch"]);
+  assert.deepEqual(decision.qualityAdvisoryReasons, ["source-regression"]);
 });
 
 test("qc-unavailable fallback chooses rendered cinematic candidate when all QC failed", () => {

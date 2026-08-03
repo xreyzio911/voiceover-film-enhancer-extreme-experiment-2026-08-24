@@ -46,6 +46,7 @@ import {
 } from "../lib/plannerDelivery";
 import {
   AUDIBILITY_SAFE_STRATEGY_LABEL,
+  ENHANCED_LINEAR_RECOVERY_STRATEGY_LABEL,
   PLANNER_TAIL_SAFE_STRATEGY_LABEL,
   applyCandidateMeasurementWindowSummary,
   buildCandidateScoreFromAnalysis,
@@ -53,7 +54,11 @@ import {
   compareCandidateScores,
   isHealthySegmentedRender,
   resolveNextAudibilityFallbackIndex,
+  resolveEnhancedDeliveryDecision,
+  resolveRequestedEnhancedLinearRecoverySelection,
   selectQcUnavailableFallbackCandidate,
+  shouldRequestEnhancedLinearRecoveryForCandidate,
+  shouldRunSourceSafeRecoveryForCandidate,
   summarizeCandidateScore,
   type CandidateRenderMeta,
   type CandidateMeasurementWindowSummary,
@@ -68,10 +73,10 @@ import {
   REVIEW_WEIGHT_STORAGE_KEY,
   autoReviewBundle,
   buildReviewMetricDelta,
+  claimCorrectivePassForFile,
   estimateAlignmentMetrics,
   interleavedToMono,
   parseLearnedReviewWeights,
-  resolveCorrectiveMaxFilesPerBatch,
   scoreCandidateWithLearnedWeights,
   shouldAttemptCorrectivePassForAssessment,
   toReviewMetricSnapshot,
@@ -192,10 +197,10 @@ const LEVELER_PRESETS = {
 } as const;
 
 const LEVELER_CONSISTENCY = {
-  "Minimal (no auto-leveler)": 0.15,
-  Gentle: 0.45,
-  Balanced: 0.65,
-  Firm: 0.85,
+  "Minimal (no auto-leveler)": 0.1,
+  Gentle: 0.25,
+  Balanced: 0.35,
+  Firm: 0.65,
 } as const;
 
 const SMART_MATCH_PRESETS = {
@@ -215,7 +220,7 @@ const DISTRIBUTED_ANALYSIS_TARGET_COUNT = 6;
 // cannot become a WASM out-of-memory failure or fake 100% risk score.
 const BOUNDED_CANDIDATE_QC_MIN_SECONDS = 600;
 const BOUNDED_CANDIDATE_QC_MIN_BYTES = 96 * 1024 * 1024;
-const BOUNDED_CANDIDATE_QC_MIN_COMBINED_BYTES = 112 * 1024 * 1024;
+const BOUNDED_CANDIDATE_QC_MIN_COMBINED_BYTES = 40 * 1024 * 1024;
 const BOUNDED_CANDIDATE_QC_WINDOW_SECONDS = 30;
 const BOUNDED_CANDIDATE_QC_TARGET_COUNT = 6;
 const MIX_SEGMENT_SECONDS = 75;
@@ -280,7 +285,6 @@ const HEAD_PRIME_SECONDS = 1.0;
 const HEAD_PRIME_DURATION_TOLERANCE_SECONDS = 0.05;
 const POST_RENDER_REVIEW_MAX_REQUESTS = 6;
 const MAX_CORRECTIVE_PASSES = 1;
-const CORRECTIVE_WIN_MARGIN = 25;
 // Routing boundary, not a quality gate: larger delivery WAVs use the bounded
 // Blob-slice implementation instead of materializing several full-size arrays.
 const FINAL_CONSONANT_TAMER_MAX_BYTES = 64 * 1024 * 1024;
@@ -430,6 +434,8 @@ type OutputEntry = {
   variant: "clean" | "blend";
   processingFlow: "app" | "app-final-polish";
   sourcePreservingFallback?: boolean;
+  sourceSafeRecovery?: boolean;
+  protectedRecovery?: boolean;
   sourceBase?: string;
   sourceName?: string;
   partIndex?: number;
@@ -437,6 +443,18 @@ type OutputEntry = {
   /** Same-domain evidence that bounds any later positive batch scalar. */
   deliverySafetyEvidence?: PlannerDeliverySafetyEvidence | null;
 };
+
+const isProtectedOutputEntry = (
+  entry: Pick<
+    OutputEntry,
+    "sourcePreservingFallback" | "sourceSafeRecovery" | "protectedRecovery"
+  >,
+) =>
+  Boolean(
+    entry.sourcePreservingFallback ||
+      entry.sourceSafeRecovery ||
+      entry.protectedRecovery,
+  );
 
 type ReviewBundleAsset = {
   path: string;
@@ -1888,7 +1906,9 @@ const summarizeFailureReason = (error: unknown) => {
       durationSec: number;
     }>,
   ): Promise<PlannedGain | null> => {
-    if (!getActiveAudioReviewControls().gainPlannerEnabled) return null;
+    const activeControls = getActiveAudioReviewControls();
+    if (!activeControls.gainPlannerEnabled) return null;
+    const activeLeveler = getLevelerForControls(activeControls);
     const plannerDurationSeconds = range?.durationSec ?? durationSeconds;
     if (
       plannerDurationSeconds !== null &&
@@ -2060,6 +2080,7 @@ const summarizeFailureReason = (error: unknown) => {
         targetDb: plannerTargetDb,
         sourceTargetBlend: 0.1,
         maxGainDb: plannerMaxGainDb,
+        levelingConsistency: LEVELER_CONSISTENCY[activeLeveler],
         coldOpenLiftToleranceDb: 1.5 - headGuardBoost * 0.5,
         coldOpenLiftMaxDb: 5 + headGuardBoost * 1.5,
         peakCeilingDb: -3,
@@ -2137,6 +2158,7 @@ const summarizeFailureReason = (error: unknown) => {
   const PLANNER_APPLY_SAMPLE_RATE = 48000;
   const AUDIBILITY_GUARD_SAMPLE_RATE = 16000;
   const AUDIBILITY_GUARD_FRAME_MS = 20;
+  const AUDIBILITY_GUARD_MAX_ALIGNMENT_MS = 250;
   const AUDIBILITY_GUARD_MAX_DURATION_SECONDS = 1800;
   // Audibility is a speech-presence question. Measuring the same band on the
   // candidate input and render keeps low-frequency thumps, handling noise, and
@@ -3390,8 +3412,13 @@ const summarizeFailureReason = (error: unknown) => {
     );
     // inputBytes is retained by the caller as the deliverable. Removing the
     // duplicate full WAV from WASM before analysis is what avoids Arthur's
-    // prior memory fault; retries below restore only one small exact window.
+    // prior memory fault. A MEMFS unlink cannot shrink the worker's already-
+    // grown linear heap, so start the sampled analysis on a clean worker too;
+    // retries below restore only one small exact window. If that refresh cannot
+    // load, refreshFfmpeg preserves the old worker and the caller still keeps
+    // the exact candidate bytes for advisory-QC fallback delivery.
     await safeDeleteFile(ffmpeg, inputName);
+    ffmpeg = await refreshFfmpeg(`bounded candidate QC clean worker on ${sanitizeBase(inputName)}`);
 
     const windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }> = [];
     let windowRetryCount = 0;
@@ -4777,6 +4804,8 @@ const summarizeFailureReason = (error: unknown) => {
       | "partIndex"
       | "partTotal"
       | "sourcePreservingFallback"
+      | "sourceSafeRecovery"
+      | "protectedRecovery"
       | "deliverySafetyEvidence"
     > = {},
   ): Promise<OutputEntry> => {
@@ -5484,6 +5513,7 @@ const summarizeFailureReason = (error: unknown) => {
     Boolean(
       meta &&
         (meta.degradeReasons.includes("audibility-dropout-guard") ||
+          meta.degradeReasons.includes("source-safe-recovery") ||
           meta.strategyLabel === PLANNER_TAIL_SAFE_STRATEGY_LABEL ||
           meta.strategyLabel === AUDIBILITY_SAFE_STRATEGY_LABEL),
     );
@@ -5838,13 +5868,13 @@ const summarizeFailureReason = (error: unknown) => {
     };
 
     for (const entry of outputEntries) {
-      if (entry.kind === "mixready" && entry.sourcePreservingFallback) {
-        appendLog(`[BatchAlign] ${entry.name}: excluded (source-preserving planner fallback).`);
+      if (entry.kind === "mixready" && isProtectedOutputEntry(entry)) {
+        appendLog(`[BatchAlign] ${entry.name}: excluded (protected recovery/fallback).`);
       }
     }
     const targets = outputEntries
       .map((entry, index) => ({ entry, index }))
-      .filter(({ entry }) => entry.kind === "mixready" && !entry.sourcePreservingFallback)
+      .filter(({ entry }) => entry.kind === "mixready" && !isProtectedOutputEntry(entry))
       .map(({ entry, index }) => ({ entry, index, groupId: buildGroupId(entry) }));
     if (targets.length < 2) {
       appendLog("[BatchAlign] skipped (fewer than 2 mix-ready outputs).");
@@ -6098,9 +6128,9 @@ const summarizeFailureReason = (error: unknown) => {
   ): Promise<OutputEntry[]> => {
     for (let index = 0; index < outputEntries.length; index += 1) {
       const entry = outputEntries[index];
-      if (entry.sourcePreservingFallback) {
+      if (isProtectedOutputEntry(entry)) {
         appendLog(
-          `[FinalPeakTamer] ${entry.name}: source-preserving planner fallback; original bytes kept.`,
+          `[FinalPeakTamer] ${entry.name}: protected recovery/fallback; selected bytes kept.`,
         );
         continue;
       }
@@ -7098,7 +7128,9 @@ const summarizeFailureReason = (error: unknown) => {
     const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = options?.sourcePassthroughChain
       ? [
           {
-            label: "source-preserving passthrough",
+            label: options.disableLimiter === true
+              ? "source-preserving passthrough"
+              : ENHANCED_LINEAR_RECOVERY_STRATEGY_LABEL,
             options: {
               candidateVariant: "source-safe",
               disableRoomCleanup: true,
@@ -7109,7 +7141,7 @@ const summarizeFailureReason = (error: unknown) => {
               skipSpeechSegmentation: true,
               sourceSafeChain: true,
               sourcePassthroughChain: true,
-              disableLimiter: true,
+              disableLimiter: options.disableLimiter === true,
               disableTailGate: true,
               disableSpikeTamers: true,
             },
@@ -7239,7 +7271,7 @@ const summarizeFailureReason = (error: unknown) => {
           sourceFrameDb: sourceAudibilityFrameDb,
           renderedFrameDb,
           frameMs: AUDIBILITY_GUARD_FRAME_MS,
-          maxAlignmentMs: 60,
+          maxAlignmentMs: AUDIBILITY_GUARD_MAX_ALIGNMENT_MS,
         });
         if (alignedResult.alignmentOffsetMs !== 0) {
           appendLog(
@@ -7386,7 +7418,8 @@ const summarizeFailureReason = (error: unknown) => {
             renderPath === "speech-aligned-segmented" ||
             renderPath === "fixed-segmented") &&
           !reasons.includes("segment-render-memory-fault") &&
-          !reasons.includes("single-pass-recovery"),
+          !reasons.includes("single-pass-recovery") &&
+          !reasons.includes("audibility-dropout-guard"),
         degraded: reasons.length > 0,
         degradeReasons: reasons,
         analysisWindowsAttempted: 0,
@@ -7859,10 +7892,9 @@ const summarizeFailureReason = (error: unknown) => {
       // Reset on every refresh; drives the duration-aware recycling.
       let workerCumulativeAudioSec = 0;
       let postRenderReviewRequests = 0;
-      let correctiveRenderAttempts = 0;
-      const correctiveRenderBudget = resolveCorrectiveMaxFilesPerBatch(jobs.length);
+      let correctiveAttemptedFiles: ReadonlySet<string> = new Set();
       appendLog(
-        `[Corrective] batch render budget ${correctiveRenderBudget}/${jobs.length} file(s) (40% cap, minimum 2).`,
+        `[Corrective] per-file ownership active: each independently triggered file may use one bounded corrective pass.`,
       );
       let i = 0;
       while (i < jobs.length) {
@@ -8104,7 +8136,7 @@ const summarizeFailureReason = (error: unknown) => {
               `[FinalPeakTamer] ${job.base}: retained compact 16 kHz planner reference for final delivery.`,
             );
           }
-          const candidateVariants: CandidateVariant[] = plannerContext.sourcePreservingFallback
+          let candidateVariants: CandidateVariant[] = plannerContext.sourcePreservingFallback
             ? ["source-safe"]
             : buildMixCandidateVariants(profile, fileDurationForVariants);
           const isLongFile =
@@ -8124,6 +8156,7 @@ const summarizeFailureReason = (error: unknown) => {
           let attemptedCandidates = 0;
           let degradedCandidates = 0;
           let candidateQcMemoryFailed = false;
+          let enhancedLinearRecoveryRequested = false;
           const candidateArtifacts: CandidateReviewArtifact[] = [];
 
           for (let variantIndex = 0; variantIndex < candidateVariants.length; variantIndex += 1) {
@@ -8138,22 +8171,32 @@ const summarizeFailureReason = (error: unknown) => {
             }
             const candidateLabel = formatCandidateVariant(candidateVariant);
             const candidateName = `${job.base}_${candidateLabel.replace(/-/g, "_")}_candidate.wav`;
+            const enhancedLinearRecovery =
+              enhancedLinearRecoveryRequested &&
+              candidateVariant === "source-safe" &&
+              !plannerContext.sourcePreservingFallback;
             const candidateOptions: MixRenderOptions = {
               candidateVariant,
               skipSpeechSegmentation:
                 plannerContext.sourcePreservingFallback ||
+                enhancedLinearRecovery ||
                 candidateVariant === "source-safe" ||
                 (candidateVariant === "continuity-safe" && (profile?.preferSinglePassContinuity ?? false)),
               sourceSafeChain: candidateVariant === "source-safe",
               disableRoomCleanup: candidateVariant === "source-safe" ? true : undefined,
               disableAdaptiveNoiseReduction: candidateVariant === "source-safe" ? true : undefined,
-              sourcePassthroughChain: plannerContext.sourcePreservingFallback,
+              // Requested linear recovery is a single, dynamics-off peak-safety pass.
+              // It deliberately bypasses the normal profile high-pass because
+              // that filter can remove low-register performance content on the
+              // exact source that required recovery. The no-plan fallback stays
+              // a truthful decoded passthrough with its limiter disabled.
+              sourcePassthroughChain: plannerContext.sourcePreservingFallback || enhancedLinearRecovery,
               disableLimiter: plannerContext.sourcePreservingFallback,
-              disableGainPlanner: plannerContext.sourcePreservingFallback,
-              disableHeadPriming: plannerContext.sourcePreservingFallback,
-              disableSegmentGainMatch: plannerContext.sourcePreservingFallback,
-              disableTailGate: plannerContext.sourcePreservingFallback,
-              disableSpikeTamers: plannerContext.sourcePreservingFallback,
+              disableGainPlanner: plannerContext.sourcePreservingFallback || enhancedLinearRecovery,
+              disableHeadPriming: plannerContext.sourcePreservingFallback || enhancedLinearRecovery,
+              disableSegmentGainMatch: plannerContext.sourcePreservingFallback || enhancedLinearRecovery,
+              disableTailGate: plannerContext.sourcePreservingFallback || enhancedLinearRecovery,
+              disableSpikeTamers: plannerContext.sourcePreservingFallback || enhancedLinearRecovery,
             };
             try {
               const renderResult = await renderMixReadyWithFallbacks(
@@ -8362,6 +8405,34 @@ const summarizeFailureReason = (error: unknown) => {
                   candidateMeta
                 )}.`
               );
+              const objectiveLinearRecoveryRequested =
+                shouldRunSourceSafeRecoveryForCandidate({
+                  meta: candidateMeta,
+                  gateReasons: ranking.gateReasons,
+                });
+              const advisoryLinearRecoveryRequested =
+                shouldRequestEnhancedLinearRecoveryForCandidate(
+                  ranking.gateReasons,
+                );
+              if (
+                !plannerContext.sourcePreservingFallback &&
+                !enhancedLinearRecoveryRequested &&
+                (objectiveLinearRecoveryRequested ||
+                  advisoryLinearRecoveryRequested)
+              ) {
+                enhancedLinearRecoveryRequested = true;
+                candidateVariants = [...candidateVariants, "source-safe"];
+                appendLog(
+                  advisoryLinearRecoveryRequested &&
+                    !objectiveLinearRecoveryRequested
+                    ? `[CandidateQC] ${job.base}/${candidateLabel}: adaptive tail/source quality evidence requested one enhanced linear recovery (${ranking.gateReasons.join(
+                        ", ",
+                      )}); scheduling limiter-on, dynamics-off single-pass recovery.`
+                    : `[CandidateQC] ${job.base}/${candidateLabel}: objective render safety evidence requested one enhanced linear recovery (${ranking.gateReasons.join(
+                        ", ",
+                      )}); scheduling limiter-on, dynamics-off single-pass recovery.`,
+                );
+              }
               if (candidateMeta.degraded) {
                 degradedCandidates += 1;
               }
@@ -8439,14 +8510,87 @@ const summarizeFailureReason = (error: unknown) => {
             throw new Error("No candidate mix-ready render completed.");
           }
 
+          const selectedBeforeLinearRecovery =
+            candidateArtifacts.find((artifact) => artifact.bytes === selectedBytes) ??
+            candidateArtifacts.find((artifact) => artifact.variant === selectedVariant) ??
+            null;
+          const selectedObjectiveLinearRecoveryRequested = Boolean(
+            selectedBeforeLinearRecovery &&
+              shouldRunSourceSafeRecoveryForCandidate({
+                meta: selectedBeforeLinearRecovery.meta,
+                gateReasons: selectedBeforeLinearRecovery.ranking.gateReasons,
+              }),
+          );
+          const selectedAdvisoryLinearRecoveryRequested = Boolean(
+            selectedBeforeLinearRecovery &&
+              shouldRequestEnhancedLinearRecoveryForCandidate(
+                selectedBeforeLinearRecovery.ranking.gateReasons,
+              ),
+          );
+          const selectedLinearRecoveryRequested =
+            selectedObjectiveLinearRecoveryRequested ||
+            selectedAdvisoryLinearRecoveryRequested;
+          if (selectedBeforeLinearRecovery && selectedLinearRecoveryRequested) {
+            const enhancedLinearRecoveryArtifact =
+              candidateArtifacts.find((artifact) => {
+                if (
+                  artifact.meta.strategyLabel !==
+                  ENHANCED_LINEAR_RECOVERY_STRATEGY_LABEL
+                ) {
+                  return false;
+                }
+                const linearRecoverySelection =
+                  resolveRequestedEnhancedLinearRecoverySelection({
+                    recoveryRequested: true,
+                    recoveryGateReasons: artifact.ranking.gateReasons,
+                  });
+                return linearRecoverySelection.select;
+              }) ?? null;
+            if (enhancedLinearRecoveryArtifact) {
+              selectedVariant = enhancedLinearRecoveryArtifact.variant;
+              selectedBytes = enhancedLinearRecoveryArtifact.bytes;
+              selectedScore = enhancedLinearRecoveryArtifact.scoredScore;
+              selectedAnalysis = enhancedLinearRecoveryArtifact.analysis;
+              selectedFinalPolishEvidence =
+                enhancedLinearRecoveryArtifact.finalPolishEvidence;
+              selectedMeta = {
+                ...enhancedLinearRecoveryArtifact.meta,
+                degraded: true,
+                degradeReasons: Array.from(
+                  new Set([
+                    ...enhancedLinearRecoveryArtifact.meta.degradeReasons,
+                    "source-safe-recovery",
+                  ]),
+                ),
+              };
+              const advisoryOnlyRecovery =
+                selectedAdvisoryLinearRecoveryRequested &&
+                !selectedObjectiveLinearRecoveryRequested;
+              selectedReason = advisoryOnlyRecovery
+                ? "enhanced linear recovery after advisory tail/source damage"
+                : "enhanced linear recovery after objective render corruption";
+              appendLog(
+                advisoryOnlyRecovery
+                  ? `[CandidateSelect] ${job.base}: selected the requested enhanced linear recovery after adaptive tail/source evidence (${selectedBeforeLinearRecovery.ranking.gateReasons.join(
+                      ", ",
+                    )}); advisory ranking cannot cancel this technically valid recovery.`
+                  : `[CandidateSelect] ${job.base}: replaced objectively invalid render with enhanced linear recovery after ${selectedBeforeLinearRecovery.ranking.gateReasons.join(
+                      ", ",
+                    )}.`,
+              );
+            }
+          }
+
           const selectedArtifact =
-            candidateArtifacts.find((artifact) => artifact.variant === selectedVariant) ?? null;
+            candidateArtifacts.find((artifact) => artifact.bytes === selectedBytes) ??
+            candidateArtifacts.find((artifact) => artifact.variant === selectedVariant) ??
+            null;
           if (selectedArtifact) {
             selectedArtifact.selectionReason = selectedReason;
           }
           const challengerArtifact =
             [...candidateArtifacts]
-              .filter((artifact) => artifact.variant !== selectedVariant)
+              .filter((artifact) => artifact !== selectedArtifact)
               .filter((artifact) => !(artifact.scoredScore.gateReasons ?? []).includes("qc-unavailable"))
               .sort((left, right) => compareCandidateScores(left.scoredScore, right.scoredScore))[0] ?? null;
           let finalReviewChallengerArtifact = challengerArtifact;
@@ -8481,16 +8625,22 @@ const summarizeFailureReason = (error: unknown) => {
             }.`
           );
           appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
-          const selectedSourcePreservingFallback = plannerContext.sourcePreservingFallback;
+          const selectedSourceSafeRecovery =
+            selectedMeta?.degradeReasons.includes("source-safe-recovery") === true;
+          const selectedSourcePreservingFallback =
+            plannerContext.sourcePreservingFallback ||
+            selectedSourceSafeRecovery;
           const selectedAudibilityProtected = isAudibilityProtectedRender(selectedMeta);
           let outputProcessingFlow: OutputEntry["processingFlow"] = "app";
           if (selectedSourcePreservingFallback) {
             appendLog(
-              `[FinalPolish] ${job.base}: final polish skipped; planner produced no usable gain plan, so the source-preserving fallback remains untouched.`,
+              selectedSourceSafeRecovery
+                ? `[FinalPolish] ${job.base}: final polish skipped; requested enhanced linear recovery remains untouched.`
+                : `[FinalPolish] ${job.base}: final polish skipped; planner produced no usable gain plan, so the source-preserving fallback remains untouched.`,
             );
           } else if (selectedAudibilityProtected) {
             appendLog(
-              `[FinalPolish] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`,
+              `[FinalPolish] ${job.base}: skipped because a source-safe recovery render was selected.`,
             );
           } else {
             const selectedPolishFfmpeg = ffmpeg;
@@ -8690,10 +8840,12 @@ const summarizeFailureReason = (error: unknown) => {
 
           if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedSourcePreservingFallback) {
             appendLog(
-              `[Corrective] ${job.base}: corrective processing skipped; planner produced no usable gain plan and the source-preserving fallback must remain untouched.`,
+              selectedSourceSafeRecovery
+                ? `[Corrective] ${job.base}: corrective processing skipped; requested enhanced linear recovery must remain untouched.`
+                : `[Corrective] ${job.base}: corrective processing skipped; planner produced no usable gain plan and the source-preserving fallback must remain untouched.`,
             );
           } else if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedAudibilityProtected) {
-            appendLog(`[Corrective] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`);
+            appendLog(`[Corrective] ${job.base}: skipped because a source-safe recovery render was selected.`);
           }
 
           if (
@@ -8741,13 +8893,13 @@ const summarizeFailureReason = (error: unknown) => {
               appendLog(
                 `[Corrective] ${job.base}: sampled QC remains advisory; original render kept instead of applying a file-wide retry (${correctiveTriggerSummary}).`,
               );
-            } else if (shouldTryCorrective && correctiveRenderAttempts >= correctiveRenderBudget) {
+            } else if (shouldTryCorrective && correctiveAttemptedFiles.has(job.base)) {
               appendLog(
-                `[Corrective] ${job.base}: skipped by batch budget ${correctiveRenderAttempts}/${correctiveRenderBudget} (${correctiveTriggerSummary}).`,
+                `[Corrective] ${job.base}: skipped because this file already used its one bounded corrective pass (${correctiveTriggerSummary}).`,
               );
             } else if (shouldTryCorrective) {
               appendLog(
-                `[Corrective] ${job.base}: trigger accepted (${correctiveTriggerSummary}; budget ${correctiveRenderAttempts}/${correctiveRenderBudget} used).`,
+                `[Corrective] ${job.base}: trigger accepted (${correctiveTriggerSummary}; per-file pass available).`,
               );
               const baseDirectives = getActiveAudioReviewAdaptiveDirectives();
               let correctiveDirectives = mergeAudioReviewAdaptiveDirectives(
@@ -8791,9 +8943,10 @@ const summarizeFailureReason = (error: unknown) => {
               }
 
               if (hasNonTrivialAdaptiveDirectives(correctiveDirectives, baseDirectives)) {
-                correctiveRenderAttempts += 1;
+                const correctiveClaim = claimCorrectivePassForFile(correctiveAttemptedFiles, job.base);
+                correctiveAttemptedFiles = correctiveClaim.attemptedFiles;
                 appendLog(
-                  `[Corrective] ${job.base}: using render budget ${correctiveRenderAttempts}/${correctiveRenderBudget}.`,
+                  `[Corrective] ${job.base}: using its one bounded corrective pass.`,
                 );
                 const previousDirectives: AudioReviewAdaptiveDirectives | null = aiAdaptiveDirectivesOverrideRef.current;
                 const correctiveName = `${job.base}_corrective_candidate.wav`;
@@ -8837,7 +8990,7 @@ const summarizeFailureReason = (error: unknown) => {
                     "app";
                   if (isAudibilityProtectedRender(correctiveResult.meta)) {
                     appendLog(
-                      `[FinalPolish] ${job.base}: skipped corrective final app polish because audibility guard selected a source-safe recovery render.`,
+                      `[FinalPolish] ${job.base}: skipped corrective final app polish because a source-safe recovery render was selected.`,
                     );
                   } else {
                     const correctiveBytesBeforePolish = await readVirtualFileBytes(ffmpeg, correctiveName);
@@ -8961,10 +9114,16 @@ const summarizeFailureReason = (error: unknown) => {
                   );
                   const originalRank = selectedPostPolishArtifact.scoredScore.rankingScore ?? selectedPostPolishArtifact.scoredScore.total;
                   const correctiveRank = correctiveArtifact.scoredScore.rankingScore ?? correctiveArtifact.scoredScore.total;
-                  const correctiveWins =
-                    correctiveArtifact.ranking.gateReasons.length === 0 &&
-                    correctiveRank <= originalRank - CORRECTIVE_WIN_MARGIN;
-                  if (correctiveWins) {
+                  const deliveryDecision = resolveEnhancedDeliveryDecision({
+                    gateReasons: correctiveArtifact.ranking.gateReasons,
+                    previousRankingScore: originalRank,
+                    enhancedRankingScore: correctiveRank,
+                  });
+                  const {
+                    technicalSafetyReasons,
+                    qualityAdvisoryReasons,
+                  } = deliveryDecision;
+                  if (deliveryDecision.deliverEnhanced) {
                     await ffmpeg.writeFile(job.mixName, cloneBytes(correctiveBytes));
                     selectedBytes = correctiveBytes;
                     selectedAnalysis = correctiveArtifact.analysis;
@@ -8973,7 +9132,7 @@ const summarizeFailureReason = (error: unknown) => {
                     selectedScore = correctiveArtifact.scoredScore;
                     selectedMeta = correctiveArtifact.meta;
                     outputProcessingFlow = correctiveProcessingFlow;
-                    selectedReason = `corrective pass kept (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points)`;
+                    selectedReason = `corrective pass kept after advisory comparison (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points)`;
                     if (canEmitPerFileReviewBundle) {
                       finalReviewChallengerArtifact = selectedPostPolishArtifact;
                     } else {
@@ -8982,17 +9141,19 @@ const summarizeFailureReason = (error: unknown) => {
                       );
                     }
                     appendLog(
-                      `[Corrective] ${job.base}: kept corrective render triggered by ${postAutoReview.issueTags.join(
+                      `[Corrective] ${job.base}: kept corrective render after advisory comparison triggered by ${postAutoReview.issueTags.join(
                         ", ",
-                      ) || "auto-review"} (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points).`,
+                      ) || "auto-review"} (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points; advisories ${
+                        qualityAdvisoryReasons.join(", ") || "none"
+                      }).`,
                     );
                   } else {
                     await ffmpeg.writeFile(job.mixName, cloneBytes(selectedPostPolishBytes));
                     appendLog(
-                      `[Corrective] ${job.base}: discarded corrective render triggered by ${postAutoReview.issueTags.join(
+                      `[Corrective] ${job.base}: retained original after corrective technical safety fallback triggered by ${postAutoReview.issueTags.join(
                         ", ",
-                      ) || "auto-review"} (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points; gates ${
-                        correctiveArtifact.ranking.gateReasons.join(", ") || "none"
+                      ) || "auto-review"} (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points; technical reasons ${
+                        technicalSafetyReasons.join(", ")
                       }).`,
                     );
                   }
@@ -9091,11 +9252,29 @@ const summarizeFailureReason = (error: unknown) => {
             };
           }
 
-          if (shouldEmitMixReadyOutput(loudnessConfig !== null) || selectedSourcePreservingFallback) {
+          // Corrective selection can replace selectedMeta after the earlier polish/retry
+          // guards ran. Re-derive delivery protection from that final artifact so a
+          // newly accepted recovery cannot enter any later byte mutation path.
+          const finalSelectedSourceSafeRecovery =
+            selectedMeta?.degradeReasons.includes("source-safe-recovery") === true;
+          const finalSelectedAudibilityProtected = isAudibilityProtectedRender(selectedMeta);
+          const finalSelectedSourcePreservingFallback = plannerContext.sourcePreservingFallback;
+          const finalSelectedProtectedRecovery =
+            !finalSelectedSourcePreservingFallback &&
+            !finalSelectedSourceSafeRecovery &&
+            finalSelectedAudibilityProtected;
+          const finalSelectedDeliveryProtected =
+            finalSelectedSourcePreservingFallback ||
+            finalSelectedSourceSafeRecovery ||
+            finalSelectedProtectedRecovery;
+
+          if (shouldEmitMixReadyOutput(loudnessConfig !== null) || finalSelectedDeliveryProtected) {
             const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean", outputProcessingFlow, {
               sourceBase: job.base,
               sourceName: job.file.name,
-              sourcePreservingFallback: selectedSourcePreservingFallback,
+              sourcePreservingFallback: finalSelectedSourcePreservingFallback,
+              sourceSafeRecovery: finalSelectedSourceSafeRecovery,
+              protectedRecovery: finalSelectedProtectedRecovery,
               deliverySafetyEvidence:
                 selectedFinalPolishEvidence?.plannerDeliverySafetyEvidence ??
                 null,
@@ -9106,7 +9285,7 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          if (sceneBlend && !selectedSourcePreservingFallback) {
+          if (sceneBlend && !finalSelectedDeliveryProtected) {
             const indoorGain = profile?.blendIndoorGain ?? 0;
             const outdoorGain = profile?.blendOutdoorGain ?? 0;
             if (indoorGain + outdoorGain <= 0.0001) {
@@ -9155,7 +9334,7 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          if (loudnessConfig && !selectedSourcePreservingFallback) {
+          if (loudnessConfig && !finalSelectedDeliveryProtected) {
             cleanLoudName = `${job.base}_${loudnessConfig.suffix}.wav`;
             setStatus(`Loudness clean: ${job.base} (${i + 1}/${jobs.length})`);
             setActiveQueueStage(job.base, "Loudness (clean)", `File ${i + 1} of ${jobs.length}`);
@@ -9186,9 +9365,13 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          if (selectedSourcePreservingFallback) {
+          if (finalSelectedDeliveryProtected) {
             appendLog(
-              `[PlannerFallback] ${job.base}: emitted one decoded 48 kHz float source-preserving output; scene blend, loudness normalization, batch alignment, and final consonant residual are excluded.`,
+              finalSelectedSourceSafeRecovery
+                ? `[EnhancedLinearRecovery] ${job.base}: emitted one decoded 48 kHz float limiter-on, dynamics-off enhanced linear recovery requested by adaptive review; profile high-pass, planner, compression, gating, scene blend, loudness normalization, batch alignment, and final consonant residual are excluded.`
+                : plannerContext.sourcePreservingFallback
+                  ? `[PlannerFallback] ${job.base}: emitted one decoded 48 kHz float source-preserving output; scene blend, loudness normalization, batch alignment, and final consonant residual are excluded.`
+                  : `[ProtectedRecovery] ${job.base}: emitted the selected audibility-protected recovery unchanged; corrective recursion, scene blend, loudness normalization, batch alignment, and final consonant residual are excluded.`,
             );
           }
           markQueueDone(job.base, "Outputs ready");
@@ -9454,6 +9637,8 @@ const summarizeFailureReason = (error: unknown) => {
       variant: output.variant,
       processingFlow: output.processingFlow,
       sourcePreservingFallback: output.sourcePreservingFallback === true,
+      sourceSafeRecovery: output.sourceSafeRecovery === true,
+      protectedRecovery: output.protectedRecovery === true,
       sizeBytes: output.size,
     })),
   });
@@ -10177,7 +10362,11 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={`${styles.outputList} ${styles.sectionTop}`}>
             {outputs.length === 0 && <div className={styles.dropHint}>No output yet.</div>}
             {outputs.map((output, index) => {
-              const outputHelpText = output.sourcePreservingFallback
+              const outputHelpText = output.sourceSafeRecovery
+                ? "Enhanced linear recovery: adaptive review requested one limiter-on, dynamics-off single-pass render from the decoded source. Normal profile high-pass, planner, compression, gating, and later mastering transforms were excluded."
+                : output.protectedRecovery
+                ? "Protected recovery: an audibility-safe recovery render was selected and kept unchanged through later mastering transforms."
+                : output.sourcePreservingFallback
                 ? "Source-preserving fallback: the gain planner returned no usable plan, so no adaptive enhancement or later mastering transform was applied."
                 : output.kind === "mixready"
                 ? output.variant === "blend"
@@ -10199,8 +10388,14 @@ const summarizeFailureReason = (error: unknown) => {
                     {output.processingFlow === "app-final-polish" && (
                       <span className={styles.outputBadge}>Final app polish</span>
                     )}
-                    {output.sourcePreservingFallback && (
-                      <span className={styles.outputBadge}>Source preserved</span>
+                    {isProtectedOutputEntry(output) && (
+                      <span className={styles.outputBadge}>
+                        {output.sourceSafeRecovery
+                          ? "Enhanced linear recovery"
+                          : output.protectedRecovery
+                            ? "Protected recovery"
+                            : "Source preserved"}
+                      </span>
                     )}
                     {output.kind === "mixready" ? (
                       <>

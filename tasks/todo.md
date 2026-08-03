@@ -351,3 +351,44 @@
 - Dark and light subtle text measured 4.78:1 and 5.29:1 in the brightest plausible glass regions; dense review metadata measured 5.10:1 and 4.59:1. Reduced transparency rendered a solid theme surface with no backdrop filter.
 - Escape closed the panel and restored trigger focus, outside click closed it, and six rapid toggles settled closed without console or dev-server errors. Reduced motion removed transform movement while retaining a 150 ms opacity cue.
 - Independent reviewers confirmed the theme treatment, accessibility wiring, cross-browser fallback, and desktop visual quality. The layer intentionally covers the lower action/cards while open because that is the user-annotated below-button target region; those controls return immediately on close, and live geometry supplements the static source contract.
+# Adaptive Cinematic Stability and Body Upgrade
+
+## Checklist
+
+- [x] Preserve the active dirty worktree, read the repository contracts, map the planner/render/selection paths, and inventory all local VO fixtures.
+- [x] Freeze the current software baseline with `npm run test:audio-qc` and identify the 31 practical source/output corpus pairs.
+- [x] Build and run one durable all-corpus measurement ledger for slow rise/fall drift, processing-added spikes, speech-body density, and expressive-transient retention.
+- [x] Complete the repository-aware Kimi K3 audio-engineering consultation and verify its consequential suggestions against source and tests.
+- [x] Run session-only Gemini 3.6 Flash paired-audio auditions at its highest supported thinking level, requesting detailed cinematic/taste and technical DSP feedback on representative affected and control renders.
+- [x] Add RED regressions for processing-added trend/spike defects, source-adaptive body recovery, onomatopoeia protection, fail-soft evidence, and soft enhanced-candidate delivery.
+- [x] Implement the smallest continuous planner/final-policy correction plus only proven low-risk complexity fixes; add no parallel dynamics stack.
+- [x] Evaluate at most five single-hypothesis variants on the same 31-pair corpus, compare each with the accepted best, and stop when the remaining improvement is within measurement noise or risks performance flattening.
+- [x] Rerender the complete source corpus through the final app path, verify exact delivered WAVs, run focused/full tests, lint/build/diff checks, and complete independent correctness/audio/security review.
+
+## Final Evidence
+
+- Kimi K3's first max-reasoning review supported symmetric trend balancing, recurrent body-sag recovery, retained expressive/transient authority, lag-compensated metrics, and advisory-only quality comparison. Its bounded final review (`019fc3b0-60de-7662-93d0-9eddfc36a2eb`) returned conditional GO and independently found the same stale protected-state P1 as the code reviewer. That ship gate and the related recovery-label truthfulness issue were subsequently fixed and independently re-reviewed. The adopted changes stayed inside planner/recovery policy instead of adding a parallel dynamics stack.
+- Gemini 3.6 Flash high-thinking audition was external/session-only and advisory. Stable conclusions after challenged corrections were that the final Seth variant was preferred and the Rena defects were materially repaired; Tony preference was prompt-sensitive, so objective expressive evidence remained decisive. In the final SIMONE blind pass Gemini swapped the source and damaged-render identities; after the verified mapping was disclosed, it explicitly retracted those claims and judged the final recovery perceptually source-identical and promotion-safe. The failure and corrected conclusion are recorded in `gemini-review/reports/gemini-simone-final-v8.md`. No SDK/runtime/app integration or credential persistence was added, all 27 unique temporary Files API uploads were deleted after the reviews, and the session key was cleared.
+- Final recomputed 31-file / 8.55-hour ledger: `tasks/render-evidence/current-goal/voice-stability-final-v7-full.json` measured 31/31 exact source/result pairs with 0 errors. Median old -> final: drift `0.0837 -> 0.0275 dB/min`, upward spike P95 `6.592 -> 3.591 dB`, downward spike P95 `10.224 -> 3.814 dB`, body spread delta `-4.723 -> -2.394 dB`, expressive-retention P10 `0.437 -> 0.810`. Per-file wins: downward spikes `31/31`, upward spikes `29/31`, expression `26/31`, and body-spread preservation `27/31`.
+- SIMONE enhanced-linear recovery: the fixed-segmented output consistently showed `ending-damage+end-edge-dip+source-regression`; those findings request one limiter-on, dynamics/EQ/planner/segmentation-off enhanced linear candidate rather than rejecting enhancement or returning raw source. Advisory ranking cannot cancel the valid recovery. Final exact-tree metrics in `simone-exact-final-v8-stability.json` are lag `0 ms`, no processing-added spike events, body fill/spread `0.00/0.00 dB`, and expressive retention `1.00`. Final polish, corrective recursion, scene blend, loudnorm, batch alignment, and residual mutation are excluded from the protected bytes.
+- Long-file WASM proof: a 205.0 MiB / 18.7-minute render completed candidate and final sampled QC at `6/6` windows each after clean-worker rotation, with zero bounded-window fallbacks and exact enhanced delivery. `final-browser-proof-v7.json` records hashes and exact app-path evidence.
+- Seth remains an advisory tradeoff, not a hard fallback: down-spike P95 improved `21.11 -> 16.05 dB` and body fill improved `0.20 -> 3.42 dB`, while up-spike P95 and expressive retention worsened (`6.57 -> 8.34 dB`, `0.96 -> 0.63`). This did not meet the verified technical-corruption signature, so no broad source-regression cancellation was added.
+- Verification: focused recovery/audibility/contract tests passed, `npm run test:audio-qc` passed `464` tests with `1` intentional optional skip, `npx tsc --noEmit --pretty false` passed, ESLint passed with zero errors and two warnings only in an untracked diagnostic script, the production Next.js build passed with the pre-existing Audio Splitter NFT trace warning, and `git diff --check` reported only LF-to-CRLF notices.
+
+## Scope Boundaries
+
+- Preserve intentional actor dynamics, emphatic attacks, sustained exclamations, and onomatopoeias; correct only processing-added motion or source motion that becomes materially less intelligible.
+- Use continuous source-relative confidence and bounded gain authority. Add no compressor, gate, dynaudnorm, broad limiter, consonant tamer, neural enhancer, synthetic ambience, or new cloud provider.
+- Keep comparison and quality metrics advisory. A technically valid enhanced render remains deliverable even when a rank or quality score is worse; only true render/decode/byte failure, gross timing or duration corruption, erased speech, or peak/clipping safety can block it.
+- Preserve one input to one output, exact duration/alignment, consonants, tails, room-noise safety, clean/dry neutrality, private local WAVs, and all Audio Splitter-owned files.
+- Treat objective measurements and level-matched human audition as separate evidence. Do not claim subjective naturalness from metrics alone.
+- Keep Gemini review external to the product: read the user-supplied key only at call time, persist no credential, add no SDK/runtime/app integration, upload only the explicitly authorized audition pairs, and treat model listening judgments as advisory rather than a delivery gate.
+
+## Measured Search Contract
+
+- Operation: the active planner-owned mix-ready path plus its single static final polish.
+- Correctness gate: focused synthetic regressions, exact WAV geometry/peak/speech integrity, then the complete `test:audio-qc` suite.
+- Quality metrics: signed section/body trend, processing-added spike contrast/count, speech-body fill/spread, line/sentence stability, and retained source-relative expressive contrast.
+- Audition evidence: detailed paired original/enhanced Gemini review of cinematic tone, body, slow drift, sudden up/down motion, breaths, consonants, room continuity, fatigue, and onomatopoeia/emotional authority; keep this in a separate subjective ledger.
+- Search budget: baseline plus no more than five explainable single-hypothesis variants; no paid processing beyond the explicitly authorized session-only Gemini audition uploads.
+- Promotion: prefer the best measured safe variant only when the corpus improvement repeats, affected-tail behavior improves materially, expressive controls remain within tolerance, and rollback is a localized constant or helper removal.

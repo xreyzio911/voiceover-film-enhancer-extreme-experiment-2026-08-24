@@ -82,6 +82,12 @@ export type GainPlannerInput = {
    * source-blind localized attenuation inside a word.
    */
   speechSpikeTaming?: number;
+  /**
+   * 0..1 authority for equalizing normal body-speech runs. Lower values
+   * retain more source line-to-line contrast; very quiet speech continuously
+   * earns back enough authority for audibility. Defaults to 1.
+   */
+  levelingConsistency?: number;
 };
 
 /**
@@ -115,6 +121,8 @@ export type GainPlannerOutput = {
     bodyOwnershipAuthority: number;
     /** Attenuation withdrawn from the legacy transient plan; always 0..3.2 dB. */
     transientBodyRecoveryDb: number;
+    /** Source emphasis retained only by periodic, body-owned transient speech. */
+    transientRetainedAdvantageDb: number;
   }>;
   /** Computed expander depth in dB used for silences. */
   expanderDepthDb: number;
@@ -195,6 +203,11 @@ const QUIET_BODY_FLOOR_LOUDNESS_OFFSET_DB = 1.0;
 const QUIET_BODY_FLOOR_MAX_LIFT_DB = 3.5;
 const QUIET_BODY_FLOOR_HIGH_CREST_DB = 20;
 const QUIET_BODY_FLOOR_EXTREME_CREST_DB = 24;
+// The audibility return is deliberately logistic: every source level has a
+// continuous response, while body speech around 18 dB below target begins to
+// recover most of the consistency deliberately withheld for actor contrast.
+const BODY_LEVELING_AUDIBILITY_CENTER_BELOW_TARGET_DB = 18;
+const BODY_LEVELING_AUDIBILITY_WIDTH_DB = 2.5;
 // Phrase-scale gain may legitimately exceed 6 dB on extremely uneven takes.
 // This budget applies only to additional time-local peak/residual decisions so
 // a narrow detector response cannot stack into a broadband hole.
@@ -209,6 +222,8 @@ const BODY_SPIKE_MAX_CREATED_ENVELOPE_LOSS_DB = 0.6;
 // breath. Explicit speech-body power may continuously withdraw only the
 // class's 3.2 dB under-target bias; it never adds gain above the source.
 const TRANSIENT_BODY_RECOVERY_MAX_DB = 3.2;
+const TRANSIENT_BODY_RETAINED_ADVANTAGE_FRACTION = 0.6;
+const TRANSIENT_BODY_RETAINED_ADVANTAGE_MAX_DB = 2.5;
 const TRANSIENT_BODY_SHARE_AUTHORITY_EXPONENT = 1.1;
 const TRANSIENT_VOICING_ANALYSIS_RATE_HZ = 8_000;
 const TRANSIENT_VOICING_WINDOW_MS = 30;
@@ -287,6 +302,14 @@ const DECRESCENDO_FADE_SOFTNESS_DB = 4;
 const DECRESCENDO_MIN_RECOVERY_FRACTION = 0.12;
 const DECRESCENDO_MAX_RECOVERY_FRACTION = 0.28;
 const DECRESCENDO_RESIDUAL_KNEE_DB = 0.18;
+const RECURRENT_BODY_VALLEY_INNER_SHOULDER_MS = 90;
+const RECURRENT_BODY_VALLEY_OUTER_SHOULDER_MS = 240;
+const RECURRENT_BODY_VALLEY_CENTER_MS = 40;
+const RECURRENT_BODY_VALLEY_FILL_FRACTION = 0.6;
+const RECURRENT_BODY_VALLEY_MAX_LIFT_DB = 4;
+const RECURRENT_BODY_VALLEY_EVIDENCE_KNEE_DB = 0.5;
+// Leave a small Float32/linear-conversion margin under the 0.3 dB contract.
+const BODY_DYNAMICS_MAX_GAIN_STEP_DB = 0.295;
 const DENSE_BODY_PEAK_RELAXATION_CURVE = 24;
 
 /**
@@ -713,6 +736,23 @@ const rmsDbOfSlice = (
   return 10 * Math.log10(sumPower / (b - a) + 1e-30);
 };
 
+const meanDbOfSlice = (
+  frameDb: ArrayLike<number>,
+  start: number,
+  end: number,
+): number => {
+  const a = Math.max(0, start);
+  const b = Math.min(frameDb.length, end);
+  if (b <= a) return Number.NaN;
+  let sumDb = 0;
+  for (let frame = a; frame < b; frame += 1) {
+    const value = frameDb[frame];
+    if (!Number.isFinite(value)) return Number.NaN;
+    sumDb += value;
+  }
+  return sumDb / (b - a);
+};
+
 /**
  * Continuously relax short processing-added output valleys inside body speech.
  *
@@ -932,15 +972,16 @@ export const limitEmbeddedPerformancePositiveGainAuthority = (
 };
 
 /**
- * Add only the residual lift needed by a sustained, body-owned decrescendo.
+ * Add only the residual lift needed by a sustained, body-owned extreme trend.
  *
  * The run's source trend remains authoritative: ordinary actor fades receive
- * little or no additional ride, while an extreme monotonic fade can recover
- * only a bounded fraction of its decline. The correction is positive-only,
- * follows a smooth run-scale envelope, and is continuously damped as the
- * speech-body evidence approaches the recording floor.
+ * little or no additional ride, while an extreme monotonic rise or fall can
+ * recover only a bounded fraction of its travel. Falling speech gets a smooth
+ * tail lift; rising speech gets the mirrored head lift. Both are positive-only
+ * so the balancer never creates a new attenuation event, and body evidence is
+ * continuously damped as it approaches the recording floor.
  */
-const recoverExtremeBodySpeechDecrescendos = (
+const balanceExtremeBodySpeechTrends = (
   gainDbCurve: Float32Array,
   speechBodyFrameDb: ArrayLike<number>,
   bodySpeechRuns: readonly SpeechRun[],
@@ -1000,11 +1041,16 @@ const recoverExtremeBodySpeechDecrescendos = (
     );
     if (!Number.isFinite(headBodyDb) || !Number.isFinite(tailBodyDb)) continue;
 
-    const sourceFadeDb = softPositiveDb(
-      headBodyDb - tailBodyDb,
-      DECRESCENDO_RESIDUAL_KNEE_DB,
+    const signedSourceTrendDb = tailBodyDb - headBodyDb;
+    const sourceTrendDb = Math.max(
+      0,
+      softPositiveDb(
+        Math.abs(signedSourceTrendDb),
+        DECRESCENDO_RESIDUAL_KNEE_DB,
+      ) - softPositiveDb(0, DECRESCENDO_RESIDUAL_KNEE_DB),
     );
-    if (!(sourceFadeDb > 0)) continue;
+    if (!(sourceTrendDb > 0)) continue;
+    const rising = signedSourceTrendDb > 0;
 
     // Directionality is continuous. A clean monotonic decline approaches one;
     // a locally animated or rising delivery spends proportionally less of the
@@ -1012,6 +1058,8 @@ const recoverExtremeBodySpeechDecrescendos = (
     const trendSampleCount = Math.max(4, Math.min(20, Math.floor(runFrames / trendWindowFrames)));
     let downwardTravelDb = 0;
     let upwardTravelDb = 0;
+    let earlyDirectionalTravelDb = 0;
+    let lateDirectionalTravelDb = 0;
     let previousTrendDb = Number.NaN;
     for (let sample = 0; sample < trendSampleCount; sample += 1) {
       const progress = trendSampleCount > 1 ? sample / (trendSampleCount - 1) : 0;
@@ -1024,40 +1072,67 @@ const recoverExtremeBodySpeechDecrescendos = (
       if (!Number.isFinite(localBodyDb)) continue;
       if (Number.isFinite(previousTrendDb)) {
         const deltaDb = previousTrendDb - localBodyDb;
-        if (deltaDb >= 0) downwardTravelDb += deltaDb;
-        else upwardTravelDb -= deltaDb;
+        const downwardStepDb = Math.max(0, deltaDb);
+        const upwardStepDb = Math.max(0, -deltaDb);
+        downwardTravelDb += downwardStepDb;
+        upwardTravelDb += upwardStepDb;
+        const directionalStepDb = rising ? upwardStepDb : downwardStepDb;
+        const intervalCenterProgress =
+          trendSampleCount > 1
+            ? (sample - 0.5) / (trendSampleCount - 1)
+            : 0;
+        if (intervalCenterProgress <= 0.5) {
+          earlyDirectionalTravelDb += directionalStepDb;
+        } else {
+          lateDirectionalTravelDb += directionalStepDb;
+        }
       }
       previousTrendDb = localBodyDb;
     }
     const travelDb = downwardTravelDb + upwardTravelDb;
+    const directionalTravelDb = rising ? upwardTravelDb : downwardTravelDb;
     const directionAuthority =
-      downwardTravelDb / (travelDb + DECRESCENDO_RESIDUAL_KNEE_DB);
-    const fadeAuthority =
+      directionalTravelDb / (travelDb + DECRESCENDO_RESIDUAL_KNEE_DB);
+    // A phrase-wide correction requires directionally consistent travel in
+    // both halves of the run. A localized onset or terminal fade can still
+    // look monotonic at the endpoints, but it has near-zero distributed
+    // coverage and therefore keeps the actor's source-shaped edge intact.
+    const directionalCoverageAuthority = clamp(
+      (2 * Math.min(earlyDirectionalTravelDb, lateDirectionalTravelDb)) /
+        (earlyDirectionalTravelDb + lateDirectionalTravelDb +
+          DECRESCENDO_RESIDUAL_KNEE_DB),
+      0,
+      1,
+    );
+    const spendAuthority = directionAuthority * directionalCoverageAuthority;
+    const trendAuthority =
       0.5 +
       0.5 *
         Math.tanh(
-          (sourceFadeDb - DECRESCENDO_ORDINARY_FADE_CENTER_DB) /
+          (sourceTrendDb - DECRESCENDO_ORDINARY_FADE_CENTER_DB) /
             DECRESCENDO_FADE_SOFTNESS_DB,
         );
     const recoveryFraction =
-      DECRESCENDO_MIN_RECOVERY_FRACTION +
-      (DECRESCENDO_MAX_RECOVERY_FRACTION -
-        DECRESCENDO_MIN_RECOVERY_FRACTION) *
-        fadeAuthority *
-        directionAuthority;
+      (DECRESCENDO_MIN_RECOVERY_FRACTION +
+        (DECRESCENDO_MAX_RECOVERY_FRACTION -
+          DECRESCENDO_MIN_RECOVERY_FRACTION) *
+          trendAuthority) *
+      spendAuthority;
     const desiredRecoveryDb = Math.min(
-      sourceFadeDb * recoveryFraction,
-      sourceFadeDb * DECRESCENDO_MAX_RECOVERY_FRACTION,
+      sourceTrendDb * recoveryFraction,
+      sourceTrendDb * DECRESCENDO_MAX_RECOVERY_FRACTION,
     );
-    const currentRecoveryDb =
-      meanGainDb(tailStartFrame, tailEndFrame) -
-      meanGainDb(headStartFrame, headEndFrame);
+    const headGainDb = meanGainDb(headStartFrame, headEndFrame);
+    const tailGainDb = meanGainDb(tailStartFrame, tailEndFrame);
+    const currentRecoveryDb = rising
+      ? headGainDb - tailGainDb
+      : tailGainDb - headGainDb;
     const residualRecoveryDb = Math.min(
       DECRESCENDO_MAX_RESIDUAL_LIFT_DB,
       softPositiveDb(
         desiredRecoveryDb - currentRecoveryDb,
         DECRESCENDO_RESIDUAL_KNEE_DB,
-      ) * directionAuthority,
+      ) * spendAuthority,
     );
     if (!(residualRecoveryDb > 0)) continue;
 
@@ -1075,7 +1150,8 @@ const recoverExtremeBodySpeechDecrescendos = (
       const bodyDb = speechBodyFrameDb[frame];
       if (!Number.isFinite(bodyDb)) continue;
       const runProgress = (frame - startFrame) / Math.max(1, runFrames - 1);
-      const shape = smoothUnitRamp(runProgress, 0, 1);
+      const trendShape = smoothUnitRamp(runProgress, 0, 1);
+      const shape = rising ? 1 - trendShape : trendShape;
       const floorMarginDb = bodyDb - (noiseFloorDb + 8);
       const evidenceAuthority = 1 / (1 + Math.exp(-floorMarginDb / 4));
       const liftDb = fullLiftDb * shape * evidenceAuthority;
@@ -1084,6 +1160,162 @@ const recoverExtremeBodySpeechDecrescendos = (
         gainDbCurve[frame] + Math.max(0, liftDb),
       );
     }
+  }
+
+  return recoveredGainDbCurve;
+};
+
+/**
+ * Partially fill recurrent, short, body-owned source valleys without treating
+ * a sustained quiet passage as a defect. Both the voiced-body and broadband
+ * envelopes must form the same two-sided concavity, which prevents bright
+ * consonants and LF impacts from borrowing body authority. A run-level
+ * evidence density supplies continuous recurrence confidence, and the lift
+ * envelope is widened only enough to keep its control motion below 0.3 dB per
+ * 10 ms. Missing or inconsistent evidence returns a distinct unchanged copy.
+ */
+export const recoverRecurrentBodySpeechValleys = (
+  gainDbCurve: Float32Array,
+  sourceFrameDb: ArrayLike<number>,
+  speechBodyFrameDb: ArrayLike<number>,
+  bodySpeechRuns: readonly SpeechRun[],
+  maxGainDb: number,
+  frameMs = 10,
+): Float32Array => {
+  const recoveredGainDbCurve = new Float32Array(gainDbCurve);
+  if (
+    sourceFrameDb.length !== gainDbCurve.length ||
+    speechBodyFrameDb.length !== gainDbCurve.length ||
+    !Number.isFinite(frameMs) ||
+    frameMs <= 0 ||
+    !Number.isFinite(maxGainDb)
+  ) {
+    return recoveredGainDbCurve;
+  }
+  for (let frame = 0; frame < gainDbCurve.length; frame += 1) {
+    if (
+      !Number.isFinite(gainDbCurve[frame]) ||
+      !Number.isFinite(sourceFrameDb[frame]) ||
+      !Number.isFinite(speechBodyFrameDb[frame])
+    ) {
+      return recoveredGainDbCurve;
+    }
+  }
+
+  const innerShoulderFrames = Math.max(
+    1,
+    Math.round(RECURRENT_BODY_VALLEY_INNER_SHOULDER_MS / frameMs),
+  );
+  const outerShoulderFrames = Math.max(
+    innerShoulderFrames + 1,
+    Math.round(RECURRENT_BODY_VALLEY_OUTER_SHOULDER_MS / frameMs),
+  );
+  const centerHalfFrames = Math.max(
+    1,
+    Math.round(RECURRENT_BODY_VALLEY_CENTER_MS / (2 * frameMs)),
+  );
+
+  for (const run of bodySpeechRuns) {
+    const startFrame = clamp(Math.trunc(run.startFrame), 0, gainDbCurve.length);
+    const endFrame = clamp(Math.trunc(run.endFrame), startFrame, gainDbCurve.length);
+    if (endFrame - startFrame <= outerShoulderFrames * 2) continue;
+
+    const requestedLiftDb = new Float32Array(endFrame - startFrame);
+    let evidenceWeight = 0;
+    for (
+      let frame = startFrame + outerShoulderFrames;
+      frame < endFrame - outerShoulderFrames;
+      frame += 1
+    ) {
+      const bodyCenterDb = meanDbOfSlice(
+        speechBodyFrameDb,
+        frame - centerHalfFrames,
+        frame + centerHalfFrames + 1,
+      );
+      const sourceCenterDb = meanDbOfSlice(
+        sourceFrameDb,
+        frame - centerHalfFrames,
+        frame + centerHalfFrames + 1,
+      );
+      const bodyShoulderDb = Math.min(
+        meanDbOfSlice(
+          speechBodyFrameDb,
+          frame - outerShoulderFrames,
+          frame - innerShoulderFrames,
+        ),
+        meanDbOfSlice(
+          speechBodyFrameDb,
+          frame + innerShoulderFrames + 1,
+          frame + outerShoulderFrames + 1,
+        ),
+      );
+      const sourceShoulderDb = Math.min(
+        meanDbOfSlice(
+          sourceFrameDb,
+          frame - outerShoulderFrames,
+          frame - innerShoulderFrames,
+        ),
+        meanDbOfSlice(
+          sourceFrameDb,
+          frame + innerShoulderFrames + 1,
+          frame + outerShoulderFrames + 1,
+        ),
+      );
+      if (
+        !Number.isFinite(bodyCenterDb) ||
+        !Number.isFinite(sourceCenterDb) ||
+        !Number.isFinite(bodyShoulderDb) ||
+        !Number.isFinite(sourceShoulderDb)
+      ) {
+        continue;
+      }
+
+      const alignedConcavityDb = Math.min(
+        bodyShoulderDb - bodyCenterDb,
+        sourceShoulderDb - sourceCenterDb,
+      );
+      const continuousConcavityDb = Math.max(
+        0,
+        softPositiveDb(
+          alignedConcavityDb,
+          RECURRENT_BODY_VALLEY_EVIDENCE_KNEE_DB,
+        ) - softPositiveDb(0, RECURRENT_BODY_VALLEY_EVIDENCE_KNEE_DB),
+      );
+      evidenceWeight += smoothUnitRamp(continuousConcavityDb, 0.75, 6);
+      requestedLiftDb[frame - startFrame] = Math.min(
+        RECURRENT_BODY_VALLEY_MAX_LIFT_DB,
+        continuousConcavityDb * RECURRENT_BODY_VALLEY_FILL_FRACTION,
+      );
+    }
+
+    const runFrames = endFrame - startFrame;
+    const recurrenceAuthority =
+      evidenceWeight / (evidenceWeight + runFrames * 0.04 + Number.EPSILON);
+    for (let index = 0; index < requestedLiftDb.length; index += 1) {
+      requestedLiftDb[index] *= recurrenceAuthority;
+    }
+
+    // Least 0.3 dB/frame Lipschitz majorant: preserve each requested valley
+    // lift while extending only the minimum smooth shoulder around it.
+    for (let index = 1; index < requestedLiftDb.length; index += 1) {
+      requestedLiftDb[index] = Math.max(
+        requestedLiftDb[index],
+        requestedLiftDb[index - 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      );
+    }
+    for (let index = requestedLiftDb.length - 2; index >= 0; index -= 1) {
+      requestedLiftDb[index] = Math.max(
+        requestedLiftDb[index],
+        requestedLiftDb[index + 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      );
+    }
+    for (let frame = startFrame; frame < endFrame; frame += 1) {
+      recoveredGainDbCurve[frame] = Math.min(
+        maxGainDb,
+        recoveredGainDbCurve[frame] + requestedLiftDb[frame - startFrame],
+      );
+    }
+
   }
 
   return recoveredGainDbCurve;
@@ -1188,6 +1420,27 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const sourceTargetBlend = clamp(input.sourceTargetBlend ?? 0.15, 0, 1);
   const maxGainDb = input.maxGainDb ?? 14;
   const minGainDb = input.minGainDb ?? -14;
+  const instabilityHint = clamp(input.instabilityHint ?? 0.5, 0, 1);
+  const selectedLevelingConsistency = Number.isFinite(input.levelingConsistency)
+    ? clamp(input.levelingConsistency as number, 0, 1)
+    : 1;
+  // A cinematic preset is the baseline authority, not a blind fixed amount.
+  // Only a severely unstable source earns more phrase equalization, and the
+  // return is continuous across the same measured instability signal that
+  // controls the micro-ride. Multiplicative headroom preserves the ordering
+  // of Minimal/Gentle/Balanced/Firm while default consistency=1 remains exact.
+  const severeInstabilityAuthority =
+    selectedLevelingConsistency < 1
+      ? smoothUnitRamp(instabilityHint, 0.87, 0.95)
+      : 0;
+  const severeInstabilityConsistencyCeiling = Math.min(
+    1,
+    selectedLevelingConsistency * 1.86,
+  );
+  let levelingConsistency =
+    selectedLevelingConsistency +
+    (severeInstabilityConsistencyCeiling - selectedLevelingConsistency) *
+      severeInstabilityAuthority;
   const coldOpenLiftToleranceDb = input.coldOpenLiftToleranceDb ?? COLD_OPEN_LIFT_TOLERANCE_DB;
   const coldOpenLiftMaxAllowedDb = input.coldOpenLiftMaxDb ?? COLD_OPEN_LIFT_MAX_DB;
   // -4 dBFS ceiling gives the downstream `alimiter=limit=-2dB` genuine
@@ -1244,7 +1497,6 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // messy takes, we need the full ride to keep the body level stable.
   //
   // Scale: ±0.4 dB at instabilityHint=0, ±1.5 dB at instabilityHint=1.
-  const instabilityHint = Math.max(0, Math.min(1, input.instabilityHint ?? 0.5));
   const microRideDb = 0.4 + instabilityHint * 1.1;
   // This controls only the uniform residual correction for a whole hot run.
   // Time-local consonant repair is source-relative later in the delivery path;
@@ -1443,6 +1695,18 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     if (runClass === "body-speech") runRmsDb.push(loudnessMeanDb);
   }
 
+  // Do not spend phrase equalization merely because it is available. When
+  // at least three body runs already live within a narrow cinematic range,
+  // continuously return most macro authority to the actor. Genuinely uneven
+  // takes regain the selected (and severe-instability-adjusted) authority by
+  // 8 dB of source spread. Local spike, valley, tail, and peak repair remain
+  // independent, so an already-consistent take can still lose defects.
+  if (levelingConsistency < 1 && runRmsDb.length >= 3) {
+    const sourceBodyRunSpreadDb = Math.max(...runRmsDb) - Math.min(...runRmsDb);
+    const sourceSpreadAuthority = smoothUnitRamp(sourceBodyRunSpreadDb, 2, 8);
+    levelingConsistency *= 0.15 + 0.85 * sourceSpreadAuthority;
+  }
+
   // 2) Target = TRIMMED MEAN of run body RMS (drop extreme sentences as
   //    outliers), blended toward targetDbBase. Trimmed mean resists the
   //    single-loud-sentence skew the median had: median tracks the middle
@@ -1500,7 +1764,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       1,
     );
   };
-  const resolveBodyPlannedGainDb = (m: RunEntry) => {
+  const resolveFullConsistencyBodyPlannedGainDb = (m: RunEntry) => {
     const performanceAuthority = resolveBodyPerformanceAuthority(m);
     const sourceExcessDb = Math.max(0, m.loudnessMeanDb - targetDb);
     const retainedEmphasisDb = clamp(
@@ -1515,17 +1779,34 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       minGainDb + (widestLowerClamp - minGainDb) * performanceAuthority;
     return clamp(adjustedTarget - m.loudnessMeanDb, lowerClamp, maxGainDb);
   };
+  const resolveBodyLevelingAuthority = (m: RunEntry) => {
+    if (m.runClass !== "body-speech" || levelingConsistency >= 1) return 1;
+    const belowTargetDb = targetDb - m.loudnessMeanDb;
+    const audibilityReturn =
+      1 /
+      (1 +
+        Math.exp(
+          -(belowTargetDb - BODY_LEVELING_AUDIBILITY_CENTER_BELOW_TARGET_DB) /
+            BODY_LEVELING_AUDIBILITY_WIDTH_DB,
+        ));
+    return levelingConsistency + (1 - levelingConsistency) * audibilityReturn;
+  };
   const bodyPerformanceAuthority = runMeta.map((m) =>
     m.runClass === "body-speech" ? resolveBodyPerformanceAuthority(m) : 0
   );
+  const bodyLevelingAuthority = runMeta.map(resolveBodyLevelingAuthority);
+  const fullConsistencyBodyPlannedGainDb = runMeta.map(
+    resolveFullConsistencyBodyPlannedGainDb,
+  );
   const transientBodyRecoveryDb = new Array<number>(runMeta.length).fill(0);
+  const transientRetainedAdvantageDb = new Array<number>(runMeta.length).fill(0);
   const plannedRunGainDb: number[] = runMeta.map((m, runIndex) => {
     if (m.runClass === "transient-breath") {
       const targetClassGain = breathTargetDb - m.loudnessMeanDb;
       const positiveClamp =
         m.isColdOpen && targetClassGain > 0 ? Math.min(maxGainDb, Math.max(4, targetClassGain)) : 4;
       const breathPlanGainDb = clamp(targetClassGain, -12, positiveClamp);
-      const bodyPlanGainDb = resolveBodyPlannedGainDb(m);
+      const bodyPlanGainDb = fullConsistencyBodyPlannedGainDb[runIndex];
       const recoverableAttenuationDb = Math.max(
         0,
         Math.min(0, bodyPlanGainDb) - breathPlanGainDb,
@@ -1535,7 +1816,14 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         recoverableAttenuationDb * m.bodyOwnershipAuthority,
       );
       transientBodyRecoveryDb[runIndex] = recoveryDb;
-      return breathPlanGainDb + recoveryDb;
+      const retainedAdvantageDb = Math.min(
+        TRANSIENT_BODY_RETAINED_ADVANTAGE_MAX_DB,
+        Math.max(0, m.loudnessMeanDb - targetDb) *
+          TRANSIENT_BODY_RETAINED_ADVANTAGE_FRACTION *
+          m.bodyOwnershipAuthority,
+      );
+      transientRetainedAdvantageDb[runIndex] = retainedAdvantageDb;
+      return breathPlanGainDb + recoveryDb + retainedAdvantageDb;
     }
     if (m.runClass === "edge-fragment") {
       const targetClassGain = targetDb - m.loudnessMeanDb;
@@ -1543,7 +1831,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         m.isColdOpen && targetClassGain > 0 ? Math.min(maxGainDb, Math.max(4, targetClassGain)) : 4;
       return clamp(targetClassGain, -4, positiveClamp);
     }
-    return resolveBodyPlannedGainDb(m);
+    return fullConsistencyBodyPlannedGainDb[runIndex] * bodyLevelingAuthority[runIndex];
   });
   // Cross-run smoothing on adjacent body-speech pairs only.
   //
@@ -1551,23 +1839,31 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // Body pairs influence each other continuously: similarity decays with
   // source-level distance, large planned differences earn more smoothing,
   // and emotional evidence continuously protects the retained contour.
-  for (let i = 1; i < plannedRunGainDb.length; i += 1) {
-    const cur = runMeta[i];
-    const prev = runMeta[i - 1];
-    if (cur.runClass !== "body-speech" || prev.runClass !== "body-speech") continue;
-    const diff = plannedRunGainDb[i] - plannedRunGainDb[i - 1];
-    const sourceDeltaDb = Math.abs(cur.loudnessMeanDb - prev.loudnessMeanDb);
-    const sourceSimilarity = 1 / (1 + (sourceDeltaDb / 8) ** 2);
-    const differenceAuthority = Math.abs(diff) / (Math.abs(diff) + 3);
-    const performanceProtection =
-      1 - 0.9 * Math.max(bodyPerformanceAuthority[i], bodyPerformanceAuthority[i - 1]);
-    const blend =
-      0.35 * sourceSimilarity * differenceAuthority * performanceProtection;
-    const mid = (plannedRunGainDb[i] + plannedRunGainDb[i - 1]) / 2;
-    plannedRunGainDb[i - 1] =
-      plannedRunGainDb[i - 1] + (mid - plannedRunGainDb[i - 1]) * blend;
-    plannedRunGainDb[i] =
-      plannedRunGainDb[i] + (mid - plannedRunGainDb[i]) * blend;
+  const smoothAdjacentBodyRunGains = (runGainDb: number[]) => {
+    for (let i = 1; i < runGainDb.length; i += 1) {
+      const cur = runMeta[i];
+      const prev = runMeta[i - 1];
+      if (cur.runClass !== "body-speech" || prev.runClass !== "body-speech") continue;
+      const diff = runGainDb[i] - runGainDb[i - 1];
+      const sourceDeltaDb = Math.abs(cur.loudnessMeanDb - prev.loudnessMeanDb);
+      const sourceSimilarity = 1 / (1 + (sourceDeltaDb / 8) ** 2);
+      const differenceAuthority = Math.abs(diff) / (Math.abs(diff) + 3);
+      const performanceProtection =
+        1 - 0.9 * Math.max(bodyPerformanceAuthority[i], bodyPerformanceAuthority[i - 1]);
+      const blend =
+        0.35 * sourceSimilarity * differenceAuthority * performanceProtection;
+      const mid = (runGainDb[i] + runGainDb[i - 1]) / 2;
+      runGainDb[i - 1] =
+        runGainDb[i - 1] + (mid - runGainDb[i - 1]) * blend;
+      runGainDb[i] = runGainDb[i] + (mid - runGainDb[i]) * blend;
+    }
+  };
+  const fullConsistencyReferenceGainDb = levelingConsistency < 1
+    ? [...fullConsistencyBodyPlannedGainDb]
+    : plannedRunGainDb;
+  smoothAdjacentBodyRunGains(plannedRunGainDb);
+  if (fullConsistencyReferenceGainDb !== plannedRunGainDb) {
+    smoothAdjacentBodyRunGains(fullConsistencyReferenceGainDb);
   }
 
   // Conservative opener guard. It only acts when the first few body-speech
@@ -1582,11 +1878,23 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     .map((meta, index) => (meta.runClass === "body-speech" ? index : -1))
     .filter((index) => index >= 0);
   if (bodyRunIndexes.length >= 3) {
+    // Reduced consistency must not make this independent opener repair chase
+    // the intentionally less-equalized later runs. Judge the guard against a
+    // full-consistency counterfactual, then spend only this run's authority.
+    // At consistency=1 the live array remains the reference, preserving the
+    // legacy operation order and values exactly.
+    const usesCounterfactualReference =
+      fullConsistencyReferenceGainDb !== plannedRunGainDb;
+    const coldOpenReferenceGainDb = fullConsistencyReferenceGainDb;
     const earlyRunIndexes = bodyRunIndexes.slice(0, Math.min(3, bodyRunIndexes.length - 2));
     const earlySet = new Set(earlyRunIndexes);
     const laterAppliedBodies = bodyRunIndexes
       .filter((index) => !earlySet.has(index))
-      .map((index) => runMeta[index].loudnessMeanDb + (plannedRunGainDb[index] ?? 0))
+      .map(
+        (index) =>
+          runMeta[index].loudnessMeanDb +
+          (coldOpenReferenceGainDb[index] ?? 0),
+      )
       .filter(Number.isFinite)
       .sort((a, b) => a - b);
     const laterAnchorDb = laterAppliedBodies[Math.floor(laterAppliedBodies.length / 2)];
@@ -1594,29 +1902,50 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       const toleranceDb = 1.5;
       const triggerDb = 2.75;
       for (const index of earlyRunIndexes) {
-        const appliedBodyDb = runMeta[index].loudnessMeanDb + (plannedRunGainDb[index] ?? 0);
+        const appliedBodyDb =
+          runMeta[index].loudnessMeanDb +
+          (coldOpenReferenceGainDb[index] ?? 0);
         const overLaterDb = appliedBodyDb - laterAnchorDb;
         if (overLaterDb < triggerDb) continue;
         const reductionDb = clamp(overLaterDb - toleranceDb, 0, 5);
         if (reductionDb <= 0) continue;
-        plannedRunGainDb[index] -= reductionDb;
+        const authorizedReductionDb =
+          reductionDb * (bodyLevelingAuthority[index] ?? 1);
+        plannedRunGainDb[index] -= authorizedReductionDb;
+        if (usesCounterfactualReference) {
+          coldOpenReferenceGainDb[index] -= reductionDb;
+        }
         earlyRunCapCount += 1;
-        earlyRunMaxReductionDb = Math.max(earlyRunMaxReductionDb, reductionDb);
+        earlyRunMaxReductionDb = Math.max(
+          earlyRunMaxReductionDb,
+          authorizedReductionDb,
+        );
       }
       for (const index of earlyRunIndexes) {
-        const appliedBodyDb = runMeta[index].loudnessMeanDb + (plannedRunGainDb[index] ?? 0);
+        const appliedBodyDb =
+          runMeta[index].loudnessMeanDb +
+          (coldOpenReferenceGainDb[index] ?? 0);
         const underLaterDb = laterAnchorDb - appliedBodyDb;
         if (underLaterDb <= coldOpenLiftToleranceDb) continue;
-        const maxAllowedByGain = maxGainDb - (plannedRunGainDb[index] ?? 0);
+        const maxAllowedByGain =
+          maxGainDb - (coldOpenReferenceGainDb[index] ?? 0);
         const liftDb = clamp(
           underLaterDb - coldOpenLiftToleranceDb,
           0,
           Math.min(coldOpenLiftMaxAllowedDb, maxAllowedByGain),
         );
         if (liftDb <= 0) continue;
-        plannedRunGainDb[index] += liftDb;
+        const authorizedLiftDb = Math.min(
+          liftDb * (bodyLevelingAuthority[index] ?? 1),
+          maxGainDb - (plannedRunGainDb[index] ?? 0),
+        );
+        if (authorizedLiftDb <= 0) continue;
+        plannedRunGainDb[index] += authorizedLiftDb;
+        if (usesCounterfactualReference) {
+          coldOpenReferenceGainDb[index] += liftDb;
+        }
         coldOpenLiftCount += 1;
-        coldOpenLiftMaxDb = Math.max(coldOpenLiftMaxDb, liftDb);
+        coldOpenLiftMaxDb = Math.max(coldOpenLiftMaxDb, authorizedLiftDb);
       }
     }
   }
@@ -1633,8 +1962,14 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     if (meta.runClass !== "body-speech") continue;
 
     const currentGainDb = plannedRunGainDb[index] ?? 0;
-    const rawAppliedDb = meta.meanDb + currentGainDb;
-    const loudnessAppliedDb = meta.loudnessMeanDb + currentGainDb;
+    // At reduced consistency the floor judges the full-consistency plan, not
+    // the deliberately contrast-preserving gain. Otherwise this later pass
+    // would simply add back the equalization that the caller withheld.
+    const floorReferenceGainDb = levelingConsistency >= 1
+      ? currentGainDb
+      : fullConsistencyReferenceGainDb[index] ?? currentGainDb;
+    const rawAppliedDb = meta.meanDb + floorReferenceGainDb;
+    const loudnessAppliedDb = meta.loudnessMeanDb + floorReferenceGainDb;
     const rawLiftNeededDb = quietBodyRawFloorDb - rawAppliedDb;
     const loudnessHeadroomDb = quietBodyLoudnessFloorDb - loudnessAppliedDb;
     if (rawLiftNeededDb <= 0 || loudnessHeadroomDb <= 0) continue;
@@ -1646,10 +1981,15 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
           ? 0.65
           : 1;
     const gainHeadroomDb = maxGainDb - currentGainDb;
+    const liftAuthority = bodyLevelingAuthority[index] ?? 1;
     const liftDb = clamp(
-      Math.min(rawLiftNeededDb, loudnessHeadroomDb),
+      Math.min(
+        rawLiftNeededDb,
+        loudnessHeadroomDb,
+        QUIET_BODY_FLOOR_MAX_LIFT_DB * crestScale,
+      ) * liftAuthority,
       0,
-      Math.min(QUIET_BODY_FLOOR_MAX_LIFT_DB * crestScale, gainHeadroomDb),
+      gainHeadroomDb,
     );
     if (liftDb > 0) {
       plannedRunGainDb[index] += liftDb;
@@ -1743,7 +2083,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   };
 
   for (let r = 0; r < runMeta.length; r += 1) {
-    const { startFrame, endFrame, runClass, crestDb } = runMeta[r];
+    const { startFrame, endFrame, loudnessMeanDb, runClass, crestDb } = runMeta[r];
     const bodyGainDb = plannedRunGainDb[r];
 
     // Micro-ride policy per class:
@@ -1769,8 +2109,17 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       const winStart = Math.max(startFrame, i - Math.floor(slideFrames / 2));
       const winEnd = Math.min(endFrame, i + Math.ceil(slideFrames / 2));
       const localDb = rmsDbOfSlice(loudnessFrameDb, winStart, winEnd);
+      // Reduced consistency retains the run's macro output level, while the
+      // existing micro-ride still stabilizes deviations inside that run. If
+      // this continued to chase the house target it could add back up to the
+      // full micro-ride after macro equalization had been withheld.
+      const retainedMacroOutputDb = loudnessMeanDb + bodyGainDb;
+      const microRideTargetDb = levelingConsistency >= 1
+        ? targetDb
+        : retainedMacroOutputDb +
+          (targetDb - retainedMacroOutputDb) * levelingConsistency;
       const microGainDb = clamp(
-        targetDb - (localDb + bodyGainDb),
+        microRideTargetDb - (localDb + bodyGainDb),
         -runEffectiveMicroRideDb,
         runEffectiveMicroRideDb,
       );
@@ -1935,13 +2284,23 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     targetDb,
     frameMs,
   );
-  const slewed = recoverExtremeBodySpeechDecrescendos(
+  const trendBalanced = balanceExtremeBodySpeechTrends(
     embeddedLimited,
     speechBodyFrameDb,
     runMeta
       .filter(({ runClass }) => runClass === "body-speech")
       .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
     input.noiseFloorDb,
+    maxGainDb,
+    frameMs,
+  );
+  const slewed = recoverRecurrentBodySpeechValleys(
+    trendBalanced,
+    input.frameDb,
+    speechBodyFrameDb,
+    runMeta
+      .filter(({ runClass }) => runClass === "body-speech")
+      .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
     maxGainDb,
     frameMs,
   );
@@ -1981,10 +2340,17 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         isPerformanceTransient && runIdx >= 0
           ? transientBodyRecoveryDb[runIdx] ?? 0
           : 0;
+      const transientRetainedAdvantageForFrameDb =
+        isPerformanceTransient && runIdx >= 0
+          ? transientRetainedAdvantageDb[runIdx] ?? 0
+          : 0;
       const localPeakCeilingDb = isPerformanceTransient
         ? Math.min(
             peakCeilingDb,
-            targetDb + 8 + transientBodyRecoveryForFrameDb,
+            targetDb +
+              8 +
+              transientBodyRecoveryForFrameDb +
+              transientRetainedAdvantageForFrameDb,
           )
         : peakCeilingDb;
       const appliedPeakDb = framePeakDb[f] + currentGainDb;
@@ -2223,6 +2589,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       runClass: m.runClass,
       bodyOwnershipAuthority: m.bodyOwnershipAuthority,
       transientBodyRecoveryDb: transientBodyRecoveryDb[i] ?? 0,
+      transientRetainedAdvantageDb: transientRetainedAdvantageDb[i] ?? 0,
     })),
     expanderDepthDb,
     targetDb,
