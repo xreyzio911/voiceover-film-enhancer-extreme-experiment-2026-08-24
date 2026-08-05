@@ -18,6 +18,25 @@ const buildRamp = (sampleRate: number, seconds: number) => {
   return samples;
 };
 
+const insertPreDataMetadataChunk = (
+  source: Uint8Array,
+  chunkId: "LIST" | "iXML",
+  metadataBytes: number,
+) => {
+  const paddedMetadataBytes = metadataBytes + (metadataBytes % 2);
+  const output = new Uint8Array(source.byteLength + 8 + paddedMetadataBytes);
+  output.set(source.subarray(0, 36), 0);
+  const view = new DataView(output.buffer);
+  for (let index = 0; index < chunkId.length; index += 1) {
+    view.setUint8(36 + index, chunkId.charCodeAt(index));
+  }
+  view.setUint32(40, metadataBytes, true);
+  output.fill(0x61, 44, 44 + metadataBytes);
+  output.set(source.subarray(36), 44 + paddedMetadataBytes);
+  view.setUint32(4, output.byteLength - 8, true);
+  return output;
+};
+
 test("inspects app-rendered mono float32 WAV without decoding the full payload", () => {
   const sampleRate = 48_000;
   const samples = buildRamp(sampleRate, 3);
@@ -95,6 +114,80 @@ test("slices a final-WAV Blob without materializing the complete file", async ()
   assert.equal(window.sampleCount, 24_000);
   assert.ok(Math.abs(decoded.samples[0] - samples[60_000]) < 1e-7);
   assert.ok(Math.abs(decoded.samples.at(-1)! - samples[83_999]) < 1e-7);
+});
+
+test("progressively inspects valid large LIST and iXML chunks without reading the audio payload", async () => {
+  class SliceTrackingBlob extends Blob {
+    wholeRead = false;
+    largestSliceBytes = 0;
+
+    override async arrayBuffer() {
+      this.wholeRead = true;
+      return super.arrayBuffer();
+    }
+
+    override slice(start?: number, end?: number, contentType?: string) {
+      const safeStart = start ?? 0;
+      const safeEnd = end ?? this.size;
+      this.largestSliceBytes = Math.max(this.largestSliceBytes, safeEnd - safeStart);
+      return super.slice(start, end, contentType);
+    }
+  }
+
+  const sampleRate = 48_000;
+  const canonical = encodeWavFloat32(buildRamp(sampleRate, 2), sampleRate, 1);
+  for (const chunkId of ["LIST", "iXML"] as const) {
+    const metadataBytes = 96 * 1024 + 1;
+    const encoded = insertPreDataMetadataChunk(canonical, chunkId, metadataBytes);
+    const blob = new SliceTrackingBlob([encoded]);
+
+    const info = await inspectMonoFloat32WavBlob(blob);
+
+    assert.equal(info.sampleRate, sampleRate);
+    assert.equal(info.totalSamples, 2 * sampleRate);
+    assert.equal(info.dataOffset, 52 + metadataBytes + 1);
+    assert.equal(blob.wholeRead, false);
+    assert.ok(blob.largestSliceBytes > 64 * 1024, "inspection must advance past the old fixed probe");
+    assert.ok(blob.largestSliceBytes < blob.size, "inspection must not materialize the audio payload");
+  }
+});
+
+test("reports a truly oversized metadata declaration as corruption, not a short probe", async () => {
+  const canonical = encodeWavFloat32(buildRamp(48_000, 1), 48_000, 1);
+  const encoded = insertPreDataMetadataChunk(canonical, "LIST", 16);
+  new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength).setUint32(
+    40,
+    encoded.byteLength,
+    true,
+  );
+
+  await assert.rejects(
+    inspectMonoFloat32WavBlob(new Blob([encoded])),
+    /Corrupt WAV: LIST chunk exceeds the file/i,
+  );
+});
+
+test("keeps progressive metadata inspection under a fixed memory bound", async () => {
+  class SliceTrackingBlob extends Blob {
+    largestSliceBytes = 0;
+
+    override slice(start?: number, end?: number, contentType?: string) {
+      const safeStart = start ?? 0;
+      const safeEnd = end ?? this.size;
+      this.largestSliceBytes = Math.max(this.largestSliceBytes, safeEnd - safeStart);
+      return super.slice(start, end, contentType);
+    }
+  }
+
+  const canonical = encodeWavFloat32(buildRamp(48_000, 1), 48_000, 1);
+  const encoded = insertPreDataMetadataChunk(canonical, "iXML", 4 * 1024 * 1024 + 1);
+  const blob = new SliceTrackingBlob([encoded]);
+
+  await assert.rejects(
+    inspectMonoFloat32WavBlob(blob),
+    /metadata prefix exceeds the .* bounded inspection limit/i,
+  );
+  assert.equal(blob.largestSliceBytes, 64 * 1024);
 });
 
 test("rejects stereo or non-float input instead of silently misreading QC evidence", () => {

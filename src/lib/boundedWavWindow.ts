@@ -1,6 +1,7 @@
 const RIFF_HEADER_BYTES = 12;
 const CANONICAL_FLOAT_WAV_HEADER_BYTES = 44;
 const BLOB_WAV_HEADER_PROBE_BYTES = 64 * 1024;
+const BLOB_WAV_HEADER_MAX_PROBE_BYTES = 4 * 1024 * 1024;
 const FLOAT32_BYTES = Float32Array.BYTES_PER_ELEMENT;
 const WAVE_FORMAT_IEEE_FLOAT = 0x0003;
 const WAVE_FORMAT_EXTENSIBLE = 0xfffe;
@@ -83,6 +84,16 @@ const writeAscii = (view: DataView, offset: number, value: string) => {
   }
 };
 
+class IncompleteWavPrefixError extends Error {
+  readonly requiredBytes: number;
+
+  constructor(requiredBytes: number) {
+    super("WAV header inspection needs a larger bounded prefix.");
+    this.name = "IncompleteWavPrefixError";
+    this.requiredBytes = requiredBytes;
+  }
+}
+
 const inspectMonoFloat32WavPrefix = (
   bytes: Uint8Array,
   fileByteLength: number,
@@ -110,8 +121,12 @@ const inspectMonoFloat32WavPrefix = (
     const chunkSize = view.getUint32(offset + 4, true);
     const chunkStart = offset + 8;
     const chunkEnd = chunkStart + chunkSize;
-    if (chunkId !== "data" && chunkEnd > view.byteLength) {
+    if (chunkId !== "data" && chunkEnd > fileByteLength) {
       throw new Error(`Corrupt WAV: ${chunkId.trim() || "unknown"} chunk exceeds the file.`);
+    }
+    if (chunkId !== "data" && chunkEnd > view.byteLength) {
+      const nextChunkHeaderEnd = chunkEnd + (chunkSize % 2) + 8;
+      throw new IncompleteWavPrefixError(Math.min(fileByteLength, nextChunkHeaderEnd));
     }
 
     if (chunkId === "fmt ") {
@@ -146,6 +161,12 @@ const inspectMonoFloat32WavPrefix = (
     offset = chunkEnd + (chunkSize % 2);
   }
 
+  if (dataOffset < 0 && view.byteLength < fileByteLength) {
+    throw new IncompleteWavPrefixError(
+      Math.min(fileByteLength, Math.max(offset + 8, view.byteLength + 8)),
+    );
+  }
+
   if (!formatValid) {
     throw new Error("Bounded QC expects mono pcm_f32le audio.");
   }
@@ -167,9 +188,22 @@ export const inspectMonoFloat32Wav = (bytes: Uint8Array): MonoFloat32WavInfo =>
   inspectMonoFloat32WavPrefix(bytes, bytes.byteLength);
 
 export const inspectMonoFloat32WavBlob = async (blob: Blob): Promise<MonoFloat32WavInfo> => {
-  const prefixEnd = Math.min(blob.size, BLOB_WAV_HEADER_PROBE_BYTES);
-  const prefixBytes = new Uint8Array(await blob.slice(0, prefixEnd).arrayBuffer());
-  return inspectMonoFloat32WavPrefix(prefixBytes, blob.size);
+  let prefixEnd = Math.min(blob.size, BLOB_WAV_HEADER_PROBE_BYTES);
+  while (true) {
+    const prefixBytes = new Uint8Array(await blob.slice(0, prefixEnd).arrayBuffer());
+    try {
+      return inspectMonoFloat32WavPrefix(prefixBytes, blob.size);
+    } catch (error) {
+      if (!(error instanceof IncompleteWavPrefixError)) throw error;
+      const requiredBytes = Math.max(prefixEnd + 1, error.requiredBytes);
+      if (requiredBytes > BLOB_WAV_HEADER_MAX_PROBE_BYTES) {
+        throw new Error(
+          `WAV metadata prefix exceeds the ${BLOB_WAV_HEADER_MAX_PROBE_BYTES}-byte bounded inspection limit.`,
+        );
+      }
+      prefixEnd = Math.min(blob.size, requiredBytes);
+    }
+  }
 };
 
 const encodeCanonicalHeader = (sampleRate: number, sampleCount: number) => {

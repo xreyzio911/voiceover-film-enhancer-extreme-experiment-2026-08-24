@@ -49,14 +49,58 @@ test("batch speech evidence stays full for short outputs and bounded for long ou
     { startSec: 0, durationSec: 180 },
   ]);
 
-  const windows = planDistributedSpeechEvidenceWindows(1_828.7);
+  const windows = planDistributedSpeechEvidenceWindows(600);
   assert.equal(windows.length, 6);
   assert.deepEqual(windows[0], { startSec: 0, durationSec: 30 });
-  assert.deepEqual(windows.at(-1), { startSec: 1_798.7, durationSec: 30 });
+  assert.deepEqual(windows.at(-1), { startSec: 570, durationSec: 30 });
   assert.ok(windows.every((window) => window.durationSec <= 30));
   assert.ok(
     windows.reduce((total, window) => total + window.durationSec, 0) <= 180,
     "long-file batch evidence must keep a fixed decode budget",
+  );
+});
+
+test("very long batch speech evidence grows duration-proportionally without overlapping", () => {
+  const windows = planDistributedSpeechEvidenceWindows(1_828.7);
+
+  assert.equal(windows.length, 24);
+  assert.ok(windows.every((window) => window.durationSec === 15));
+  assert.deepEqual(windows[0], { startSec: 0, durationSec: 15 });
+  assert.deepEqual(windows.at(-1), { startSec: 1_813.7, durationSec: 15 });
+  assert.ok(
+    windows.every((window, index) => (
+      index === 0 || window.startSec >= windows[index - 1].startSec + windows[index - 1].durationSec
+    )),
+    "distributed evidence windows must be deterministic and non-overlapping",
+  );
+  assert.equal(
+    windows.reduce((total, window) => total + window.durationSec, 0),
+    360,
+    "the 24-window cap must bound a very long file to six minutes of decoded evidence",
+  );
+});
+
+test("duration-proportional evidence never reduces coverage at the medium-file boundary", () => {
+  const boundaryWindows = planDistributedSpeechEvidenceWindows(720);
+  assert.equal(boundaryWindows.length, 6);
+  assert.ok(boundaryWindows.every((window) => window.durationSec === 30));
+  assert.equal(
+    boundaryWindows.reduce((total, window) => total + window.durationSec, 0),
+    180,
+  );
+
+  const firstScaledDurationSec = 720.001;
+  const scaledWindows = planDistributedSpeechEvidenceWindows(firstScaledDurationSec);
+  assert.equal(scaledWindows.length, 13);
+  assert.ok(scaledWindows.every((window) => window.durationSec === 15));
+  assert.deepEqual(scaledWindows.at(-1), { startSec: 705.001, durationSec: 15 });
+  assert.ok(
+    scaledWindows.reduce((total, window) => total + window.durationSec, 0) >= 180,
+  );
+  assert.deepEqual(
+    planDistributedSpeechEvidenceWindows(firstScaledDurationSec),
+    scaledWindows,
+    "the same duration must always produce the same distributed windows",
   );
 });
 

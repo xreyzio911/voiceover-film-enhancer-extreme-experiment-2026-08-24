@@ -3,6 +3,10 @@ export const BATCH_SPEECH_ALIGN_MAX_DB = 2.0;
 export const BATCH_SPEECH_EVIDENCE_FULL_MAX_SECONDS = 180;
 export const BATCH_SPEECH_EVIDENCE_WINDOW_SECONDS = 30;
 export const BATCH_SPEECH_EVIDENCE_WINDOW_COUNT = 6;
+export const BATCH_SPEECH_EVIDENCE_SCALED_MIN_SECONDS = 720;
+export const BATCH_SPEECH_EVIDENCE_SCALED_WINDOW_SECONDS = 15;
+export const BATCH_SPEECH_EVIDENCE_SCALED_MIN_WINDOWS = 13;
+export const BATCH_SPEECH_EVIDENCE_SCALED_MAX_WINDOWS = 24;
 
 export type BatchSpeechLevelMeasurement = Readonly<{
   id: string;
@@ -75,8 +79,10 @@ export const planBatchSpeechAlignment = (
 };
 
 /**
- * Keep exact full-output speech evidence for short renders while bounding
- * long-output decoding to six evenly distributed 30-second windows.
+ * Keep exact full-output speech evidence for short renders and the established
+ * six-window route for medium renders. Very long files receive proportionally
+ * more, shorter windows without ever reducing the prior 180-second evidence
+ * budget, capped at six minutes of decoded material.
  */
 export const planDistributedSpeechEvidenceWindows = (
   durationSec: number,
@@ -86,13 +92,25 @@ export const planDistributedSpeechEvidenceWindows = (
     return [{ startSec: 0, durationSec }];
   }
 
-  const windowDurationSec = Math.min(BATCH_SPEECH_EVIDENCE_WINDOW_SECONDS, durationSec);
+  const useScaledEvidence = durationSec > BATCH_SPEECH_EVIDENCE_SCALED_MIN_SECONDS;
+  const windowDurationSec = useScaledEvidence
+    ? BATCH_SPEECH_EVIDENCE_SCALED_WINDOW_SECONDS
+    : BATCH_SPEECH_EVIDENCE_WINDOW_SECONDS;
+  const windowCount = useScaledEvidence
+    ? Math.min(
+      BATCH_SPEECH_EVIDENCE_SCALED_MAX_WINDOWS,
+      Math.max(
+        BATCH_SPEECH_EVIDENCE_SCALED_MIN_WINDOWS,
+        Math.ceil(durationSec / 60),
+      ),
+    )
+    : BATCH_SPEECH_EVIDENCE_WINDOW_COUNT;
   const finalStartSec = Math.max(0, durationSec - windowDurationSec);
   return Array.from(
-    { length: BATCH_SPEECH_EVIDENCE_WINDOW_COUNT },
+    { length: windowCount },
     (_, index): SpeechEvidenceWindow => ({
       startSec: Number(
-        ((finalStartSec * index) / (BATCH_SPEECH_EVIDENCE_WINDOW_COUNT - 1)).toFixed(6),
+        ((finalStartSec * index) / (windowCount - 1)).toFixed(6),
       ),
       durationSec: Number(windowDurationSec.toFixed(6)),
     }),
