@@ -5260,15 +5260,48 @@ describe("actor-decay regressions", () => {
     );
 
     let maximumAddedLiftDb = 0;
+    let maximumAddedLocalContrastDb = Number.NEGATIVE_INFINITY;
+    const addedLiftDb = Array.from(
+      stabilizedGainDb,
+      (valueDb, frame) => valueDb - establishedGainDb[frame],
+    );
     for (let frame = 0; frame < totalFrames; frame += 1) {
       maximumAddedLiftDb = Math.max(
         maximumAddedLiftDb,
-        stabilizedGainDb[frame] - establishedGainDb[frame],
+        addedLiftDb[frame],
+      );
+    }
+    const shoulderFrames = Math.round(400 / FRAME_MS);
+    const coreFrames = Math.round(60 / FRAME_MS);
+    for (
+      let frame = speechRuns[0].startFrame + shoulderFrames;
+      frame + shoulderFrames < speechRuns[0].endFrame;
+      frame += 1
+    ) {
+      const leftShoulder = addedLiftDb.slice(
+        frame - shoulderFrames,
+        frame - coreFrames,
+      );
+      const rightShoulder = addedLiftDb.slice(
+        frame + coreFrames + 1,
+        frame + shoulderFrames + 1,
+      );
+      const shoulderMeanDb = [...leftShoulder, ...rightShoulder].reduce(
+        (sum, valueDb) => sum + valueDb,
+        0,
+      ) / (leftShoulder.length + rightShoulder.length);
+      maximumAddedLocalContrastDb = Math.max(
+        maximumAddedLocalContrastDb,
+        addedLiftDb[frame] - shoulderMeanDb,
       );
     }
     assert.ok(
       maximumAddedLiftDb <= 4.5 + 1e-6,
       `residual authority must not exceed the documented 4.5 dB tier cap, got ${maximumAddedLiftDb.toFixed(3)} dB`,
+    );
+    assert.ok(
+      maximumAddedLocalContrastDb <= 1.9 + 1e-6,
+      `smooth lift must not create a new local word-body crest, got ${maximumAddedLocalContrastDb.toFixed(3)} dB`,
     );
     assert.deepEqual(frameDb, frameSnapshot);
     assert.deepEqual(speechBodyFrameDb, bodySnapshot);

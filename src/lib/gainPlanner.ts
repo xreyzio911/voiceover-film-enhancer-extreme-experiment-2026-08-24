@@ -318,6 +318,8 @@ const WORD_SCALE_BODY_MAX_LIFT_DB = 4.5;
 const WORD_SCALE_BODY_EVIDENCE_KNEE_DB = 0.6;
 const WORD_SCALE_BODY_LONG_UNIT_START_MS = 1_000;
 const WORD_SCALE_BODY_LONG_UNIT_FULL_MS = 1_800;
+const WORD_SCALE_BODY_LOCAL_SHOULDER_MS = 400;
+const WORD_SCALE_BODY_LOCAL_CORE_MS = 60;
 // Leave a small Float32/linear-conversion margin under the 0.3 dB contract.
 const BODY_DYNAMICS_MAX_GAIN_STEP_DB = 0.295;
 const DENSE_BODY_PEAK_RELAXATION_CURVE = 24;
@@ -1331,6 +1333,72 @@ export const recoverRecurrentBodySpeechValleys = (
   return recoveredGainDbCurve;
 };
 
+const projectWordScaleLiftWithoutLocalCrests = (
+  requestedLiftDb: Float32Array,
+  instabilityHint: number,
+  frameMs: number,
+): Float32Array => {
+  const projectedLiftDb = new Float32Array(requestedLiftDb);
+  const shoulderFrames = Math.max(
+    5,
+    Math.round(WORD_SCALE_BODY_LOCAL_SHOULDER_MS / frameMs),
+  );
+  const coreFrames = Math.max(
+    1,
+    Math.round(WORD_SCALE_BODY_LOCAL_CORE_MS / frameMs),
+  );
+  if (projectedLiftDb.length <= shoulderFrames * 2 || coreFrames >= shoulderFrames) {
+    return projectedLiftDb;
+  }
+
+  // Messier sources may use slightly more local authority, but the correction
+  // itself stays below 1.9 dB over its 400 ms shoulders. This constrains only
+  // the added lift; it never attenuates or flattens source-owned expression.
+  const maximumAddedContrastDb =
+    1.55 + 0.35 * clamp(instabilityHint, 0, 1);
+  for (let pass = 0; pass < 2; pass += 1) {
+    const evidenceLiftDb = new Float32Array(projectedLiftDb);
+    const prefixSumDb = new Float64Array(evidenceLiftDb.length + 1);
+    for (let index = 0; index < evidenceLiftDb.length; index += 1) {
+      prefixSumDb[index + 1] = prefixSumDb[index] + evidenceLiftDb[index];
+    }
+    const shoulderFrameCount = shoulderFrames - coreFrames;
+    for (
+      let index = shoulderFrames;
+      index + shoulderFrames < evidenceLiftDb.length;
+      index += 1
+    ) {
+      const leftMeanDb =
+        (prefixSumDb[index - coreFrames] - prefixSumDb[index - shoulderFrames]) /
+        shoulderFrameCount;
+      const rightMeanDb =
+        (prefixSumDb[index + shoulderFrames + 1] -
+          prefixSumDb[index + coreFrames + 1]) /
+        shoulderFrameCount;
+      projectedLiftDb[index] = Math.min(
+        projectedLiftDb[index],
+        (leftMeanDb + rightMeanDb) / 2 + maximumAddedContrastDb,
+      );
+    }
+
+    // Local crest projection only lowers authority. Re-project its neighbors
+    // downward so the bounded contrast cannot introduce a new 10 ms edge.
+    for (let index = 1; index < projectedLiftDb.length; index += 1) {
+      projectedLiftDb[index] = Math.min(
+        projectedLiftDb[index],
+        projectedLiftDb[index - 1] + BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      );
+    }
+    for (let index = projectedLiftDb.length - 2; index >= 0; index -= 1) {
+      projectedLiftDb[index] = Math.min(
+        projectedLiftDb[index],
+        projectedLiftDb[index + 1] + BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      );
+    }
+  }
+  return projectedLiftDb;
+};
+
 /**
  * Partially support repeated word-scale body deficits inside one speech run.
  *
@@ -1369,6 +1437,9 @@ export const stabilizeRecurrentWordScaleBody = (
 
   const windowFrames = Math.max(1, Math.round(WORD_SCALE_BODY_WINDOW_MS / frameMs));
   const halfWindowFrames = Math.max(1, Math.floor(windowFrames / 2));
+  const adaptiveInstabilityHint = Number.isFinite(instabilityHint)
+    ? clamp(instabilityHint, 0, 1)
+    : 0.5;
   const continuousPositiveDb = (valueDb: number) => Math.max(
     0,
     softPositiveDb(valueDb, WORD_SCALE_BODY_EVIDENCE_KNEE_DB) -
@@ -1542,7 +1613,7 @@ export const stabilizeRecurrentWordScaleBody = (
     const runSpreadDb = Math.max(0, sourceP90Db - sourceP10Db);
     const spreadAuthority = 1 / (1 + Math.exp(-(runSpreadDb - 5) / 2));
     const sourceAdaptationAuthority =
-      (0.7 + 0.3 * clamp(instabilityHint, 0, 1)) * spreadAuthority;
+      (0.7 + 0.3 * adaptiveInstabilityHint) * spreadAuthority;
     const unitAuthorityByFrame = new Float32Array(runFrames);
     for (const unit of units) {
       const unitAuthority =
@@ -1569,10 +1640,15 @@ export const stabilizeRecurrentWordScaleBody = (
         requestedLiftDb[index + 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
       );
     }
+    const projectedLiftDb = projectWordScaleLiftWithoutLocalCrests(
+      requestedLiftDb,
+      adaptiveInstabilityHint,
+      frameMs,
+    );
     for (let index = 0; index < runFrames; index += 1) {
       stabilizedGainDbCurve[startFrame + index] = Math.min(
         maxGainDb,
-        stabilizedGainDbCurve[startFrame + index] + requestedLiftDb[index],
+        stabilizedGainDbCurve[startFrame + index] + projectedLiftDb[index],
       );
     }
   }
@@ -2630,7 +2706,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     bodySpeechRuns,
     input.noiseFloorDb,
     maxGainDb,
-    input.instabilityHint,
+    instabilityHint,
     frameMs,
   );
   const slewed = projectWordScaleGainWithoutWorseningEdges(
