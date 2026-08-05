@@ -314,14 +314,14 @@ const RECURRENT_BODY_VALLEY_EVIDENCE_KNEE_DB = 0.5;
 const WORD_SCALE_BODY_WINDOW_MS = 300;
 const WORD_SCALE_BODY_REFERENCE_PERCENTILE = 70;
 const WORD_SCALE_BODY_RECOVERY_FRACTION = 0.62;
-const WORD_SCALE_BODY_MAX_LIFT_DB = 4.5;
+const WORD_SCALE_BODY_MAX_LIFT_DB = 3.6;
 const WORD_SCALE_BODY_EVIDENCE_KNEE_DB = 0.6;
 const WORD_SCALE_BODY_LONG_UNIT_START_MS = 1_000;
 const WORD_SCALE_BODY_LONG_UNIT_FULL_MS = 1_800;
 const WORD_SCALE_BODY_LOCAL_SHOULDER_MS = 400;
 const WORD_SCALE_BODY_LOCAL_CORE_MS = 60;
 // Leave a small Float32/linear-conversion margin under the 0.3 dB contract.
-const BODY_DYNAMICS_MAX_GAIN_STEP_DB = 0.295;
+const BODY_DYNAMICS_MAX_GAIN_STEP_DB = 0.24;
 const DENSE_BODY_PEAK_RELAXATION_CURVE = 24;
 
 /**
@@ -1351,11 +1351,11 @@ const projectWordScaleLiftWithoutLocalCrests = (
     return projectedLiftDb;
   }
 
-  // Messier sources may use slightly more local authority, but the raw budget
-  // keeps a 0.1 dB projection margin below the 1.9 dB shoulder contract. This constrains only
+  // Messier sources may use slightly more local authority, but the safer budget
+  // stays deliberately below the earlier 1.9 dB shoulder contract. This constrains only
   // the added lift; it never attenuates or flattens source-owned expression.
   const maximumAddedContrastDb =
-    1.48 + 0.32 * clamp(instabilityHint, 0, 1);
+    1.18 + 0.22 * clamp(instabilityHint, 0, 1);
   for (let pass = 0; pass < 2; pass += 1) {
     const evidenceLiftDb = new Float32Array(projectedLiftDb);
     const prefixSumDb = new Float64Array(evidenceLiftDb.length + 1);
@@ -1566,8 +1566,12 @@ export const stabilizeRecurrentWordScaleBody = (
       );
       const floorMarginDb = localBodyDb[index] - (noiseFloorDb + 8);
       const floorAuthority = 1 / (1 + Math.exp(-floorMarginDb / 4));
+      const bodyWeakNonVerbalAuthority =
+        1 - 0.6 * smoothUnitRamp(localSourceDb[index] - localBodyDb[index], 6, 12);
       requestedLiftDb[index] =
-        Math.min(WORD_SCALE_BODY_MAX_LIFT_DB, residualLiftDb) * floorAuthority;
+        Math.min(WORD_SCALE_BODY_MAX_LIFT_DB, residualLiftDb) *
+        floorAuthority *
+        bodyWeakNonVerbalAuthority;
     }
 
     type ValleyUnit = Readonly<{
@@ -1621,8 +1625,12 @@ export const stabilizeRecurrentWordScaleBody = (
     const recurrenceAuthority = smoothUnitRamp(recurrenceDiversity, 0, 0.5);
     const runSpreadDb = Math.max(0, sourceP90Db - sourceP10Db);
     const spreadAuthority = 1 / (1 + Math.exp(-(runSpreadDb - 5) / 2));
+    const expressiveSpreadDamping =
+      1 - 0.12 * smoothUnitRamp(runSpreadDb, 12, 20);
     const sourceAdaptationAuthority =
-      (0.7 + 0.3 * adaptiveInstabilityHint) * spreadAuthority;
+      (0.68 + 0.29 * adaptiveInstabilityHint) *
+      spreadAuthority *
+      expressiveSpreadDamping;
     const unitAuthorityByFrame = new Float32Array(runFrames);
     for (const unit of units) {
       const unitAuthority =
@@ -1635,7 +1643,7 @@ export const stabilizeRecurrentWordScaleBody = (
       requestedLiftDb[index] *= unitAuthorityByFrame[index];
     }
 
-    // Least 0.295 dB/frame majorant: the lift itself cannot introduce a word
+    // Least 0.24 dB/frame majorant: the lift itself cannot introduce a word
     // edge, even when the source envelope has an abrupt valley boundary.
     for (let index = 1; index < requestedLiftDb.length; index += 1) {
       requestedLiftDb[index] = Math.max(
@@ -1668,7 +1676,7 @@ export const stabilizeRecurrentWordScaleBody = (
 /**
  * Keep the added word-scale tier from making any existing planner edge steeper.
  * The edge allowance is the larger of the established curve's movement and
- * the 0.295 dB body-motion contract. This preserves source-owned transient and
+ * the 0.24 dB body-motion contract. This preserves source-owned transient and
  * onset authority, while the projection can only lower candidate gain and can
  * therefore never introduce a new headroom risk.
  */

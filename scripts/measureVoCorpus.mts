@@ -16,6 +16,7 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   readdir,
   realpath,
   stat,
@@ -680,12 +681,21 @@ const summarize = (
 
 export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) => {
   let output: string | null = null;
+  let pairsJson: string | null = null;
   const pairSpecs: string[] = [];
   for (let index = 0; index < argumentsList.length; index += 1) {
     const argument = argumentsList[index];
     if (argument === "--out") {
       if (output !== null) throw new Error("--out may only be supplied once.");
       output = argumentsList[index + 1] ?? null;
+      index += 1;
+      continue;
+    }
+    if (argument === "--pairs-json") {
+      if (pairsJson !== null) throw new Error("--pairs-json may only be supplied once.");
+      const pairsJsonPath = argumentsList[index + 1];
+      if (pairsJsonPath === undefined) throw new Error("--pairs-json requires a JSON path.");
+      pairsJson = pairsJsonPath;
       index += 1;
       continue;
     }
@@ -704,7 +714,63 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
   if (output === null || output.trim() === "") {
     throw new Error("Usage requires --out <tasks/render-evidence/...json>.");
   }
-  return { output, pairSpecs: [...pairSpecs] };
+  return { output, pairSpecs: [...pairSpecs], pairsJson };
+};
+
+type ExplicitPairManifestEntry = Readonly<{
+  id?: unknown;
+  result?: unknown;
+  source?: unknown;
+}>;
+
+const resolveJsonPathInsideRepo = async (repoRoot: string, requestedPath: string) => {
+  if (!requestedPath.trim()) throw new Error("--pairs-json requires a JSON path.");
+  if (path.extname(requestedPath).toLowerCase() !== ".json") {
+    throw new Error("--pairs-json must end in .json.");
+  }
+  const absolutePath = path.resolve(repoRoot, requestedPath);
+  if (!isPathInside(repoRoot, absolutePath)) {
+    throw new Error("--pairs-json path must stay inside the repository.");
+  }
+  const realRepoRoot = await realpath(repoRoot);
+  const realJsonPath = await realpath(absolutePath);
+  if (!isPathInside(realRepoRoot, realJsonPath)) {
+    throw new Error("--pairs-json path must resolve inside the repository.");
+  }
+  return absolutePath;
+};
+
+const normalizePairManifestEntries = (parsed: unknown): readonly ExplicitPairManifestEntry[] => {
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as { pairs?: unknown }).pairs)
+      ? (parsed as { pairs: unknown[] }).pairs
+      : null;
+  if (!entries) throw new Error("--pairs-json must contain an array or an object with a pairs array.");
+  return entries as readonly ExplicitPairManifestEntry[];
+};
+
+/** Load explicit source/result/id specs from a repo-local JSON manifest. */
+export const readExplicitPairSpecsJson = async (
+  repoRoot: string,
+  requestedPath: string,
+): Promise<readonly string[]> => {
+  const jsonPath = await resolveJsonPathInsideRepo(repoRoot, requestedPath);
+  const parsed = JSON.parse(await readFile(jsonPath, "utf8")) as unknown;
+  const entries = normalizePairManifestEntries(parsed);
+  if (entries.length > MAX_EXPLICIT_PAIRS) {
+    throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
+  }
+  return entries.map((entry, index) => {
+    if (
+      typeof entry.source !== "string" ||
+      typeof entry.result !== "string" ||
+      typeof entry.id !== "string"
+    ) {
+      throw new Error(`--pairs-json entry ${index + 1} requires string source, result, and id fields.`);
+    }
+    return `${entry.source}|${entry.result}|${entry.id}`;
+  });
 };
 
 const toLedgerCorpusFile = (file: CorpusFile) => ({
@@ -716,12 +782,17 @@ const toLedgerCorpusFile = (file: CorpusFile) => ({
 
 const main = async () => {
   const repoRoot = process.cwd();
-  const { output, pairSpecs } = parseMeasureVoCorpusArguments(process.argv.slice(2));
+  const { output, pairSpecs, pairsJson } = parseMeasureVoCorpusArguments(process.argv.slice(2));
   const outputPath = await prepareLedgerOutputPath(repoRoot, output);
-  const discovery: CorpusDiscovery = pairSpecs.length === 0
+  const jsonPairSpecs = pairsJson ? await readExplicitPairSpecsJson(repoRoot, pairsJson) : [];
+  const explicitPairSpecs = [...pairSpecs, ...jsonPairSpecs];
+  if (explicitPairSpecs.length > MAX_EXPLICIT_PAIRS) {
+    throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
+  }
+  const discovery: CorpusDiscovery = explicitPairSpecs.length === 0
     ? await discoverCorpusPairs(repoRoot)
     : {
-        pairs: await resolveExplicitCorpusPairs(repoRoot, pairSpecs),
+        pairs: await resolveExplicitCorpusPairs(repoRoot, explicitPairSpecs),
         unmatchedSources: [],
         unmatchedResults: [],
         missingRoots: [],

@@ -1,3 +1,30 @@
+# Word-Scale Body Arc Follow-up
+
+## Checklist
+
+- [x] Treat the attached critique as an implementation hypothesis, reproduce its claimed gap, and preserve the untouched 472-pass / 1-skip audio-QC baseline.
+- [x] Add RED regressions for a symmetric head-mid-tail arc, recurrent 300-1000 ms body deficits, expressive retention, gain-motion bounds, and the advisory metric blind spot.
+- [x] Add one bounded source-relative word-scale tier inside the existing planner; add no compressor, gate, candidate rejection, cancellation, or second dynamics stack.
+- [x] Keep the older onset, tail, consonant, room, micro-sag, expressive-vocalization, protected-output, chunk, and exact-timing contracts green.
+- [x] Add an advisory `intraRunArc` lane that keeps body-supported expressive windows and reports signed head/mid/tail shape without changing the conservative `intraRunBody` lane.
+- [x] Increase very-long-file distributed batch evidence without reducing short/medium coverage, and fix bounded WAV inspection for valid large pre-data metadata chunks.
+- [x] Rerender targeted evidence through the exact browser delivery path; compare hashes, geometry, old/new metrics, and level-matched audio where artifact extraction was available.
+- [x] Iterate within the bounded variant budget, then rerender and measure all 31 exact corpus sources after targeted evidence was positive.
+- [x] Obtain session-only Gemini 3.6 Flash high-thinking audio/DSP review, delete every remote upload, and keep the API key out of files/logs.
+- [x] Run final TypeScript, lint, production build, dependency/security checks, and owner diff review.
+- [ ] Push and deploy through the exact X Chrome profile, then verify the production URL.
+
+## Current Evidence
+
+- RED reproduction: the prior planner narrowed the recurrent word-scale fixture by only `0.80 dB`; its largest established gain edge was `0.887 dB/10 ms`. The symmetric arc already received `2.87 dB` of incidental support, but its largest established gain edge was `1.706 dB/10 ms`, showing that endpoint-only trend metrics were not the right diagnosis.
+- GREEN synthetic result after the conservative follow-up: recurrent word-scale body deficits still narrow materially (`3.0-5.5 dB` contract) while hot voiced expression must keep at least an `8 dB` advantage. Symmetric arc support stays bilateral and source-shaped rather than endpoint-only.
+- The added lift itself stays below `0.24 dB/10 ms`; a differential projection prevents it from steepening a pre-existing planner edge. It never raises gain above the bounded candidate and never undoes source-owned attenuation.
+- The word-scale tier uses 300 ms body/broadband evidence, a P70 ordinary-body reference, raw-envelope valley cores, recurrence diversity outside the strongest single unit, continuous 0.3-1.0 s duration authority, long-unit damping, floor authority, a `3.6 dB` lift cap, non-verbal body-weak damping, and the existing max-gain budget. A lone whisper, localized terminal fade, or body-weak sigh/laugh/groan has reduced authority rather than a hard rejection gate; hot expression is never attenuated by this lift-only stage.
+- Exact browser v4 corpus evidence measured 31/31 delivered WAVs with 0 errors after the word-scale arc implementation. Median old -> v4: signed drift `+0.0275 -> +0.0110 dB/min`, body spread delta `-2.3937 -> -2.7427 dB`, intra-run body median `-1.2801 -> -1.5355 dB`, intra-run body P90 `-0.0375 -> -0.1995 dB`, expressive retention P10 `0.8095 -> 0.8029`. The remaining outliers were mostly body-weak non-verbal reactions, so the final patch added continuous damping for those frames.
+- Gemini 3.6 Flash high-thinking audition was session-only and advisory. It judged the v4 speech-body/cinematic stability as a material improvement, but flagged lifted sigh/groan/laugh/breath moments on Seth, Martina, and Rena; that directly informed the final continuous non-verbal authority damping. All eight temporary Gemini file uploads were deleted, and no key or SDK/runtime integration was added.
+- A complete v5 browser rerender was attempted after the final damping patch, but Chrome stopped exposing fresh WAV downloads/media artifacts even after generated Downloads WAVs were moved into a repo evidence archive. The final damping patch is therefore covered by focused/full automated tests and the v4 exact browser corpus evidence, not by a second complete rendered corpus ledger.
+- Final local verification passed after the last parser/DSP patch: focused planner `121/121`, voice-stability `28/28`, full audio-QC `483` pass with `1` intentional optional skip, TypeScript, lint with `0` errors and only the pre-existing warnings in `scripts/diagGainVsLevel.mts`, production build, and `npm audit --audit-level=high` with 0 vulnerabilities. `git diff --check` reported only Windows LF-to-CRLF notices.
+
 # Post-b7 VO Stability Adjustment
 
 ## Checklist

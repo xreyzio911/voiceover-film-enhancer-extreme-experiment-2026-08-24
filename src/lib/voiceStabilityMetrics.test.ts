@@ -14,6 +14,7 @@ import {
   MAX_EXPLICIT_PAIRS,
   parseMeasureVoCorpusArguments,
   prepareLedgerOutputPath,
+  readExplicitPairSpecsJson,
   resolveExplicitCorpusPairs,
   resolveLedgerOutputPath,
 } from "../../scripts/measureVoCorpus.mts";
@@ -607,6 +608,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
     {
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [],
+      pairsJson: null,
     },
   );
   assert.deepEqual(
@@ -624,8 +626,62 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
         "clips/a-source.wav|clips/a-result.wav|audition-a",
         "clips/b-source.wav|clips/b-result.wav|audition-b",
       ],
+      pairsJson: null,
     },
   );
+  assert.deepEqual(
+    parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--pairs-json",
+      "tasks/render-evidence/current-goal/pairs.json",
+    ]),
+    {
+      output: "tasks/render-evidence/current-goal/audition.json",
+      pairSpecs: [],
+      pairsJson: "tasks/render-evidence/current-goal/pairs.json",
+    },
+  );
+  assert.throws(
+    () => parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--pairs-json",
+    ]),
+    /requires a JSON path/i,
+  );
+});
+
+test("measure CLI loads explicit pairs from a repo-local JSON manifest", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-pairs-json-"));
+  try {
+    const manifest = path.join(root, "tasks/render-evidence/current-goal/pairs.json");
+    await mkdir(path.dirname(manifest), { recursive: true });
+    await writeFile(
+      manifest,
+      JSON.stringify({
+        pairs: [
+          {
+            source: "clips/a-source.wav",
+            result: "clips/a-result.wav",
+            id: "audition-a",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    assert.deepEqual(
+      await readExplicitPairSpecsJson(root, "tasks/render-evidence/current-goal/pairs.json"),
+      ["clips/a-source.wav|clips/a-result.wav|audition-a"],
+    );
+    await assert.rejects(
+      () => readExplicitPairSpecsJson(root, "../outside.json"),
+      /inside the repository/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("corpus evidence records a deterministic full-file SHA-256 identity", async () => {

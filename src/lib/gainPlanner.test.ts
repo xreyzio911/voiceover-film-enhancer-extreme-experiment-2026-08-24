@@ -5296,18 +5296,18 @@ describe("actor-decay regressions", () => {
       );
     }
     assert.ok(
-      maximumAddedLiftDb <= 4.5 + 1e-6,
-      `residual authority must not exceed the documented 4.5 dB tier cap, got ${maximumAddedLiftDb.toFixed(3)} dB`,
+      maximumAddedLiftDb <= 3.6 + 1e-6,
+      `residual authority must not exceed the documented 3.6 dB tier cap, got ${maximumAddedLiftDb.toFixed(3)} dB`,
     );
     const minimumValleyCenterLiftDb = Math.min(
       ...[75, 175, 275].map((frame) => addedLiftDb[frame]),
     );
     assert.ok(
-      minimumValleyCenterLiftDb >= 3.2,
+      minimumValleyCenterLiftDb >= 2.6,
       `local-contrast projection must retain material recurrent recovery, got ${minimumValleyCenterLiftDb.toFixed(3)} dB`,
     );
     assert.ok(
-      maximumAddedLocalContrastDb <= 1.9 + 1e-6,
+      maximumAddedLocalContrastDb <= 1.43,
       `smooth lift must not create a new local word-body crest, got ${maximumAddedLocalContrastDb.toFixed(3)} dB`,
     );
     assert.deepEqual(frameDb, frameSnapshot);
@@ -5398,7 +5398,7 @@ describe("actor-decay regressions", () => {
       `narrowing ${narrowingDb.toFixed(2)}, expressive advantage ${retainedExpressiveAdvantageDb.toFixed(2)}, ` +
       `planner slew ${largestGainStepDb.toFixed(3)}, correction slew ${largestCorrectionStepDb.toFixed(3)} dB`;
     assert.ok(
-      narrowingDb >= 3.5 && narrowingDb <= 6,
+      narrowingDb >= 3.0 && narrowingDb <= 5.5,
       `recurrent 300-1000 ms body deficits need a material but bounded source-adaptive ride (${wordLedger})`,
     );
     assert.ok(
@@ -5406,8 +5406,8 @@ describe("actor-decay regressions", () => {
       `hot voiced expression must remain clearly dominant (${wordLedger})`,
     );
     assert.ok(
-      largestCorrectionStepDb <= 0.3,
-      `the added word-scale lift must keep the 0.3 dB/10 ms slew contract (${wordLedger})`,
+      largestCorrectionStepDb <= 0.24 + 1e-6,
+      `the added word-scale lift must keep the safer 0.24 dB/10 ms slew contract (${wordLedger})`,
     );
     assert.ok(
       largestGainStepDb <= 0.9,
@@ -5571,10 +5571,10 @@ describe("actor-decay regressions", () => {
       `source deficit ${sourceDeficitDb.toFixed(4)}, output deficit ${outputDeficitDb.toFixed(4)}, ` +
       `source expression ${sourceExpressiveContrastDb.toFixed(2)}, output expression ${outputExpressiveContrastDb.toFixed(2)}, ` +
       `slew ${largestGainStepDb.toFixed(3)}, quiet control ${outputQuietContrastDb.toFixed(2)} dB`;
-    // With a 16-frame clean gap, the strict 0.3 dB/frame two-sided slew can
-    // supply at most 2.4 dB of relative fill without creating a new gain step.
+    // With a 16-frame clean gap, the stricter 0.24 dB/frame two-sided slew can
+    // supply roughly 2 dB of relative fill without creating a new gain step.
     assert.ok(
-      outputDeficitDb >= 4.5 && outputDeficitDb <= 7.65,
+      outputDeficitDb >= 7.5 && outputDeficitDb <= 8.2,
       `recurrent 80 ms body holes need bounded fill without hard flattening (${stabilityLedger})`,
     );
     assert.ok(
@@ -5586,7 +5586,7 @@ describe("actor-decay regressions", () => {
       `planner may withdraw at most 3 dB of expressive contrast (${stabilityLedger})`,
     );
     assert.ok(
-      largestGainStepDb <= 0.3,
+      largestGainStepDb <= 0.24 + 1e-6,
       `micro-sag support must remain a smooth ride (${stabilityLedger})`,
     );
     assert.ok(
@@ -5596,6 +5596,39 @@ describe("actor-decay regressions", () => {
     assert.ok(
       Math.abs(outputQuietContrastDb - sourceQuietContrastDb) <= 1.5,
       `intentional quiet contrast may change by at most 1.5 dB, source ${sourceQuietContrastDb.toFixed(2)} vs output ${outputQuietContrastDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("cinematic stability: backs off recurrent lift on body-weak non-verbal reactions", () => {
+    const totalFrames = 400;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [{ startFrame: 50, endFrame: 350 }];
+    for (let unit = 0; unit < 6; unit += 1) {
+      const startFrame = 50 + unit * 50;
+      const isReaction = unit % 2 === 0;
+      for (let frame = startFrame; frame < startFrame + 50; frame += 1) {
+        frameDb[frame] = isReaction ? -36 : -23;
+        speechBodyFrameDb[frame] = isReaction ? -46 : -23;
+      }
+    }
+
+    const stabilizedGainDb = stabilizeRecurrentWordScaleBody(
+      new Float32Array(totalFrames),
+      frameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      -82,
+      14,
+      0.9,
+      FRAME_MS,
+    );
+    const reactionLiftDb = [75, 175, 275].map((frame) => stabilizedGainDb[frame]);
+    const maximumReactionLiftDb = Math.max(...reactionLiftDb);
+
+    assert.ok(
+      maximumReactionLiftDb <= 1.7,
+      `body-weak sigh/laugh-like reactions must stay below dialogue gain, got ${maximumReactionLiftDb.toFixed(3)} dB`,
     );
   });
 
