@@ -117,11 +117,6 @@ test("planner no-plan output stays source-preserving through every later deliver
     "const alignBatchMixReadyOutputs = async",
     "const applyFinalConsonantResidualToOutputs = async",
   );
-  const batchPlanningMeasurementBlock = textBetween(
-    batchAlignmentBlock,
-    "for (const target of variantTargets)",
-    "const groupMeasurements =",
-  );
   const renderFallbackBlock = sourceBetween(
     "const renderMixReadyWithFallbacks = async",
     "let lastMixError: unknown = null",
@@ -282,6 +277,11 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
   const batchAlignmentBlock = sourceBetween(
     "const alignBatchMixReadyOutputs = async",
     "const applyFinalConsonantResidualToOutputs = async",
+  );
+  const batchPlanningMeasurementBlock = textBetween(
+    batchAlignmentBlock,
+    "for (const target of variantTargets)",
+    "const groupMeasurements =",
   );
   const longFormBlock = sourceBetween(
     "const renderLongFormSafeMode = async",
@@ -1243,7 +1243,7 @@ test("final residual sweep precedes batch measurement so alignment uses the fina
   );
   const finalDeliveryBlock = textBetween(
     processFilesBlock,
-    "if (loudnessConfig === null) {",
+    "let finalOutputEntries = outputEntries;",
     "setReviewBundles(finalReviewBundles)",
   );
 

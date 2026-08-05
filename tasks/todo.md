@@ -6,13 +6,14 @@
 - [x] Reject unproven word-scale compressor/AGC, stronger limiter drive, fixed house curve, and broad tail/release changes where the evidence was broadband/LF or otherwise under-specified.
 - [x] Add advisory-only absolute drift, 180-3000 Hz body-spike, and intra-run body-spread diagnostics so broadband cleanup artifacts are separated from actual voiced-body instability.
 - [x] Improve runtime batch volume stability by planning batch alignment from speech-weighted energy measured from bounded, distributed windows of the actual final WAV blobs, while keeping existing true-peak and positive-headroom safety validation.
+- [x] Remove the remaining long-WAV measurement copy, refresh the worker before unavoidable large alignment renders, and run the source-relative consonant residual before alignment so the batch anchor sees the final pre-alignment candidate bytes.
 - [x] Protect private local review corpora with exact root-only ignores for `/bug/` and `/another testing/`.
-- [x] Measure all 31 manifest-pinned, exact delivered browser WAV pairs rather than accepting stale in-folder result discovery.
-- [x] Run focused tests, full audio-QC suite, TypeScript, lint, production build, security audit, and final deployment/runtime checks after the bounded batch-alignment correction.
+- [x] Measure all 31 adjudicated exact delivered browser WAV pairs with full source/result SHA-256 identities rather than accepting stale path discovery or a manifest that predates protected-output overrides.
+- [ ] Run focused tests, full audio-QC suite, TypeScript, lint, production build, security audit, independent re-review, and final deployment/runtime checks after the bounded-Blob correction.
 
 ## Evidence
 
-- 31/31 manifest-pinned source/delivered-browser pairs measured with 0 errors at `tasks/render-evidence/current-goal/post-b7-adjustment/voice-stability-exact-delivered-v1.json`. Explicit pairs override older files under discovered `result/` folders, including protected recovery outputs.
+- 31/31 adjudicated source/delivered-browser pairs measured with 0 errors and 31/31 valid source/result SHA-256 identities at `tasks/render-evidence/current-goal/post-b7-adjustment/voice-stability-exact-delivered-v3-hashed.json`. The v3 pair list preserves the exact protected Seth/Simone overrides; a manifest-only v2 rerun was retained but superseded after its differing summary exposed those two older paths.
 - Exact delivered corpus medians: candidate absolute drift is less downward than source (`-0.0798` versus `-0.1988 dB/min`); processing-delta drift is `+0.0275 dB/min`; body spread improves by `-2.3937 dB`; robust intra-run body spread improves by `-1.2801 dB` at the median and `-0.0375 dB` at P90; expressive-contrast retention P10 is `0.8095`.
 - Existing Seth broadband down-spikes were not treated as a planner/tail failure because source/body evidence showed LF cleanup dominance, not voiced-body collapse.
 - Remaining worst-decile intra-run results (Antonio `+2.29 dB`, Arthur `+1.84 dB`, Julie `+1.23 dB`, Seth `+0.79 dB`) stay advisory: they are not sufficient evidence for a word-scale compressor, release rewrite, or candidate rejection without a creating-stage diagnosis and level-matched audition.

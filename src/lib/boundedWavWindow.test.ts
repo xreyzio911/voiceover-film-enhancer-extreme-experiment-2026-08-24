@@ -80,7 +80,10 @@ test("slices a final-WAV Blob without materializing the complete file", async ()
 
   const sampleRate = 48_000;
   const samples = buildRamp(sampleRate, 4);
-  const blob = new WholeReadTrackingBlob([encodeWavFloat32(samples, sampleRate, 1)]);
+  const encoded = encodeWavFloat32(samples, sampleRate, 1);
+  const encodedBuffer = new ArrayBuffer(encoded.byteLength);
+  new Uint8Array(encodedBuffer).set(encoded);
+  const blob = new WholeReadTrackingBlob([encodedBuffer]);
   const info = await inspectMonoFloat32WavBlob(blob);
   const window = await sliceMonoFloat32WavBlob(blob, info, 1.25, 0.5);
   const decoded = decodeWav(window.bytes);

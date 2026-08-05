@@ -107,8 +107,10 @@ import {
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import {
   estimateCanonicalMonoFloat32WavBytes,
+  inspectMonoFloat32WavBlob,
   inspectMonoFloat32Wav,
   shouldUseBoundedWavQc,
+  sliceMonoFloat32WavBlob,
   sliceMonoFloat32Wav,
 } from "../lib/boundedWavWindow";
 import {
@@ -240,6 +242,7 @@ const SEGMENT_GAIN_MATCH_MIN_DELTA_DB = 0.35;
 const SEGMENT_GAIN_MATCH_MAX_DB = 1.8;
 const BATCH_MEMORY_GUARD_FILE_THRESHOLD = 8;
 const BATCH_MEMORY_GUARD_INTERVAL = 3;
+const BATCH_FULL_BLOB_COPY_RECYCLE_BYTES = 64 * 1024 * 1024;
 
 /**
  * Cumulative audio (in seconds) the active ffmpeg worker may process before
@@ -5895,6 +5898,22 @@ const summarizeFailureReason = (error: unknown) => {
       setStatus("Finalizing batch loudness alignment");
     };
 
+    const recycleBeforeFullBlobCopy = async (
+      entry: OutputEntry,
+      stage: "measure" | "render",
+    ) => {
+      const byteLength = Math.max(entry.size, entry.blob.size);
+      if (byteLength < BATCH_FULL_BLOB_COPY_RECYCLE_BYTES) {
+        await recycleBeforeOperation(stage);
+        return;
+      }
+      activeFfmpeg = await refreshFfmpeg(
+        `batch loudness alignment ${stage} large-WAV memory guard (${(byteLength / (1024 * 1024)).toFixed(1)} MB)`,
+      );
+      cumulativeAudioSec = 0;
+      setStatus("Finalizing batch loudness alignment");
+    };
+
     const noteProcessedAudio = (entry: OutputEntry) => {
       cumulativeAudioSec += estimateOutputAudioSeconds(entry);
     };
@@ -5928,21 +5947,20 @@ const summarizeFailureReason = (error: unknown) => {
 
           const inputName = `batch_align_${target.index}_measure.wav`;
           try {
-            await activeFfmpeg.writeFile(inputName, new Uint8Array(await target.entry.blob.arrayBuffer()));
-            try {
-              const speechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, inputName);
-              speechLevelByIndex.set(target.index, speechLevelDb);
-              if (speechLevelDb !== null && Number.isFinite(speechLevelDb)) {
-                const values = measurementsByGroup.get(target.groupId) ?? [];
-                values.push(speechLevelDb);
-                measurementsByGroup.set(target.groupId, values);
-              }
-            } catch (error) {
-              appendLog(`[BatchAlign] ${target.entry.name}: speech-energy measure skipped (${describeError(error)}).`);
-              speechLevelByIndex.set(target.index, null);
+            const speechLevelDb = await measureBatchSpeechLevelDbFromBlob(
+              activeFfmpeg,
+              target.entry.blob,
+              inputName,
+            );
+            speechLevelByIndex.set(target.index, speechLevelDb);
+            if (speechLevelDb !== null && Number.isFinite(speechLevelDb)) {
+              const values = measurementsByGroup.get(target.groupId) ?? [];
+              values.push(speechLevelDb);
+              measurementsByGroup.set(target.groupId, values);
             }
-          } finally {
-            await safeDeleteFile(activeFfmpeg, inputName);
+          } catch (error) {
+            appendLog(`[BatchAlign] ${target.entry.name}: speech-energy measure skipped (${describeError(error)}).`);
+            speechLevelByIndex.set(target.index, null);
           }
           noteProcessedAudio(target.entry);
         }
@@ -5993,7 +6011,7 @@ const summarizeFailureReason = (error: unknown) => {
               );
               continue;
             }
-            await recycleBeforeOperation("render");
+            await recycleBeforeFullBlobCopy(target.entry, "render");
             const inputName = `batch_align_${target.index}_in.wav`;
             const outputName = `batch_align_${target.index}_out.wav`;
             let nextEntry = target.entry;
@@ -6781,6 +6799,41 @@ const summarizeFailureReason = (error: unknown) => {
         appendLog(
           `[BatchAlign] ${targetName}: speech window @ ${window.startSec.toFixed(1)}s skipped (${describeError(error)}).`,
         );
+      }
+    }
+    return percentile(speechLevelsDb, 50);
+  };
+
+  const measureBatchSpeechLevelDbFromBlob = async (
+    ffmpeg: FFmpeg,
+    blob: Blob,
+    targetName: string,
+  ) => {
+    const info = await inspectMonoFloat32WavBlob(blob);
+    const windows = planDistributedSpeechEvidenceWindows(info.durationSec);
+    const speechLevelsDb: number[] = [];
+    for (let index = 0; index < windows.length; index += 1) {
+      const window = windows[index];
+      const windowName = `${sanitizeBase(targetName)}_speech_${index}.wav`;
+      try {
+        const boundedWindow = await sliceMonoFloat32WavBlob(
+          blob,
+          info,
+          window.startSec,
+          window.durationSec,
+        );
+        await ffmpeg.writeFile(windowName, boundedWindow.bytes);
+        const evidence = await measureFinalPolishEvidenceFromVirtualWav(ffmpeg, windowName);
+        const speechLevelDb = evidence?.speechKWeightedEnergyDb;
+        if (speechLevelDb !== null && speechLevelDb !== undefined && Number.isFinite(speechLevelDb)) {
+          speechLevelsDb.push(speechLevelDb);
+        }
+      } catch (error) {
+        appendLog(
+          `[BatchAlign] ${targetName}: bounded speech window @ ${window.startSec.toFixed(1)}s skipped (${describeError(error)}).`,
+        );
+      } finally {
+        await safeDeleteFile(ffmpeg, windowName);
       }
     }
     return percentile(speechLevelsDb, 50);
@@ -9506,20 +9559,6 @@ const summarizeFailureReason = (error: unknown) => {
         }
       }
 
-      if (loudnessConfig === null) {
-        try {
-          ffmpeg = await alignBatchMixReadyOutputs(
-            ffmpeg,
-            outputEntries,
-            sourceSafetyEvidenceByBase,
-          );
-        } catch (error) {
-          hadErrors = true;
-          appendLog(
-            `[BatchAlign] finalization failed; completed original outputs kept (${describeError(error)}).`,
-          );
-        }
-      }
       let finalOutputEntries = outputEntries;
       try {
         finalConsonantPassStarted = true;
@@ -9532,6 +9571,20 @@ const summarizeFailureReason = (error: unknown) => {
         appendLog(
           `[FinalPeakTamer] finalization failed; completed original outputs kept (${describeError(error)}).`,
         );
+      }
+      if (loudnessConfig === null) {
+        try {
+          ffmpeg = await alignBatchMixReadyOutputs(
+            ffmpeg,
+            finalOutputEntries,
+            sourceSafetyEvidenceByBase,
+          );
+        } catch (error) {
+          hadErrors = true;
+          appendLog(
+            `[BatchAlign] finalization failed; completed pre-alignment outputs kept (${describeError(error)}).`,
+          );
+        }
       }
       const finalReviewBundles = await buildFinalReviewBundles(
         nextReviewBundles,

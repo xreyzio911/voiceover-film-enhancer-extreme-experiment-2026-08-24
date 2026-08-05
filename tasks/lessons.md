@@ -1,10 +1,10 @@
 # Lessons
 
-## 2026-08-05 - Delivered Manifests Outrank Discovered Result Folders
+## 2026-08-05 - Delivered Byte Identity Outranks Path Discovery
 
-- What went wrong: The default corpus discovery paired sources with older files in nearby `result/` folders, producing plausible but stale release metrics even though the exact browser-delivered WAVs had different hashes.
-- Rule to prevent it: Pin release measurements to the render manifest and explicit source/result pairs; treat a path match as unverified whenever it does not identify the exact delivered bytes.
-- How to verify next time: Compare hashes or manifest paths before measuring, report the exact ledger path, and never carry stale-pair outliers into a DSP decision.
+- What went wrong: Default discovery paired older nearby results, and the original render manifest still pointed to pre-protected Seth/Simone outputs; both produced plausible but stale release metrics.
+- Rule to prevent it: Pin release measurements to the adjudicated explicit pair list, including later protected-output overrides, and record full source/result SHA-256 identities; neither a filename nor a manifest path alone proves the delivered bytes.
+- How to verify next time: Require hashes for every measured pair, compare the rerun summary to the adjudicated ledger, report the exact ledger path, and never carry stale-pair outliers into a DSP decision.
 
 ## 2026-08-05 - Separate Broadband Cleanup From Voiced-Body Instability
 
@@ -15,8 +15,8 @@
 ## 2026-08-05 - Batch Alignment Should Follow Speech, Not Room Time
 
 - What went wrong: Whole-file integrated loudness can be biased by long pauses, tails, or room tone, causing batch alignment offsets that do not match perceived dialogue loudness.
-- Rule to prevent it: Plan batch alignment from speech-weighted energy measured from the final emitted WAV blob; keep true-peak and positive-gain headroom validation after rendering.
-- How to verify next time: Contract-test the measurement source and run a sparse-speech/long-room batch fixture before changing alignment thresholds.
+- Rule to prevent it: Run the final source-relative residual first, then plan batch alignment from speech-weighted energy read through bounded Blob slices; keep true-peak, direction, and positive-gain headroom validation after rendering.
+- How to verify next time: Contract-test finalizer order and the absence of a whole-Blob planning read, then run a sparse-speech/long-room batch fixture before changing alignment thresholds.
 
 ## 2026-07-24 - Judge Micro-Dips In The Speech Body, Not Gain Motion Alone
 

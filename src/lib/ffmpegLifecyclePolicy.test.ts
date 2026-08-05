@@ -129,6 +129,9 @@ test("VoLeveler applies lifecycle policies at the listener and before alignment 
 
   assert.match(source, /shouldPublishGenericFfmpegProgress\(activeBase\)/);
   assert.match(alignmentSource, /await recycleBeforeOperation\("measure"\)[\s\S]*?writeFile\(inputName/);
-  assert.match(alignmentSource, /await recycleBeforeOperation\("render"\)[\s\S]*?writeFile\(inputName/);
+  assert.match(
+    alignmentSource,
+    /const recycleBeforeFullBlobCopy[\s\S]*?await recycleBeforeOperation\(stage\)[\s\S]*?refreshFfmpeg\([\s\S]*?await recycleBeforeFullBlobCopy\(target\.entry, "render"\)[\s\S]*?writeFile\(inputName/,
+  );
   assert.doesNotMatch(alignmentSource, /await noteProcessedAudio/);
 });

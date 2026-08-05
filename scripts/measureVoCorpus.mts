@@ -11,6 +11,7 @@
  *   npm run measure:vo-corpus -- --out tasks/render-evidence/current-goal/audition.json \
  *     --pair "clips/source.wav|clips/result.wav|audition-id"
  */
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -44,6 +45,7 @@ const CORPUS_ROOTS = [
 const DEFAULT_FRAME_MS = 20;
 const DEFAULT_CHUNK_SECONDS = 20;
 const BODY_FILTER_WARMUP_MS = 200;
+const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 export const MAX_EXPLICIT_PAIRS = 64;
 const OPTIONAL_HISTORICAL_RESULTS = [
   {
@@ -92,6 +94,8 @@ type PairLedgerEntry = Readonly<{
   corpus: string;
   source: string;
   result: string;
+  sourceSha256?: string;
+  resultSha256?: string;
   status: "measured" | "error";
   sourceWav?: ReturnType<typeof wavLedgerMetadata>;
   resultWav?: ReturnType<typeof wavLedgerMetadata>;
@@ -552,19 +556,41 @@ const wavLedgerMetadata = (extracted: ExtractedEvidence) => ({
 const safeErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
+export const hashFileSha256 = async (filePath: string) => {
+  const handle = await open(filePath, "r");
+  const hash = createHash("sha256");
+  const buffer = new Uint8Array(HASH_CHUNK_BYTES);
+  let position = 0;
+  try {
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    return hash.digest("hex");
+  } finally {
+    await handle.close();
+  }
+};
+
 const measurePair = async (
   pair: CorpusPair,
   frameMs: number,
   chunkSeconds: number,
 ): Promise<PairLedgerEntry> => {
   try {
+    const sourceSha256 = await hashFileSha256(pair.source.path);
     const source = await extractEnvelopeEvidence(pair.source.path, frameMs, chunkSeconds);
+    const resultSha256 = await hashFileSha256(pair.result.path);
     const result = await extractEnvelopeEvidence(pair.result.path, frameMs, chunkSeconds);
     return {
       id: pair.id,
       corpus: pair.corpus,
       source: pair.source.relativePath,
       result: pair.result.relativePath,
+      sourceSha256,
+      resultSha256,
       status: "measured",
       sourceWav: wavLedgerMetadata(source),
       resultWav: wavLedgerMetadata(result),
@@ -697,13 +723,14 @@ const main = async () => {
   }
 
   const ledger = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     advisoryOnly: true,
     generatedAt: new Date().toISOString(),
     definitions: {
       frameMs: DEFAULT_FRAME_MS,
       decodedChunkSeconds: DEFAULT_CHUNK_SECONDS,
       processingModel: "one pair at a time; source and result read sequentially in bounded ranges",
+      fileIdentity: "full-file SHA-256 for both source and result; paths alone are not treated as delivered-byte identity",
       drift: "median source, candidate, and candidate-minus-source dB by 10 s source-speech section; bounded-lag robust absolute and processing-delta slopes in dB/min",
       alignment: "gain-centered global envelope lag searched within +/-250 ms before comparison",
       spikes: "broadband candidate local up/down contrast beyond the source +/-20 ms neighborhood; retains cleanup-artifact visibility separately from voice-body stability",
