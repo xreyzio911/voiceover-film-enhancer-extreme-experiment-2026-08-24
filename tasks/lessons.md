@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-08-05 - Delivered Manifests Outrank Discovered Result Folders
+
+- What went wrong: The default corpus discovery paired sources with older files in nearby `result/` folders, producing plausible but stale release metrics even though the exact browser-delivered WAVs had different hashes.
+- Rule to prevent it: Pin release measurements to the render manifest and explicit source/result pairs; treat a path match as unverified whenever it does not identify the exact delivered bytes.
+- How to verify next time: Compare hashes or manifest paths before measuring, report the exact ledger path, and never carry stale-pair outliers into a DSP decision.
+
 ## 2026-08-05 - Separate Broadband Cleanup From Voiced-Body Instability
 
 - What went wrong: Broadband local-contrast spikes can look like severe volume dropouts when the rendered file intentionally removes low-frequency thumps or rumble.
