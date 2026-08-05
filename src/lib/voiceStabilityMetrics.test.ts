@@ -675,9 +675,59 @@ test("measure CLI loads explicit pairs from a repo-local JSON manifest", async (
       await readExplicitPairSpecsJson(root, "tasks/render-evidence/current-goal/pairs.json"),
       ["clips/a-source.wav|clips/a-result.wav|audition-a"],
     );
+    await writeFile(
+      manifest,
+      JSON.stringify({
+        selected: [
+          {
+            source: "clips/browser-source.wav",
+            output: "clips/browser-result.wav",
+            id: "browser-audition",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    assert.deepEqual(
+      await readExplicitPairSpecsJson(root, "tasks/render-evidence/current-goal/pairs.json"),
+      ["clips/browser-source.wav|clips/browser-result.wav|browser-audition"],
+    );
     await assert.rejects(
       () => readExplicitPairSpecsJson(root, "../outside.json"),
       /inside the repository/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("measure CLI loads the browser render selection manifest without rewriting it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-browser-pairs-json-"));
+  try {
+    const manifest = path.join(root, "tasks/render-evidence/current-goal/selected-manifest.json");
+    await mkdir(path.dirname(manifest), { recursive: true });
+    await writeFile(
+      manifest,
+      JSON.stringify({
+        selected: [
+          {
+            source: "clips/a-source.wav",
+            output: "clips/a-result.wav",
+            id: "audition-a",
+            bytes: 123,
+            sha256: "advisory-browser-metadata",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    assert.deepEqual(
+      await readExplicitPairSpecsJson(
+        root,
+        "tasks/render-evidence/current-goal/selected-manifest.json",
+      ),
+      ["clips/a-source.wav|clips/a-result.wav|audition-a"],
     );
   } finally {
     await rm(root, { recursive: true, force: true });

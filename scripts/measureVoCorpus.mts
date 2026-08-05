@@ -719,6 +719,7 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
 
 type ExplicitPairManifestEntry = Readonly<{
   id?: unknown;
+  output?: unknown;
   result?: unknown;
   source?: unknown;
 }>;
@@ -745,8 +746,14 @@ const normalizePairManifestEntries = (parsed: unknown): readonly ExplicitPairMan
     ? parsed
     : parsed && typeof parsed === "object" && Array.isArray((parsed as { pairs?: unknown }).pairs)
       ? (parsed as { pairs: unknown[] }).pairs
+      : parsed && typeof parsed === "object" && Array.isArray((parsed as { selected?: unknown }).selected)
+        ? (parsed as { selected: unknown[] }).selected
       : null;
-  if (!entries) throw new Error("--pairs-json must contain an array or an object with a pairs array.");
+  if (!entries) {
+    throw new Error(
+      "--pairs-json must contain an array, a pairs array, or a browser selected array.",
+    );
+  }
   return entries as readonly ExplicitPairManifestEntry[];
 };
 
@@ -762,14 +769,17 @@ export const readExplicitPairSpecsJson = async (
     throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
   }
   return entries.map((entry, index) => {
+    const result = typeof entry.result === "string" ? entry.result : entry.output;
     if (
       typeof entry.source !== "string" ||
-      typeof entry.result !== "string" ||
+      typeof result !== "string" ||
       typeof entry.id !== "string"
     ) {
-      throw new Error(`--pairs-json entry ${index + 1} requires string source, result, and id fields.`);
+      throw new Error(
+        `--pairs-json entry ${index + 1} requires string source, result/output, and id fields.`,
+      );
     }
-    return `${entry.source}|${entry.result}|${entry.id}`;
+    return `${entry.source}|${result}|${entry.id}`;
   });
 };
 
