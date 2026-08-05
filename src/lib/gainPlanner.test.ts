@@ -5300,6 +5300,10 @@ describe("actor-decay regressions", () => {
       `residual authority must not exceed the documented 4.5 dB tier cap, got ${maximumAddedLiftDb.toFixed(3)} dB`,
     );
     assert.ok(
+      maximumAddedLiftDb >= 2.5,
+      `the bounded tier must retain material recurrent-valley support, got ${maximumAddedLiftDb.toFixed(3)} dB`,
+    );
+    assert.ok(
       maximumAddedLocalContrastDb <= 1.9 + 1e-6,
       `smooth lift must not create a new local word-body crest, got ${maximumAddedLocalContrastDb.toFixed(3)} dB`,
     );
@@ -5372,7 +5376,7 @@ describe("actor-decay regressions", () => {
     );
     let largestGainStepDb = 0;
     let largestCorrectionStepDb = 0;
-    for (let frame = 51; frame < 450; frame += 1) {
+    for (let frame = 50; frame <= 450; frame += 1) {
       largestGainStepDb = Math.max(
         largestGainStepDb,
         Math.abs(

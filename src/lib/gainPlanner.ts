@@ -1351,11 +1351,11 @@ const projectWordScaleLiftWithoutLocalCrests = (
     return projectedLiftDb;
   }
 
-  // Messier sources may use slightly more local authority, but the correction
-  // itself stays below 1.9 dB over its 400 ms shoulders. This constrains only
+  // Messier sources may use slightly more local authority, but the raw budget
+  // keeps a 0.1 dB projection margin below the 1.9 dB shoulder contract. This constrains only
   // the added lift; it never attenuates or flattens source-owned expression.
   const maximumAddedContrastDb =
-    1.55 + 0.35 * clamp(instabilityHint, 0, 1);
+    1.48 + 0.32 * clamp(instabilityHint, 0, 1);
   for (let pass = 0; pass < 2; pass += 1) {
     const evidenceLiftDb = new Float32Array(projectedLiftDb);
     const prefixSumDb = new Float64Array(evidenceLiftDb.length + 1);
@@ -1383,12 +1383,21 @@ const projectWordScaleLiftWithoutLocalCrests = (
 
     // Local crest projection only lowers authority. Re-project its neighbors
     // downward so the bounded contrast cannot introduce a new 10 ms edge.
+    projectedLiftDb[0] = Math.min(
+      projectedLiftDb[0],
+      BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+    );
     for (let index = 1; index < projectedLiftDb.length; index += 1) {
       projectedLiftDb[index] = Math.min(
         projectedLiftDb[index],
         projectedLiftDb[index - 1] + BODY_DYNAMICS_MAX_GAIN_STEP_DB,
       );
     }
+    const lastIndex = projectedLiftDb.length - 1;
+    projectedLiftDb[lastIndex] = Math.min(
+      projectedLiftDb[lastIndex],
+      BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+    );
     for (let index = projectedLiftDb.length - 2; index >= 0; index -= 1) {
       projectedLiftDb[index] = Math.min(
         projectedLiftDb[index],
