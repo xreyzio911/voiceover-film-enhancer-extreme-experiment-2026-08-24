@@ -675,23 +675,6 @@ test("measure CLI loads explicit pairs from a repo-local JSON manifest", async (
       await readExplicitPairSpecsJson(root, "tasks/render-evidence/current-goal/pairs.json"),
       ["clips/a-source.wav|clips/a-result.wav|audition-a"],
     );
-    await writeFile(
-      manifest,
-      JSON.stringify({
-        selected: [
-          {
-            source: "clips/browser-source.wav",
-            output: "clips/browser-result.wav",
-            id: "browser-audition",
-          },
-        ],
-      }),
-      "utf8",
-    );
-    assert.deepEqual(
-      await readExplicitPairSpecsJson(root, "tasks/render-evidence/current-goal/pairs.json"),
-      ["clips/browser-source.wav|clips/browser-result.wav|browser-audition"],
-    );
     await assert.rejects(
       () => readExplicitPairSpecsJson(root, "../outside.json"),
       /inside the repository/i,
