@@ -100,7 +100,10 @@ import {
 } from "../lib/spectrum";
 import { buildFinalPolishFilter } from "../lib/finalPolishFilter";
 import { measureNativeFinalToneSpectrumDb } from "../lib/finalToneEvidence";
-import { planBatchLoudnessAlignment } from "../lib/batchLoudnessAlign";
+import {
+  planBatchSpeechAlignment,
+  planDistributedSpeechEvidenceWindows,
+} from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import {
   estimateCanonicalMonoFloat32WavBytes,
@@ -5916,7 +5919,7 @@ const summarizeFailureReason = (error: unknown) => {
 
         const groupedTargets = new Map<string, AlignmentTarget[]>();
         const measurementsByGroup = new Map<string, number[]>();
-        const speechEnergyByIndex = new Map<number, number | null>();
+        const speechLevelByIndex = new Map<number, number | null>();
         for (const target of variantTargets) {
           await recycleBeforeOperation("measure");
           const group = groupedTargets.get(target.groupId) ?? [];
@@ -5927,17 +5930,16 @@ const summarizeFailureReason = (error: unknown) => {
           try {
             await activeFfmpeg.writeFile(inputName, new Uint8Array(await target.entry.blob.arrayBuffer()));
             try {
-              const finalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, inputName);
-              const speechEnergyDb = finalPolishEvidence?.speechKWeightedEnergyDb;
-              speechEnergyByIndex.set(target.index, speechEnergyDb ?? null);
-              if (speechEnergyDb !== null && speechEnergyDb !== undefined && Number.isFinite(speechEnergyDb)) {
+              const speechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, inputName);
+              speechLevelByIndex.set(target.index, speechLevelDb);
+              if (speechLevelDb !== null && Number.isFinite(speechLevelDb)) {
                 const values = measurementsByGroup.get(target.groupId) ?? [];
-                values.push(speechEnergyDb);
+                values.push(speechLevelDb);
                 measurementsByGroup.set(target.groupId, values);
               }
             } catch (error) {
               appendLog(`[BatchAlign] ${target.entry.name}: speech-energy measure skipped (${describeError(error)}).`);
-              speechEnergyByIndex.set(target.index, null);
+              speechLevelByIndex.set(target.index, null);
             }
           } finally {
             await safeDeleteFile(activeFfmpeg, inputName);
@@ -5947,10 +5949,10 @@ const summarizeFailureReason = (error: unknown) => {
 
         const groupMeasurements = Array.from(groupedTargets.keys()).map((groupId) => ({
           id: groupId,
-          inputI: medianNumber(measurementsByGroup.get(groupId) ?? []),
+          speechLevelDb: medianNumber(measurementsByGroup.get(groupId) ?? []),
         }));
-        const alignment = planBatchLoudnessAlignment(groupMeasurements);
-        if (alignment.anchorLufs === null) {
+        const alignment = planBatchSpeechAlignment(groupMeasurements);
+        if (alignment.anchorDb === null) {
           appendLog(`[BatchAlign] ${variant} skipped (insufficient speech-energy measurements).`);
           continue;
         }
@@ -5962,8 +5964,8 @@ const summarizeFailureReason = (error: unknown) => {
           if (!plan.shouldAlign) {
             appendLog(
               `[BatchAlign] ${groupLabel} (${variant}): within ${Math.abs(
-                (plan.inputI ?? alignment.anchorLufs) - alignment.anchorLufs,
-              ).toFixed(1)} dB of speech-energy batch anchor ${alignment.anchorLufs.toFixed(1)} dB.`,
+                (plan.speechLevelDb ?? alignment.anchorDb) - alignment.anchorDb,
+              ).toFixed(1)} dB of speech-energy batch anchor ${alignment.anchorDb.toFixed(1)} dB.`,
             );
             continue;
           }
@@ -6036,27 +6038,25 @@ const summarizeFailureReason = (error: unknown) => {
                   )}s`,
                 );
               }
-              const alignedFinalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, outputName);
-              const afterSpeechEnergyDb = alignedFinalPolishEvidence?.speechKWeightedEnergyDb;
+              const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, outputName);
               const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName);
               if (alignedLoudness.inputTP !== null && alignedLoudness.inputTP > -1.5) {
                 throw new Error(`true peak ${alignedLoudness.inputTP.toFixed(2)} dBTP exceeds -1.5 dBTP gate`);
               }
-              const beforeSpeechEnergyDb = speechEnergyByIndex.get(target.index);
+              const beforeSpeechLevelDb = speechLevelByIndex.get(target.index);
               if (
-                beforeSpeechEnergyDb !== null &&
-                beforeSpeechEnergyDb !== undefined &&
-                afterSpeechEnergyDb !== null &&
-                afterSpeechEnergyDb !== undefined &&
-                Number.isFinite(afterSpeechEnergyDb)
+                beforeSpeechLevelDb !== null &&
+                beforeSpeechLevelDb !== undefined &&
+                afterSpeechLevelDb !== null &&
+                Number.isFinite(afterSpeechLevelDb)
               ) {
                 const movedOppositeDirection =
                   authorizedOffsetDb > 0
-                    ? afterSpeechEnergyDb < beforeSpeechEnergyDb - 0.1
-                    : afterSpeechEnergyDb > beforeSpeechEnergyDb + 0.1;
+                    ? afterSpeechLevelDb < beforeSpeechLevelDb - 0.1
+                    : afterSpeechLevelDb > beforeSpeechLevelDb + 0.1;
                 if (movedOppositeDirection) {
                   throw new Error(
-                    `speech energy moved opposite requested offset (${beforeSpeechEnergyDb.toFixed(1)} -> ${afterSpeechEnergyDb.toFixed(
+                    `speech energy moved opposite requested offset (${beforeSpeechLevelDb.toFixed(1)} -> ${afterSpeechLevelDb.toFixed(
                       1,
                     )} dB, offset ${formatSigned(authorizedOffsetDb, 1)} dB)`,
                   );
@@ -6080,7 +6080,7 @@ const summarizeFailureReason = (error: unknown) => {
               `[BatchAlign] ${target.entry.name}: ${formatSigned(
                 authorizedOffsetDb,
                 1,
-              )} dB authorized toward ${variant} speech-energy batch anchor ${alignment.anchorLufs.toFixed(
+              )} dB authorized toward ${variant} speech-energy batch anchor ${alignment.anchorDb.toFixed(
                 1,
               )} dB${
                 authorizedOffsetDb < requestedOffsetDb
@@ -6706,8 +6706,20 @@ const summarizeFailureReason = (error: unknown) => {
   const measureFinalPolishEvidenceFromVirtualWav = async (
     ffmpeg: FFmpeg,
     targetName: string,
+    rangeStartSec = 0,
+    rangeDurationSec: number | null = null,
   ): Promise<FinalPolishEvidence | null> => {
-    const rawName = `${sanitizeBase(targetName)}_final_polish_evidence.f32`;
+    const rawName = `${sanitizeBase(targetName)}_${Math.round(
+      rangeStartSec * 1_000,
+    )}_final_polish_evidence.f32`;
+    const trimArgs = rangeDurationSec === null
+      ? []
+      : [
+          "-ss",
+          Math.max(0, rangeStartSec).toFixed(3),
+          "-t",
+          Math.max(0.001, rangeDurationSec).toFixed(3),
+        ];
     try {
       resetLogBuffer();
       await execOrThrow(
@@ -6720,6 +6732,7 @@ const summarizeFailureReason = (error: unknown) => {
           "-filter_threads",
           "1",
           "-y",
+          ...trimArgs,
           "-i",
           targetName,
           "-ac",
@@ -6742,6 +6755,35 @@ const summarizeFailureReason = (error: unknown) => {
     } finally {
       await safeDeleteFile(ffmpeg, rawName);
     }
+  };
+
+  const measureBatchSpeechLevelDbFromVirtualWav = async (
+    ffmpeg: FFmpeg,
+    targetName: string,
+  ) => {
+    const durationSec = await probeInputDurationSeconds(ffmpeg, targetName);
+    if (durationSec === null || !Number.isFinite(durationSec) || durationSec <= 0) return null;
+    const windows = planDistributedSpeechEvidenceWindows(durationSec);
+    const speechLevelsDb: number[] = [];
+    for (const window of windows) {
+      try {
+        const evidence = await measureFinalPolishEvidenceFromVirtualWav(
+          ffmpeg,
+          targetName,
+          window.startSec,
+          window.durationSec,
+        );
+        const speechLevelDb = evidence?.speechKWeightedEnergyDb;
+        if (speechLevelDb !== null && speechLevelDb !== undefined && Number.isFinite(speechLevelDb)) {
+          speechLevelsDb.push(speechLevelDb);
+        }
+      } catch (error) {
+        appendLog(
+          `[BatchAlign] ${targetName}: speech window @ ${window.startSec.toFixed(1)}s skipped (${describeError(error)}).`,
+        );
+      }
+    }
+    return percentile(speechLevelsDb, 50);
   };
 
   const recoverFinalPolishEvidenceFromExactWav = async (
