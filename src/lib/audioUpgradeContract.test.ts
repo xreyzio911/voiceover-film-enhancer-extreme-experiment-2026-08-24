@@ -264,6 +264,10 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
   );
   const virtualEvidenceBlock = sourceBetween(
     "const measureFinalPolishEvidenceFromVirtualWav = async (",
+    "const measureBatchSpeechLevelDbFromVirtualWav = async (",
+  );
+  const batchSpeechEvidenceBlock = sourceBetween(
+    "const measureBatchSpeechLevelDbFromVirtualWav = async (",
     "const recoverFinalPolishEvidenceFromExactWav = async (",
   );
   const finalPolishBlock = sourceBetween(
@@ -385,10 +389,9 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "the memory-bounded long-form limitation must remain explicit and observable",
   );
   assertMarkersInOrder(batchAlignmentBlock, [
-    "const finalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, inputName)",
-    "const speechEnergyDb = finalPolishEvidence?.speechKWeightedEnergyDb",
-    "values.push(speechEnergyDb)",
-    "planBatchLoudnessAlignment(groupMeasurements)",
+    "const speechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, inputName)",
+    "values.push(speechLevelDb)",
+    "planBatchSpeechAlignment(groupMeasurements)",
   ]);
   assert.doesNotMatch(
     batchAlignmentBlock,
@@ -401,10 +404,21 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "sourceSafetyEvidence:",
     "renderedSafetyEvidence:",
     "`volume=${authorizedOffsetDb.toFixed(2)}dB",
-    "const alignedFinalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, outputName)",
-    "const afterSpeechEnergyDb = alignedFinalPolishEvidence?.speechKWeightedEnergyDb",
+    "const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, outputName)",
     "const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName)",
   ]);
+  assertMarkersInOrder(batchSpeechEvidenceBlock, [
+    "planDistributedSpeechEvidenceWindows(durationSec)",
+    "measureFinalPolishEvidenceFromVirtualWav(",
+    "window.startSec",
+    "window.durationSec",
+    "percentile(speechLevelsDb, 50)",
+  ]);
+  assert.doesNotMatch(
+    batchSpeechEvidenceBlock,
+    /toFloatSamples\(rawBytes\)[\s\S]*?durationSec\)/,
+    "long batch outputs must be decoded as fixed distributed windows, not one full raw allocation",
+  );
   assert.match(
     batchAlignmentBlock,
     /omittedPositiveAlignmentCount[\s\S]*?requestedOffsetDb > 0 && authorizedOffsetDb <= 0[\s\S]*?omittedPositiveAlignmentCount \+= 1[\s\S]*?alignedCount === 0[\s\S]*?omittedPositiveAlignmentCount > 0/,
