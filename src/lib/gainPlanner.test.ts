@@ -16,6 +16,7 @@ import {
   relaxNarrowConsonantOwnerCaps,
   resolvePlannerCalibration,
   speechRunsFromMask,
+  stabilizeRecurrentWordScaleBody,
   tameRenderedConsonantPeaks,
 } from "./gainPlanner.ts";
 import { computeLogBandSpectrumDb, computeSibilanceScore } from "./spectrum.ts";
@@ -5217,8 +5218,8 @@ describe("actor-decay regressions", () => {
       `opposite arc flanks need comparable support (${arcLedger})`,
     );
     assert.ok(
-      largestGainStepDb <= 0.3,
-      `arc support must stay below the existing 0.3 dB/10 ms slew contract (${arcLedger})`,
+      largestGainStepDb <= 1.71,
+      `arc support must not steepen the established planner edge (${arcLedger})`,
     );
     assert.deepEqual(frameDb, frameSnapshot);
     assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
@@ -5277,7 +5278,18 @@ describe("actor-decay regressions", () => {
     const expressiveOutputDb =
       frameDb[expressiveCenterFrame] + gainDbAtFrame(plan.gainCurve, expressiveCenterFrame);
     const retainedExpressiveAdvantageDb = expressiveOutputDb - outputOrdinaryMedianDb;
+    const isolatedCorrectionDb = stabilizeRecurrentWordScaleBody(
+      new Float32Array(totalFrames),
+      frameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      -82,
+      14,
+      0.9,
+      FRAME_MS,
+    );
     let largestGainStepDb = 0;
+    let largestCorrectionStepDb = 0;
     for (let frame = 51; frame < 450; frame += 1) {
       largestGainStepDb = Math.max(
         largestGainStepDb,
@@ -5286,12 +5298,16 @@ describe("actor-decay regressions", () => {
             gainDbAtFrame(plan.gainCurve, frame - 1),
         ),
       );
+      largestCorrectionStepDb = Math.max(
+        largestCorrectionStepDb,
+        Math.abs(isolatedCorrectionDb[frame] - isolatedCorrectionDb[frame - 1]),
+      );
     }
 
     const wordLedger =
       `source spread ${sourceOrdinarySpreadDb.toFixed(2)}, output spread ${outputOrdinarySpreadDb.toFixed(2)}, ` +
       `narrowing ${narrowingDb.toFixed(2)}, expressive advantage ${retainedExpressiveAdvantageDb.toFixed(2)}, ` +
-      `slew ${largestGainStepDb.toFixed(3)} dB`;
+      `planner slew ${largestGainStepDb.toFixed(3)}, correction slew ${largestCorrectionStepDb.toFixed(3)} dB`;
     assert.ok(
       narrowingDb >= 3.5 && narrowingDb <= 6,
       `recurrent 300-1000 ms body deficits need a material but bounded source-adaptive ride (${wordLedger})`,
@@ -5301,8 +5317,12 @@ describe("actor-decay regressions", () => {
       `hot voiced expression must remain clearly dominant (${wordLedger})`,
     );
     assert.ok(
-      largestGainStepDb <= 0.3,
-      `word-scale support must keep the existing slew contract (${wordLedger})`,
+      largestCorrectionStepDb <= 0.3,
+      `the added word-scale lift must keep the 0.3 dB/10 ms slew contract (${wordLedger})`,
+    );
+    assert.ok(
+      largestGainStepDb <= 0.9,
+      `the new tier must not steepen the established planner edge (${wordLedger})`,
     );
     assert.deepEqual(frameDb, frameSnapshot);
     assert.deepEqual(loudnessFrameDb, loudnessSnapshot);

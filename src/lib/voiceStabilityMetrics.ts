@@ -163,6 +163,26 @@ export type VoiceStabilityReport = Readonly<{
     spreadDeltaP90Db: number | null;
     worsenedRunCount: number;
   }>;
+  /** Advisory ungated body-supported intra-run arc shape; no expressive or -18 dB floor exclusion. */
+  intraRunArc: Readonly<{
+    windowMs: number;
+    hopMs: number;
+    minimumBodySupportRatio: number;
+    eligibleRunCount: number;
+    sourceSpreadMedianDb: number | null;
+    candidateSpreadMedianDb: number | null;
+    /** Candidate-minus-source run spread; positive means less stable. */
+    spreadDeltaMedianDb: number | null;
+    spreadDeltaP90Db: number | null;
+    sourceRiseMedianDb: number | null;
+    candidateRiseMedianDb: number | null;
+    /** Candidate-minus-source mid-minus-head rise. */
+    riseDeltaMedianDb: number | null;
+    sourceFallMedianDb: number | null;
+    candidateFallMedianDb: number | null;
+    /** Candidate-minus-source tail-minus-mid fall. */
+    fallDeltaMedianDb: number | null;
+  }>;
   expressiveRetention: Readonly<{
     /** Events are located from source-only local contrast and crest evidence. */
     sourceEventCount: number;
@@ -808,6 +828,141 @@ const buildIntraRunBody = (
   };
 };
 
+const summarizeIntraRunArcShape = (values: readonly number[]) => {
+  if (values.length < INTRA_RUN_MIN_WINDOWS) return null;
+  const firstThirdEnd = Math.max(1, Math.floor(values.length / 3));
+  const finalThirdStart = Math.min(
+    values.length - 1,
+    Math.ceil((values.length * 2) / 3),
+  );
+  const head = finiteMedian(values.slice(0, firstThirdEnd));
+  const mid = finiteMedian(values.slice(firstThirdEnd, finalThirdStart));
+  const tail = finiteMedian(values.slice(finalThirdStart));
+  const p90 = finitePercentile(values, 90);
+  const p10 = finitePercentile(values, 10);
+  if (
+    head === null ||
+    mid === null ||
+    tail === null ||
+    p90 === null ||
+    p10 === null
+  ) return null;
+  return {
+    spreadDb: p90 - p10,
+    riseDb: mid - head,
+    fallDb: tail - mid,
+  };
+};
+
+const buildIntraRunArc = (
+  source: VoiceEnvelopeEvidence,
+  candidate: VoiceEnvelopeEvidence,
+  bodySupportMask: readonly boolean[],
+  alignedFrameCount: number,
+) => {
+  const windowFrames = Math.max(1, Math.round(INTRA_RUN_WINDOW_MS / source.frameMs));
+  const hopFrames = Math.max(1, Math.round(INTRA_RUN_HOP_MS / source.frameMs));
+  const minimumSupportedFrames = Math.ceil(
+    windowFrames * INTRA_RUN_MIN_BODY_SUPPORT_RATIO,
+  );
+  const empty = {
+    windowMs: INTRA_RUN_WINDOW_MS,
+    hopMs: INTRA_RUN_HOP_MS,
+    minimumBodySupportRatio: INTRA_RUN_MIN_BODY_SUPPORT_RATIO,
+    eligibleRunCount: 0,
+    sourceSpreadMedianDb: null,
+    candidateSpreadMedianDb: null,
+    spreadDeltaMedianDb: null,
+    spreadDeltaP90Db: null,
+    sourceRiseMedianDb: null,
+    candidateRiseMedianDb: null,
+    riseDeltaMedianDb: null,
+    sourceFallMedianDb: null,
+    candidateFallMedianDb: null,
+    fallDeltaMedianDb: null,
+  } as const;
+  const frameCount = Math.min(
+    alignedFrameCount,
+    source.speechBodyDb.length,
+    candidate.speechBodyDb.length,
+  );
+  const supportedSourceBody = source.speechBodyDb.slice(0, frameCount).filter(
+    (value, index) => bodySupportMask[index] === true && finite(value),
+  );
+  const sourceBodyMedianDb = finiteMedian(supportedSourceBody);
+  if (sourceBodyMedianDb === null || supportedSourceBody.length < MIN_BODY_FRAMES) return empty;
+  const supportFloorDb = sourceBodyMedianDb - 24;
+  const arcSupportMask = Array.from(
+    { length: frameCount },
+    (_, index) => (
+      finite(source.speechBodyDb[index]) &&
+      finite(candidate.speechBodyDb[index]) &&
+      source.speechBodyDb[index] >= supportFloorDb
+    ),
+  );
+
+  const sourceSpreads: number[] = [];
+  const candidateSpreads: number[] = [];
+  const spreadDeltas: number[] = [];
+  const sourceRises: number[] = [];
+  const candidateRises: number[] = [];
+  const riseDeltas: number[] = [];
+  const sourceFalls: number[] = [];
+  const candidateFalls: number[] = [];
+  const fallDeltas: number[] = [];
+  for (const run of deriveActiveRuns(arcSupportMask, frameCount)) {
+    const sourceWindowMedians: number[] = [];
+    const candidateWindowMedians: number[] = [];
+    for (let start = run.start; start + windowFrames <= run.end; start += hopFrames) {
+      const sourceWindow: number[] = [];
+      const candidateWindow: number[] = [];
+      for (let index = start; index < start + windowFrames; index += 1) {
+        if (
+          arcSupportMask[index] === true &&
+          finite(source.speechBodyDb[index]) &&
+          finite(candidate.speechBodyDb[index])
+        ) {
+          sourceWindow.push(source.speechBodyDb[index]);
+          candidateWindow.push(candidate.speechBodyDb[index]);
+        }
+      }
+      if (sourceWindow.length < minimumSupportedFrames) continue;
+      const sourceWindowMedianDb = finiteMedian(sourceWindow);
+      const candidateWindowMedianDb = finiteMedian(candidateWindow);
+      if (sourceWindowMedianDb === null || candidateWindowMedianDb === null) continue;
+      sourceWindowMedians.push(sourceWindowMedianDb);
+      candidateWindowMedians.push(candidateWindowMedianDb);
+    }
+    const sourceArc = summarizeIntraRunArcShape(sourceWindowMedians);
+    const candidateArc = summarizeIntraRunArcShape(candidateWindowMedians);
+    if (sourceArc === null || candidateArc === null) continue;
+    sourceSpreads.push(sourceArc.spreadDb);
+    candidateSpreads.push(candidateArc.spreadDb);
+    spreadDeltas.push(candidateArc.spreadDb - sourceArc.spreadDb);
+    sourceRises.push(sourceArc.riseDb);
+    candidateRises.push(candidateArc.riseDb);
+    riseDeltas.push(candidateArc.riseDb - sourceArc.riseDb);
+    sourceFalls.push(sourceArc.fallDb);
+    candidateFalls.push(candidateArc.fallDb);
+    fallDeltas.push(candidateArc.fallDb - sourceArc.fallDb);
+  }
+
+  return {
+    ...empty,
+    eligibleRunCount: spreadDeltas.length,
+    sourceSpreadMedianDb: finiteMedian(sourceSpreads),
+    candidateSpreadMedianDb: finiteMedian(candidateSpreads),
+    spreadDeltaMedianDb: finiteMedian(spreadDeltas),
+    spreadDeltaP90Db: finitePercentile(spreadDeltas, 90),
+    sourceRiseMedianDb: finiteMedian(sourceRises),
+    candidateRiseMedianDb: finiteMedian(candidateRises),
+    riseDeltaMedianDb: finiteMedian(riseDeltas),
+    sourceFallMedianDb: finiteMedian(sourceFalls),
+    candidateFallMedianDb: finiteMedian(candidateFalls),
+    fallDeltaMedianDb: finiteMedian(fallDeltas),
+  };
+};
+
 const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
   schemaVersion: 1,
   advisoryOnly: true,
@@ -861,6 +1016,22 @@ const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
     spreadDeltaMedianDb: null,
     spreadDeltaP90Db: null,
     worsenedRunCount: 0,
+  },
+  intraRunArc: {
+    windowMs: INTRA_RUN_WINDOW_MS,
+    hopMs: INTRA_RUN_HOP_MS,
+    minimumBodySupportRatio: INTRA_RUN_MIN_BODY_SUPPORT_RATIO,
+    eligibleRunCount: 0,
+    sourceSpreadMedianDb: null,
+    candidateSpreadMedianDb: null,
+    spreadDeltaMedianDb: null,
+    spreadDeltaP90Db: null,
+    sourceRiseMedianDb: null,
+    candidateRiseMedianDb: null,
+    riseDeltaMedianDb: null,
+    sourceFallMedianDb: null,
+    candidateFallMedianDb: null,
+    fallDeltaMedianDb: null,
   },
   expressiveRetention: {
     sourceEventCount: 0,
@@ -1090,11 +1261,20 @@ export const compareVoiceStability = (
     expressiveFrames,
     alignedFrameCount,
   );
+  const intraRunArc = buildIntraRunArc(
+    alignedSource,
+    alignedCandidate,
+    bodySupportMask,
+    alignedFrameCount,
+  );
   if (contrasts.length === 0) notes.push("No frames had two-sided source-speech shoulders for local contrast.");
   if (bodyContrasts.length === 0) notes.push("No speech-body frames had two-sided source-speech shoulders for local contrast.");
   if (expressiveEvents.length === 0) notes.push("No source-derived expressive emphasis events were detected.");
   if (intraRunBody.eligibleRunCount === 0) {
     notes.push("No speech run had enough non-expressive body-supported windows for intra-run spread.");
+  }
+  if (intraRunArc.eligibleRunCount === 0) {
+    notes.push("No speech run had enough body-supported windows for intra-run arc shape.");
   }
 
   return {
@@ -1135,6 +1315,7 @@ export const compareVoiceStability = (
       alignedFrameCount,
     ),
     intraRunBody,
+    intraRunArc,
     expressiveRetention: {
       sourceEventCount: expressiveEvents.length,
       evaluatedEventCount: retentionRatios.length,

@@ -659,6 +659,18 @@ const summarize = (
       intraRunBodySpreadDeltaP90Db: median(
         values((metrics) => metrics.intraRunBody.spreadDeltaP90Db),
       ),
+      intraRunArcSpreadDeltaMedianDb: median(
+        values((metrics) => metrics.intraRunArc.spreadDeltaMedianDb),
+      ),
+      intraRunArcSpreadDeltaP90Db: median(
+        values((metrics) => metrics.intraRunArc.spreadDeltaP90Db),
+      ),
+      intraRunArcRiseDeltaMedianDb: median(
+        values((metrics) => metrics.intraRunArc.riseDeltaMedianDb),
+      ),
+      intraRunArcFallDeltaMedianDb: median(
+        values((metrics) => metrics.intraRunArc.fallDeltaMedianDb),
+      ),
       expressiveContrastRetentionP10Ratio: median(
         values((metrics) => metrics.expressiveRetention.contrastRetentionP10Ratio),
       ),
@@ -723,7 +735,7 @@ const main = async () => {
   }
 
   const ledger = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     advisoryOnly: true,
     generatedAt: new Date().toISOString(),
     definitions: {
@@ -737,6 +749,7 @@ const main = async () => {
       bodySpikes: "180-3000 Hz candidate local up/down contrast beyond the source +/-20 ms neighborhood; event-peak P95, advisory 1.5 dB event count, and strongest five source-timeline event windows",
       body: "source-body-supported non-expressive speech, using 180-3000 Hz P10 floor/fill and P90-P10 spread after per-file static-gain centering",
       intraRunBody: "source-run 300 ms medians at 100 ms hops with >=80% body support, source body >= file median-18 dB, expressive windows excluded, and >=5 windows per eligible run; reports candidate-minus-source run-spread median and P90",
+      intraRunArc: "source-run 300 ms medians at 100 ms hops with >=80% body support and >=5 windows per eligible run; keeps expressive body-supported windows, uses only the existing median-24 dB body-support boundary, and reports ungated spread plus signed head/mid/tail rise and fall",
       expressiveRetention: "source-only local emphasis/crest events; best candidate support within +/-20 ms reported separately",
       adjudication: "advisory comparative evidence only; no accept, reject, cancellation, or delivery gate",
     },

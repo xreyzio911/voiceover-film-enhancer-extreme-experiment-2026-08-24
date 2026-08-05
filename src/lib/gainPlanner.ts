@@ -308,6 +308,16 @@ const RECURRENT_BODY_VALLEY_CENTER_MS = 40;
 const RECURRENT_BODY_VALLEY_FILL_FRACTION = 0.6;
 const RECURRENT_BODY_VALLEY_MAX_LIFT_DB = 4;
 const RECURRENT_BODY_VALLEY_EVIDENCE_KNEE_DB = 0.5;
+// A 300 ms center follows word-scale body rather than individual pitch cycles.
+// The upper-body percentile is deliberately below the expressive tail: quiet
+// words move toward the ordinary dialogue plateau, not toward the hottest line.
+const WORD_SCALE_BODY_WINDOW_MS = 300;
+const WORD_SCALE_BODY_REFERENCE_PERCENTILE = 70;
+const WORD_SCALE_BODY_RECOVERY_FRACTION = 0.62;
+const WORD_SCALE_BODY_MAX_LIFT_DB = 4.5;
+const WORD_SCALE_BODY_EVIDENCE_KNEE_DB = 0.6;
+const WORD_SCALE_BODY_LONG_UNIT_START_MS = 1_000;
+const WORD_SCALE_BODY_LONG_UNIT_FULL_MS = 1_800;
 // Leave a small Float32/linear-conversion margin under the 0.3 dB contract.
 const BODY_DYNAMICS_MAX_GAIN_STEP_DB = 0.295;
 const DENSE_BODY_PEAK_RELAXATION_CURVE = 24;
@@ -1321,6 +1331,311 @@ export const recoverRecurrentBodySpeechValleys = (
   return recoveredGainDbCurve;
 };
 
+/**
+ * Partially support repeated word-scale body deficits inside one speech run.
+ *
+ * This is a source-relative planner tier, not a compressor. A 300 ms body
+ * envelope is compared with the run's ordinary (P70) body plateau, while the
+ * same comparison in broadband rejects spectral-only movement. The requested
+ * lift also subtracts recovery already present in the candidate gain curve.
+ *
+ * Positive-deficit regions form continuous valley units. Recurrence authority
+ * comes from how much evidence exists outside the strongest single unit, so a
+ * lone whisper, localized terminal fade, or one dramatic pause keeps its
+ * source shape. Multiple independent low words earn a bounded lift. The stage
+ * is lift-only, immutable, and continuously damped near the recording floor.
+ */
+export const stabilizeRecurrentWordScaleBody = (
+  gainDbCurve: Float32Array,
+  sourceFrameDb: ArrayLike<number>,
+  speechBodyFrameDb: ArrayLike<number>,
+  bodySpeechRuns: readonly SpeechRun[],
+  noiseFloorDb: number,
+  maxGainDb: number,
+  instabilityHint: number,
+  frameMs = 10,
+): Float32Array => {
+  const stabilizedGainDbCurve = new Float32Array(gainDbCurve);
+  if (
+    sourceFrameDb.length !== gainDbCurve.length ||
+    speechBodyFrameDb.length !== gainDbCurve.length ||
+    !Number.isFinite(noiseFloorDb) ||
+    !Number.isFinite(maxGainDb) ||
+    !Number.isFinite(frameMs) ||
+    frameMs <= 0
+  ) {
+    return stabilizedGainDbCurve;
+  }
+
+  const windowFrames = Math.max(1, Math.round(WORD_SCALE_BODY_WINDOW_MS / frameMs));
+  const halfWindowFrames = Math.max(1, Math.floor(windowFrames / 2));
+  const continuousPositiveDb = (valueDb: number) => Math.max(
+    0,
+    softPositiveDb(valueDb, WORD_SCALE_BODY_EVIDENCE_KNEE_DB) -
+      softPositiveDb(0, WORD_SCALE_BODY_EVIDENCE_KNEE_DB),
+  );
+
+  for (const run of bodySpeechRuns) {
+    const startFrame = clamp(Math.trunc(run.startFrame), 0, gainDbCurve.length);
+    const endFrame = clamp(Math.trunc(run.endFrame), startFrame, gainDbCurve.length);
+    const runFrames = endFrame - startFrame;
+    if (runFrames < windowFrames) continue;
+
+    const localSourceDb = new Array<number>(runFrames);
+    const localBodyDb = new Array<number>(runFrames);
+    const localOutputBodyDb = new Array<number>(runFrames);
+    const outputBodyFrameDb = new Float32Array(runFrames);
+    for (let index = 0; index < runFrames; index += 1) {
+      const frame = startFrame + index;
+      const bodyDb = speechBodyFrameDb[frame];
+      const gainDb = gainDbCurve[frame];
+      if (!Number.isFinite(bodyDb) || !Number.isFinite(gainDb)) {
+        outputBodyFrameDb[index] = Number.NaN;
+      } else {
+        outputBodyFrameDb[index] = bodyDb + gainDb;
+      }
+    }
+    for (let index = 0; index < runFrames; index += 1) {
+      const frame = startFrame + index;
+      const localStartFrame = Math.max(startFrame, frame - halfWindowFrames);
+      const localEndFrame = Math.min(endFrame, frame + halfWindowFrames + 1);
+      localSourceDb[index] = rmsDbOfSlice(
+        sourceFrameDb,
+        localStartFrame,
+        localEndFrame,
+      );
+      localBodyDb[index] = rmsDbOfSlice(
+        speechBodyFrameDb,
+        localStartFrame,
+        localEndFrame,
+      );
+      localOutputBodyDb[index] = rmsDbOfSlice(
+        outputBodyFrameDb,
+        localStartFrame - startFrame,
+        localEndFrame - startFrame,
+      );
+    }
+
+    const sourceReferenceDb = percentileDb(
+      localSourceDb,
+      WORD_SCALE_BODY_REFERENCE_PERCENTILE,
+    );
+    const bodyReferenceDb = percentileDb(
+      localBodyDb,
+      WORD_SCALE_BODY_REFERENCE_PERCENTILE,
+    );
+    const outputReferenceDb = percentileDb(
+      localOutputBodyDb,
+      WORD_SCALE_BODY_REFERENCE_PERCENTILE,
+    );
+    const sourceP10Db = percentileDb(localBodyDb, 10);
+    const sourceP90Db = percentileDb(localBodyDb, 90);
+    const rawSourceReferenceDb = percentileDb(
+      Array.from(
+        { length: runFrames },
+        (_, index) => sourceFrameDb[startFrame + index],
+      ),
+      WORD_SCALE_BODY_REFERENCE_PERCENTILE,
+    );
+    const rawBodyReferenceDb = percentileDb(
+      Array.from(
+        { length: runFrames },
+        (_, index) => speechBodyFrameDb[startFrame + index],
+      ),
+      WORD_SCALE_BODY_REFERENCE_PERCENTILE,
+    );
+    if (
+      sourceReferenceDb === null ||
+      bodyReferenceDb === null ||
+      outputReferenceDb === null ||
+      sourceP10Db === null ||
+      sourceP90Db === null ||
+      rawSourceReferenceDb === null ||
+      rawBodyReferenceDb === null
+    ) {
+      continue;
+    }
+
+    const requestedLiftDb = new Float32Array(runFrames);
+    const unitEvidenceDb = new Float32Array(runFrames);
+    for (let index = 0; index < runFrames; index += 1) {
+      const frame = startFrame + index;
+      unitEvidenceDb[index] = Math.min(
+        continuousPositiveDb(rawSourceReferenceDb - sourceFrameDb[frame]),
+        continuousPositiveDb(rawBodyReferenceDb - speechBodyFrameDb[frame]),
+      );
+      const sourceDeficitDb = continuousPositiveDb(
+        sourceReferenceDb - localSourceDb[index],
+      );
+      const bodyDeficitDb = continuousPositiveDb(
+        bodyReferenceDb - localBodyDb[index],
+      );
+      const alignedDeficitDb = Math.min(sourceDeficitDb, bodyDeficitDb);
+      if (!(alignedDeficitDb > 0)) continue;
+
+      const outputDeficitDb = continuousPositiveDb(
+        outputReferenceDb - localOutputBodyDb[index],
+      );
+      const currentRecoveryDb = alignedDeficitDb - outputDeficitDb;
+      const desiredRecoveryDb = Math.min(
+        WORD_SCALE_BODY_MAX_LIFT_DB,
+        alignedDeficitDb * WORD_SCALE_BODY_RECOVERY_FRACTION,
+      );
+      const residualLiftDb = continuousPositiveDb(
+        desiredRecoveryDb - currentRecoveryDb,
+      );
+      const floorMarginDb = localBodyDb[index] - (noiseFloorDb + 8);
+      const floorAuthority = 1 / (1 + Math.exp(-floorMarginDb / 4));
+      requestedLiftDb[index] = residualLiftDb * floorAuthority;
+    }
+
+    type ValleyUnit = Readonly<{
+      startIndex: number;
+      endIndex: number;
+      weight: number;
+      durationAuthority: number;
+    }>;
+    const units: ValleyUnit[] = [];
+    let unitStartIndex: number | null = null;
+    for (let index = 0; index <= runFrames; index += 1) {
+      const active = index < runFrames && unitEvidenceDb[index] > 0;
+      if (active && unitStartIndex === null) unitStartIndex = index;
+      if ((!active || index === runFrames) && unitStartIndex !== null) {
+        const endIndex = index;
+        let weight = 0;
+        for (let unitIndex = unitStartIndex; unitIndex < endIndex; unitIndex += 1) {
+          weight += requestedLiftDb[unitIndex];
+        }
+        const durationMs = (endIndex - unitStartIndex) * frameMs;
+        const wordScaleDurationAuthority = smoothUnitRamp(
+          durationMs,
+          0,
+          WORD_SCALE_BODY_WINDOW_MS,
+        );
+        const durationAuthority =
+          wordScaleDurationAuthority ** 4 *
+          (1 -
+            0.75 *
+              smoothUnitRamp(
+                durationMs,
+                WORD_SCALE_BODY_LONG_UNIT_START_MS,
+                WORD_SCALE_BODY_LONG_UNIT_FULL_MS,
+              ));
+        units.push({ startIndex: unitStartIndex, endIndex, weight, durationAuthority });
+        unitStartIndex = null;
+      }
+    }
+
+    const totalUnitWeight = units.reduce(
+      (sum, unit) => sum + unit.weight * unit.durationAuthority,
+      0,
+    );
+    const strongestUnitWeight = units.reduce(
+      (strongest, unit) => Math.max(strongest, unit.weight * unit.durationAuthority),
+      0,
+    );
+    const recurrenceDiversity = totalUnitWeight > 0
+      ? clamp(1 - strongestUnitWeight / totalUnitWeight, 0, 1)
+      : 0;
+    const recurrenceAuthority = smoothUnitRamp(recurrenceDiversity, 0, 0.5);
+    const runSpreadDb = Math.max(0, sourceP90Db - sourceP10Db);
+    const spreadAuthority = 1 / (1 + Math.exp(-(runSpreadDb - 5) / 2));
+    const sourceAdaptationAuthority =
+      (0.7 + 0.3 * clamp(instabilityHint, 0, 1)) * spreadAuthority;
+    const unitAuthorityByFrame = new Float32Array(runFrames);
+    for (const unit of units) {
+      const unitAuthority =
+        recurrenceAuthority * sourceAdaptationAuthority * unit.durationAuthority;
+      for (let index = unit.startIndex; index < unit.endIndex; index += 1) {
+        unitAuthorityByFrame[index] = unitAuthority;
+      }
+    }
+    for (let index = 0; index < requestedLiftDb.length; index += 1) {
+      requestedLiftDb[index] *= unitAuthorityByFrame[index];
+    }
+
+    // Least 0.295 dB/frame majorant: the lift itself cannot introduce a word
+    // edge, even when the source envelope has an abrupt valley boundary.
+    for (let index = 1; index < requestedLiftDb.length; index += 1) {
+      requestedLiftDb[index] = Math.max(
+        requestedLiftDb[index],
+        requestedLiftDb[index - 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      );
+    }
+    for (let index = requestedLiftDb.length - 2; index >= 0; index -= 1) {
+      requestedLiftDb[index] = Math.max(
+        requestedLiftDb[index],
+        requestedLiftDb[index + 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      );
+    }
+    for (let index = 0; index < runFrames; index += 1) {
+      stabilizedGainDbCurve[startFrame + index] = Math.min(
+        maxGainDb,
+        stabilizedGainDbCurve[startFrame + index] + requestedLiftDb[index],
+      );
+    }
+  }
+
+  return stabilizedGainDbCurve;
+};
+
+/**
+ * Keep the added word-scale tier from making any existing planner edge steeper.
+ * The edge allowance is the larger of the established curve's movement and
+ * the 0.295 dB body-motion contract. This preserves source-owned transient and
+ * onset authority, while the projection can only lower candidate gain and can
+ * therefore never introduce a new headroom risk.
+ */
+const projectWordScaleGainWithoutWorseningEdges = (
+  establishedGainDbCurve: Float32Array,
+  candidateGainDbCurve: Float32Array,
+  bodySpeechRuns: readonly SpeechRun[],
+): Float32Array => {
+  const projectedGainDbCurve = new Float32Array(candidateGainDbCurve);
+  if (establishedGainDbCurve.length !== candidateGainDbCurve.length) {
+    return projectedGainDbCurve;
+  }
+  for (const run of bodySpeechRuns) {
+    const startFrame = clamp(
+      Math.trunc(run.startFrame),
+      0,
+      candidateGainDbCurve.length,
+    );
+    const endFrame = clamp(
+      Math.trunc(run.endFrame),
+      startFrame,
+      candidateGainDbCurve.length,
+    );
+    for (let frame = startFrame + 1; frame < endFrame; frame += 1) {
+      const establishedStepDb = Math.abs(
+        establishedGainDbCurve[frame] - establishedGainDbCurve[frame - 1],
+      );
+      const allowedStepDb = Math.max(
+        BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        establishedStepDb,
+      );
+      projectedGainDbCurve[frame] = Math.min(
+        projectedGainDbCurve[frame],
+        projectedGainDbCurve[frame - 1] + allowedStepDb,
+      );
+    }
+    for (let frame = endFrame - 2; frame >= startFrame; frame -= 1) {
+      const establishedStepDb = Math.abs(
+        establishedGainDbCurve[frame + 1] - establishedGainDbCurve[frame],
+      );
+      const allowedStepDb = Math.max(
+        BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        establishedStepDb,
+      );
+      projectedGainDbCurve[frame] = Math.min(
+        projectedGainDbCurve[frame],
+        projectedGainDbCurve[frame + 1] + allowedStepDb,
+      );
+    }
+  }
+  return projectedGainDbCurve;
+};
+
 const resolveTransientPeriodicity = (
   samples: Float32Array,
   sampleRate: number,
@@ -2294,7 +2609,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     maxGainDb,
     frameMs,
   );
-  const slewed = recoverRecurrentBodySpeechValleys(
+  const recurrentSupported = recoverRecurrentBodySpeechValleys(
     trendBalanced,
     input.frameDb,
     speechBodyFrameDb,
@@ -2303,6 +2618,24 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       .map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
     maxGainDb,
     frameMs,
+  );
+  const bodySpeechRuns = runMeta
+    .filter(({ runClass }) => runClass === "body-speech")
+    .map(({ startFrame, endFrame }) => ({ startFrame, endFrame }));
+  const wordScaleSupported = stabilizeRecurrentWordScaleBody(
+    recurrentSupported,
+    input.frameDb,
+    speechBodyFrameDb,
+    bodySpeechRuns,
+    input.noiseFloorDb,
+    maxGainDb,
+    input.instabilityHint,
+    frameMs,
+  );
+  const slewed = projectWordScaleGainWithoutWorseningEdges(
+    recurrentSupported,
+    wordScaleSupported,
+    bodySpeechRuns,
   );
 
   // 7) LOCALIZED absolute-peak guard.
