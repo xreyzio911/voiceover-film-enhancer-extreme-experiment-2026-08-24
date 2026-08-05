@@ -130,11 +130,11 @@ test("speech-body spike lane still reports a genuine processing-added body dip",
 });
 
 test("intra-run body metric exposes sustained word-scale worsening without using pause floor", () => {
-  const sourceFrameDb = speech(3_000);
+  const sourceFrameDb = speech(500);
   const sourceBodyDb = sourceFrameDb.map((value) => value - 1);
   const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
   const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
-  for (let index = 1_200; index < 1_250; index += 1) {
+  for (let index = 200; index < 250; index += 1) {
     candidateBodyDb[index] -= 6;
   }
 

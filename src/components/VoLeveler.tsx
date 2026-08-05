@@ -5916,7 +5916,7 @@ const summarizeFailureReason = (error: unknown) => {
 
         const groupedTargets = new Map<string, AlignmentTarget[]>();
         const measurementsByGroup = new Map<string, number[]>();
-        const measurementByIndex = new Map<number, number | null>();
+        const speechEnergyByIndex = new Map<number, number | null>();
         for (const target of variantTargets) {
           await recycleBeforeOperation("measure");
           const group = groupedTargets.get(target.groupId) ?? [];
@@ -5927,16 +5927,17 @@ const summarizeFailureReason = (error: unknown) => {
           try {
             await activeFfmpeg.writeFile(inputName, new Uint8Array(await target.entry.blob.arrayBuffer()));
             try {
-              const loudness = await analyzeIntegratedLoudness(activeFfmpeg, inputName);
-              measurementByIndex.set(target.index, loudness.inputI);
-              if (loudness.inputI !== null && Number.isFinite(loudness.inputI)) {
+              const finalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, inputName);
+              const speechEnergyDb = finalPolishEvidence?.speechKWeightedEnergyDb;
+              speechEnergyByIndex.set(target.index, speechEnergyDb ?? null);
+              if (speechEnergyDb !== null && speechEnergyDb !== undefined && Number.isFinite(speechEnergyDb)) {
                 const values = measurementsByGroup.get(target.groupId) ?? [];
-                values.push(loudness.inputI);
+                values.push(speechEnergyDb);
                 measurementsByGroup.set(target.groupId, values);
               }
             } catch (error) {
-              appendLog(`[BatchAlign] ${target.entry.name}: loudness measure skipped (${describeError(error)}).`);
-              measurementByIndex.set(target.index, null);
+              appendLog(`[BatchAlign] ${target.entry.name}: speech-energy measure skipped (${describeError(error)}).`);
+              speechEnergyByIndex.set(target.index, null);
             }
           } finally {
             await safeDeleteFile(activeFfmpeg, inputName);
@@ -5950,7 +5951,7 @@ const summarizeFailureReason = (error: unknown) => {
         }));
         const alignment = planBatchLoudnessAlignment(groupMeasurements);
         if (alignment.anchorLufs === null) {
-          appendLog(`[BatchAlign] ${variant} skipped (insufficient loudness measurements).`);
+          appendLog(`[BatchAlign] ${variant} skipped (insufficient speech-energy measurements).`);
           continue;
         }
 
@@ -5962,7 +5963,7 @@ const summarizeFailureReason = (error: unknown) => {
             appendLog(
               `[BatchAlign] ${groupLabel} (${variant}): within ${Math.abs(
                 (plan.inputI ?? alignment.anchorLufs) - alignment.anchorLufs,
-              ).toFixed(1)} LU of batch anchor ${alignment.anchorLufs.toFixed(1)} LUFS.`,
+              ).toFixed(1)} dB of speech-energy batch anchor ${alignment.anchorLufs.toFixed(1)} dB.`,
             );
             continue;
           }
@@ -6035,26 +6036,29 @@ const summarizeFailureReason = (error: unknown) => {
                   )}s`,
                 );
               }
+              const alignedFinalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, outputName);
+              const afterSpeechEnergyDb = alignedFinalPolishEvidence?.speechKWeightedEnergyDb;
               const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName);
               if (alignedLoudness.inputTP !== null && alignedLoudness.inputTP > -1.5) {
                 throw new Error(`true peak ${alignedLoudness.inputTP.toFixed(2)} dBTP exceeds -1.5 dBTP gate`);
               }
-              const beforeI = measurementByIndex.get(target.index);
+              const beforeSpeechEnergyDb = speechEnergyByIndex.get(target.index);
               if (
-                beforeI !== null &&
-                beforeI !== undefined &&
-                alignedLoudness.inputI !== null &&
-                Number.isFinite(alignedLoudness.inputI)
+                beforeSpeechEnergyDb !== null &&
+                beforeSpeechEnergyDb !== undefined &&
+                afterSpeechEnergyDb !== null &&
+                afterSpeechEnergyDb !== undefined &&
+                Number.isFinite(afterSpeechEnergyDb)
               ) {
                 const movedOppositeDirection =
                   authorizedOffsetDb > 0
-                    ? alignedLoudness.inputI < beforeI - 0.1
-                    : alignedLoudness.inputI > beforeI + 0.1;
+                    ? afterSpeechEnergyDb < beforeSpeechEnergyDb - 0.1
+                    : afterSpeechEnergyDb > beforeSpeechEnergyDb + 0.1;
                 if (movedOppositeDirection) {
                   throw new Error(
-                    `loudness moved opposite requested offset (${beforeI.toFixed(1)} -> ${alignedLoudness.inputI.toFixed(
+                    `speech energy moved opposite requested offset (${beforeSpeechEnergyDb.toFixed(1)} -> ${afterSpeechEnergyDb.toFixed(
                       1,
-                    )} LUFS, offset ${formatSigned(authorizedOffsetDb, 1)} dB)`,
+                    )} dB, offset ${formatSigned(authorizedOffsetDb, 1)} dB)`,
                   );
                 }
               }
@@ -6076,9 +6080,9 @@ const summarizeFailureReason = (error: unknown) => {
               `[BatchAlign] ${target.entry.name}: ${formatSigned(
                 authorizedOffsetDb,
                 1,
-              )} dB authorized toward ${variant} batch anchor ${alignment.anchorLufs.toFixed(
+              )} dB authorized toward ${variant} speech-energy batch anchor ${alignment.anchorLufs.toFixed(
                 1,
-              )} LUFS${
+              )} dB${
                 authorizedOffsetDb < requestedOffsetDb
                   ? ` (requested ${formatSigned(requestedOffsetDb, 1)} dB)`
                   : ""

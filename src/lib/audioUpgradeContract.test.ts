@@ -385,11 +385,25 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "the memory-bounded long-form limitation must remain explicit and observable",
   );
   assertMarkersInOrder(batchAlignmentBlock, [
+    "const finalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, inputName)",
+    "const speechEnergyDb = finalPolishEvidence?.speechKWeightedEnergyDb",
+    "values.push(speechEnergyDb)",
+    "planBatchLoudnessAlignment(groupMeasurements)",
+  ]);
+  assert.doesNotMatch(
+    batchAlignmentBlock,
+    /const loudness = await analyzeIntegratedLoudness\(activeFfmpeg, inputName\)[\s\S]{0,240}?values\.push\(loudness\.inputI\)/,
+    "batch alignment planning must not be anchored to whole-file LUFS, which is pause/room-tone sensitive",
+  );
+  assertMarkersInOrder(batchAlignmentBlock, [
     "const requestedOffsetDb = plan.offsetDb",
     "resolveSafePositiveDeliveryGainDb({",
     "sourceSafetyEvidence:",
     "renderedSafetyEvidence:",
     "`volume=${authorizedOffsetDb.toFixed(2)}dB",
+    "const alignedFinalPolishEvidence = await measureFinalPolishEvidenceFromVirtualWav(activeFfmpeg, outputName)",
+    "const afterSpeechEnergyDb = alignedFinalPolishEvidence?.speechKWeightedEnergyDb",
+    "const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName)",
   ]);
   assert.match(
     batchAlignmentBlock,

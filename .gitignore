@@ -19,6 +19,8 @@
 /.playwright-mcp/
 /tasks/render-evidence/
 /audio testing/
+/bug/
+/another testing/
 __pycache__/
 *.pyc
 

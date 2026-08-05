@@ -1,3 +1,22 @@
+# Post-b7 VO Stability Adjustment
+
+## Checklist
+
+- [x] Read the two attached review/proposal texts and classify each recommendation against exact repo behavior and corpus evidence.
+- [x] Reject unproven word-scale compressor/AGC, stronger limiter drive, fixed house curve, and broad tail/release changes where the evidence was broadband/LF or otherwise under-specified.
+- [x] Add advisory-only absolute drift, 180-3000 Hz body-spike, and intra-run body-spread diagnostics so broadband cleanup artifacts are separated from actual voiced-body instability.
+- [x] Improve runtime batch volume stability by planning batch alignment from speech-weighted energy measured from the actual final WAV blobs, while keeping existing true-peak and positive-headroom safety validation.
+- [x] Protect private local review corpora with exact root-only ignores for `/bug/` and `/another testing/`.
+- [x] Run focused tests, full audio-QC suite, TypeScript, lint, production build, security audit, and the 31-pair corpus measurement.
+
+## Evidence
+
+- 31/31 local source-result pairs measured with 0 errors at `tasks/render-evidence/current-goal/post-b7-adjustment/voice-stability-body-v1.json`.
+- Corpus median body spread improved by `-4.72 dB`; intra-run body spread improved by `-2.31 dB`; candidate absolute drift median was near flat at `+0.0006 dB/min`.
+- Existing Seth broadband down-spikes were not treated as a planner/tail failure because source/body evidence showed LF cleanup dominance, not voiced-body collapse.
+- Existing Simone/Matthew render remains a diagnostic outlier (`bodySpreadDelta +4.43 dB`, intra-run median `+1.08 dB`) and is now captured by the new advisory metrics; current app-side runtime improvement targets future batch alignment rather than blindly compressing syllables.
+- PostCSS override bumped to `8.5.25` after `npm audit --omit=dev` found the advisory; audit is now clean.
+
 # Actor Decrescendo and Cinematic Body Recovery
 
 ## Checklist

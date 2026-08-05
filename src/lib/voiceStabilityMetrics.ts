@@ -16,6 +16,12 @@ const EXPRESSIVE_MIN_CREST_DB = 6;
 const EXPRESSIVE_FLATTENED_RATIO = 0.55;
 const EXPRESSIVE_FLATTENED_LOSS_DB = 2;
 const MIN_BODY_FRAMES = 20;
+const INTRA_RUN_WINDOW_MS = 300;
+const INTRA_RUN_HOP_MS = 100;
+const INTRA_RUN_MIN_BODY_SUPPORT_RATIO = 0.8;
+const INTRA_RUN_SOURCE_FLOOR_RELATIVE_DB = -18;
+const INTRA_RUN_MIN_WINDOWS = 5;
+const INTRA_RUN_WORSENED_DELTA_DB = 0.5;
 
 /**
  * Pre-computed, fixed-duration mono envelope evidence. All level arrays use
@@ -35,6 +41,8 @@ export type DriftSection = Readonly<{
   startSec: number;
   endSec: number;
   speechFrameCount: number;
+  sourceMedianDb: number;
+  candidateMedianDb: number;
   /** Median candidate-minus-source level in dB. */
   processingDeltaDb: number;
 }>;
@@ -80,6 +88,10 @@ export type VoiceStabilityReport = Readonly<{
     scoreImprovementDb: number | null;
   }>;
   drift: Readonly<{
+    /** Robust absolute source-envelope slope; positive rises, negative falls. */
+    sourceSignedSlopeDbPerMinute: number | null;
+    /** Robust absolute candidate-envelope slope; positive rises, negative falls. */
+    candidateSignedSlopeDbPerMinute: number | null;
     /** Robust median processing-delta slope; positive rises, negative falls. */
     signedSlopeDbPerMinute: number | null;
     /** Positive 75th-percentile robust section slope, in dB/min. */
@@ -108,6 +120,21 @@ export type VoiceStabilityReport = Readonly<{
       topEvents: readonly SpikeEventWindow[];
     }>;
   }>;
+  /** Local 180-3000 Hz contrast, separated from broadband cleanup artifacts. */
+  bodySpikes: Readonly<{
+    advisoryContrastDb: number;
+    supportedFrameCount: number;
+    up: Readonly<{
+      p95AddedContrastDb: number | null;
+      countAboveAdvisoryContrast: number;
+      topEvents: readonly SpikeEventWindow[];
+    }>;
+    down: Readonly<{
+      p95AddedContrastDb: number | null;
+      countAboveAdvisoryContrast: number;
+      topEvents: readonly SpikeEventWindow[];
+    }>;
+  }>;
   body: Readonly<{
     eligibleFrameCount: number;
     /** P10 body level relative to that file's speech-body median, in dB. */
@@ -122,6 +149,19 @@ export type VoiceStabilityReport = Readonly<{
     spreadDeltaDb: number | null;
     /** Change in median (180-3000 Hz body minus broadband RMS), in dB. */
     bodyBalanceDeltaDb: number | null;
+  }>;
+  /** Source-defined, body-supported 300 ms window spread within speech runs. */
+  intraRunBody: Readonly<{
+    windowMs: number;
+    hopMs: number;
+    minimumBodySupportRatio: number;
+    eligibleRunCount: number;
+    sourceSpreadMedianDb: number | null;
+    candidateSpreadMedianDb: number | null;
+    /** Candidate-minus-source run spread; positive means less stable. */
+    spreadDeltaMedianDb: number | null;
+    spreadDeltaP90Db: number | null;
+    worsenedRunCount: number;
   }>;
   expressiveRetention: Readonly<{
     /** Events are located from source-only local contrast and crest evidence. */
@@ -314,20 +354,30 @@ const deriveLocalContrasts = (
   candidate: VoiceEnvelopeEvidence,
   speechMask: readonly boolean[],
   alignedFrameCount: number,
+  levelDomain: "broadband" | "speech-body",
 ) => {
+  const sourceLevels = levelDomain === "broadband" ? source.frameDb : source.speechBodyDb;
+  const candidateLevels = levelDomain === "broadband"
+    ? candidate.frameDb
+    : candidate.speechBodyDb;
+  const localFrameCount = Math.min(
+    alignedFrameCount,
+    sourceLevels.length,
+    candidateLevels.length,
+  );
   const include = Array.from(
-    { length: alignedFrameCount },
+    { length: localFrameCount },
     (_, index) => speechMask[index] === true,
   );
-  const sourcePrefix = makePrefix(source.frameDb.slice(0, alignedFrameCount), include);
-  const candidatePrefix = makePrefix(candidate.frameDb.slice(0, alignedFrameCount), include);
+  const sourcePrefix = makePrefix(sourceLevels.slice(0, localFrameCount), include);
+  const candidatePrefix = makePrefix(candidateLevels.slice(0, localFrameCount), include);
   const radiusFrames = Math.max(5, Math.round(LOCAL_SHOULDER_MS / source.frameMs));
   const coreFrames = Math.max(1, Math.round(LOCAL_CORE_MS / source.frameMs));
   const minimumShoulderFrames = Math.max(2, Math.round(80 / source.frameMs));
   const contrasts: LocalContrast[] = [];
 
-  for (let index = radiusFrames; index + radiusFrames < alignedFrameCount; index += 1) {
-    if (!speechMask[index] || !finite(source.frameDb[index]) || !finite(candidate.frameDb[index])) continue;
+  for (let index = radiusFrames; index + radiusFrames < localFrameCount; index += 1) {
+    if (!speechMask[index] || !finite(sourceLevels[index]) || !finite(candidateLevels[index])) continue;
     const leftStart = index - radiusFrames;
     const leftEnd = index - coreFrames;
     const rightStart = index + coreFrames + 1;
@@ -354,18 +404,16 @@ const deriveLocalContrasts = (
       candidateRight === null
     ) continue;
 
-    const sourceCrestDb =
-      finite(source.framePeakDb[index])
-        ? source.framePeakDb[index] - source.frameDb[index]
-        : null;
-    const candidateCrestDb =
-      finite(candidate.framePeakDb[index])
-        ? candidate.framePeakDb[index] - candidate.frameDb[index]
-        : null;
+    const sourceCrestDb = levelDomain === "broadband" && finite(source.framePeakDb[index])
+      ? source.framePeakDb[index] - source.frameDb[index]
+      : null;
+    const candidateCrestDb = levelDomain === "broadband" && finite(candidate.framePeakDb[index])
+      ? candidate.framePeakDb[index] - candidate.frameDb[index]
+      : null;
     contrasts.push({
       index,
-      sourceContrastDb: source.frameDb[index] - (sourceLeft + sourceRight) / 2,
-      candidateContrastDb: candidate.frameDb[index] - (candidateLeft + candidateRight) / 2,
+      sourceContrastDb: sourceLevels[index] - (sourceLeft + sourceRight) / 2,
+      candidateContrastDb: candidateLevels[index] - (candidateLeft + candidateRight) / 2,
       sourceCrestDb: finite(sourceCrestDb ?? undefined) ? sourceCrestDb : null,
       candidateCrestDb: finite(candidateCrestDb ?? undefined) ? candidateCrestDb : null,
     });
@@ -502,6 +550,27 @@ const summarizeSpikeDirection = (
   };
 };
 
+const deriveSectionSlopes = (
+  sections: readonly DriftSection[],
+  selectLevelDb: (section: DriftSection) => number,
+) => {
+  const slopes: number[] = [];
+  const minimumLag = sections.length >= 3 ? 2 : 1;
+  for (let left = 0; left < sections.length; left += 1) {
+    const maximumRight = Math.min(sections.length - 1, left + MAX_SECTION_LAG);
+    for (let right = left + minimumLag; right <= maximumRight; right += 1) {
+      const leftMidSec = (sections[left].startSec + sections[left].endSec) / 2;
+      const rightMidSec = (sections[right].startSec + sections[right].endSec) / 2;
+      const elapsedMinutes = (rightMidSec - leftMidSec) / 60;
+      if (elapsedMinutes <= 0) continue;
+      slopes.push(
+        (selectLevelDb(sections[right]) - selectLevelDb(sections[left])) / elapsedMinutes,
+      );
+    }
+  }
+  return slopes;
+};
+
 const buildDrift = (
   source: VoiceEnvelopeEvidence,
   candidate: VoiceEnvelopeEvidence,
@@ -512,33 +581,37 @@ const buildDrift = (
   const sections: DriftSection[] = [];
   for (let start = 0; start < alignedFrameCount; start += sectionFrames) {
     const end = Math.min(alignedFrameCount, start + sectionFrames);
+    const sourceLevels: number[] = [];
+    const candidateLevels: number[] = [];
     const deltas: number[] = [];
     for (let index = start; index < end; index += 1) {
       if (!speechMask[index] || !finite(source.frameDb[index]) || !finite(candidate.frameDb[index])) continue;
+      sourceLevels.push(source.frameDb[index]);
+      candidateLevels.push(candidate.frameDb[index]);
       deltas.push(candidate.frameDb[index] - source.frameDb[index]);
     }
+    const sourceMedianDb = finiteMedian(sourceLevels);
+    const candidateMedianDb = finiteMedian(candidateLevels);
     const processingDeltaDb = finiteMedian(deltas);
-    if (processingDeltaDb === null || deltas.length < 5) continue;
+    if (
+      sourceMedianDb === null ||
+      candidateMedianDb === null ||
+      processingDeltaDb === null ||
+      deltas.length < 5
+    ) continue;
     sections.push({
       startSec: (start * source.frameMs) / 1_000,
       endSec: (end * source.frameMs) / 1_000,
       speechFrameCount: deltas.length,
+      sourceMedianDb,
+      candidateMedianDb,
       processingDeltaDb,
     });
   }
 
-  const slopes: number[] = [];
-  const minimumLag = sections.length >= 3 ? 2 : 1;
-  for (let left = 0; left < sections.length; left += 1) {
-    const maximumRight = Math.min(sections.length - 1, left + MAX_SECTION_LAG);
-    for (let right = left + minimumLag; right <= maximumRight; right += 1) {
-      const leftMidSec = (sections[left].startSec + sections[left].endSec) / 2;
-      const rightMidSec = (sections[right].startSec + sections[right].endSec) / 2;
-      const elapsedMinutes = (rightMidSec - leftMidSec) / 60;
-      if (elapsedMinutes <= 0) continue;
-      slopes.push((sections[right].processingDeltaDb - sections[left].processingDeltaDb) / elapsedMinutes);
-    }
-  }
+  const sourceSlopes = deriveSectionSlopes(sections, (section) => section.sourceMedianDb);
+  const candidateSlopes = deriveSectionSlopes(sections, (section) => section.candidateMedianDb);
+  const slopes = deriveSectionSlopes(sections, (section) => section.processingDeltaDb);
   const signedSlopeDbPerMinute = finiteMedian(slopes);
   const p75 = finitePercentile(slopes, 75);
   const p25 = finitePercentile(slopes, 25);
@@ -546,6 +619,8 @@ const buildDrift = (
   const sectionP90 = finitePercentile(sectionValues, 90);
   const sectionP10 = finitePercentile(sectionValues, 10);
   return {
+    sourceSignedSlopeDbPerMinute: finiteMedian(sourceSlopes),
+    candidateSignedSlopeDbPerMinute: finiteMedian(candidateSlopes),
     signedSlopeDbPerMinute,
     risingSlopeP75DbPerMinute: p75 === null ? null : Math.max(0, p75),
     fallingSlopeP25DbPerMinute: p25 === null ? null : Math.min(0, p25),
@@ -627,6 +702,112 @@ const buildBody = (
   };
 };
 
+const deriveActiveRuns = (mask: readonly boolean[], frameCount: number) => {
+  const runs: Array<Readonly<{ start: number; end: number }>> = [];
+  let start: number | null = null;
+  for (let index = 0; index < frameCount; index += 1) {
+    if (mask[index] === true && start === null) start = index;
+    if (mask[index] !== true && start !== null) {
+      runs.push({ start, end: index });
+      start = null;
+    }
+  }
+  if (start !== null) runs.push({ start, end: frameCount });
+  return runs;
+};
+
+const buildIntraRunBody = (
+  source: VoiceEnvelopeEvidence,
+  candidate: VoiceEnvelopeEvidence,
+  speechMask: readonly boolean[],
+  bodySupportMask: readonly boolean[],
+  expressiveFrames: ReadonlySet<number>,
+  alignedFrameCount: number,
+) => {
+  const windowFrames = Math.max(1, Math.round(INTRA_RUN_WINDOW_MS / source.frameMs));
+  const hopFrames = Math.max(1, Math.round(INTRA_RUN_HOP_MS / source.frameMs));
+  const minimumSupportedFrames = Math.ceil(
+    windowFrames * INTRA_RUN_MIN_BODY_SUPPORT_RATIO,
+  );
+  const empty = {
+    windowMs: INTRA_RUN_WINDOW_MS,
+    hopMs: INTRA_RUN_HOP_MS,
+    minimumBodySupportRatio: INTRA_RUN_MIN_BODY_SUPPORT_RATIO,
+    eligibleRunCount: 0,
+    sourceSpreadMedianDb: null,
+    candidateSpreadMedianDb: null,
+    spreadDeltaMedianDb: null,
+    spreadDeltaP90Db: null,
+    worsenedRunCount: 0,
+  } as const;
+  const frameCount = Math.min(
+    alignedFrameCount,
+    source.speechBodyDb.length,
+    candidate.speechBodyDb.length,
+  );
+  const supportedSourceBody = source.speechBodyDb.slice(0, frameCount).filter(
+    (value, index) => bodySupportMask[index] === true && finite(value),
+  );
+  const sourceBodyMedianDb = finiteMedian(supportedSourceBody);
+  if (sourceBodyMedianDb === null || supportedSourceBody.length < MIN_BODY_FRAMES) return empty;
+
+  const sourceSpreads: number[] = [];
+  const candidateSpreads: number[] = [];
+  const spreadDeltas: number[] = [];
+  for (const run of deriveActiveRuns(speechMask, frameCount)) {
+    const sourceWindowMedians: number[] = [];
+    const candidateWindowMedians: number[] = [];
+    for (let start = run.start; start + windowFrames <= run.end; start += hopFrames) {
+      const sourceWindow: number[] = [];
+      const candidateWindow: number[] = [];
+      let expressive = false;
+      for (let index = start; index < start + windowFrames; index += 1) {
+        if (expressiveFrames.has(index)) expressive = true;
+        if (
+          bodySupportMask[index] === true &&
+          finite(source.speechBodyDb[index]) &&
+          finite(candidate.speechBodyDb[index])
+        ) {
+          sourceWindow.push(source.speechBodyDb[index]);
+          candidateWindow.push(candidate.speechBodyDb[index]);
+        }
+      }
+      if (expressive || sourceWindow.length < minimumSupportedFrames) continue;
+      const sourceWindowMedianDb = finiteMedian(sourceWindow);
+      const candidateWindowMedianDb = finiteMedian(candidateWindow);
+      if (
+        sourceWindowMedianDb === null ||
+        candidateWindowMedianDb === null ||
+        sourceWindowMedianDb < sourceBodyMedianDb + INTRA_RUN_SOURCE_FLOOR_RELATIVE_DB
+      ) continue;
+      sourceWindowMedians.push(sourceWindowMedianDb);
+      candidateWindowMedians.push(candidateWindowMedianDb);
+    }
+    if (sourceWindowMedians.length < INTRA_RUN_MIN_WINDOWS) continue;
+    const sourceP90 = finitePercentile(sourceWindowMedians, 90)!;
+    const sourceP10 = finitePercentile(sourceWindowMedians, 10)!;
+    const candidateP90 = finitePercentile(candidateWindowMedians, 90)!;
+    const candidateP10 = finitePercentile(candidateWindowMedians, 10)!;
+    const sourceSpreadDb = sourceP90 - sourceP10;
+    const candidateSpreadDb = candidateP90 - candidateP10;
+    sourceSpreads.push(sourceSpreadDb);
+    candidateSpreads.push(candidateSpreadDb);
+    spreadDeltas.push(candidateSpreadDb - sourceSpreadDb);
+  }
+
+  return {
+    ...empty,
+    eligibleRunCount: spreadDeltas.length,
+    sourceSpreadMedianDb: finiteMedian(sourceSpreads),
+    candidateSpreadMedianDb: finiteMedian(candidateSpreads),
+    spreadDeltaMedianDb: finiteMedian(spreadDeltas),
+    spreadDeltaP90Db: finitePercentile(spreadDeltas, 90),
+    worsenedRunCount: spreadDeltas.filter(
+      (deltaDb) => deltaDb > INTRA_RUN_WORSENED_DELTA_DB,
+    ).length,
+  };
+};
+
 const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
   schemaVersion: 1,
   advisoryOnly: true,
@@ -640,6 +821,8 @@ const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
     scoreImprovementDb: null,
   },
   drift: {
+    sourceSignedSlopeDbPerMinute: null,
+    candidateSignedSlopeDbPerMinute: null,
     signedSlopeDbPerMinute: null,
     risingSlopeP75DbPerMinute: null,
     fallingSlopeP25DbPerMinute: null,
@@ -647,6 +830,12 @@ const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
     sections: [],
   },
   spikes: {
+    advisoryContrastDb: SPIKE_ADVISORY_CONTRAST_DB,
+    supportedFrameCount: 0,
+    up: { p95AddedContrastDb: null, countAboveAdvisoryContrast: 0, topEvents: [] },
+    down: { p95AddedContrastDb: null, countAboveAdvisoryContrast: 0, topEvents: [] },
+  },
+  bodySpikes: {
     advisoryContrastDb: SPIKE_ADVISORY_CONTRAST_DB,
     supportedFrameCount: 0,
     up: { p95AddedContrastDb: null, countAboveAdvisoryContrast: 0, topEvents: [] },
@@ -661,6 +850,17 @@ const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
     candidateSpreadDb: null,
     spreadDeltaDb: null,
     bodyBalanceDeltaDb: null,
+  },
+  intraRunBody: {
+    windowMs: INTRA_RUN_WINDOW_MS,
+    hopMs: INTRA_RUN_HOP_MS,
+    minimumBodySupportRatio: INTRA_RUN_MIN_BODY_SUPPORT_RATIO,
+    eligibleRunCount: 0,
+    sourceSpreadMedianDb: null,
+    candidateSpreadMedianDb: null,
+    spreadDeltaMedianDb: null,
+    spreadDeltaP90Db: null,
+    worsenedRunCount: 0,
   },
   expressiveRetention: {
     sourceEventCount: 0,
@@ -758,6 +958,14 @@ export const compareVoiceStability = (
     alignedCandidate,
     bodySupportMask,
     alignedFrameCount,
+    "broadband",
+  );
+  const bodyContrasts = deriveLocalContrasts(
+    alignedSource,
+    alignedCandidate,
+    bodySupportMask,
+    alignedFrameCount,
+    "speech-body",
   );
   const expressiveEvents = selectExpressiveEvents(contrasts, alignedSource.frameMs);
   const expressiveFrames = new Set(expressiveEvents.flatMap((event) => event.frames));
@@ -771,6 +979,18 @@ export const compareVoiceStability = (
   );
   const downSpikes = summarizeSpikeDirection(
     contrasts,
+    alignedSource.frameMs,
+    "down",
+    sourceFrameOffset,
+  );
+  const bodyUpSpikes = summarizeSpikeDirection(
+    bodyContrasts,
+    alignedSource.frameMs,
+    "up",
+    sourceFrameOffset,
+  );
+  const bodyDownSpikes = summarizeSpikeDirection(
+    bodyContrasts,
     alignedSource.frameMs,
     "down",
     sourceFrameOffset,
@@ -862,8 +1082,20 @@ export const compareVoiceStability = (
     }
   }
 
+  const intraRunBody = buildIntraRunBody(
+    alignedSource,
+    alignedCandidate,
+    speechMask,
+    bodySupportMask,
+    expressiveFrames,
+    alignedFrameCount,
+  );
   if (contrasts.length === 0) notes.push("No frames had two-sided source-speech shoulders for local contrast.");
+  if (bodyContrasts.length === 0) notes.push("No speech-body frames had two-sided source-speech shoulders for local contrast.");
   if (expressiveEvents.length === 0) notes.push("No source-derived expressive emphasis events were detected.");
+  if (intraRunBody.eligibleRunCount === 0) {
+    notes.push("No speech run had enough non-expressive body-supported windows for intra-run spread.");
+  }
 
   return {
     schemaVersion: 1,
@@ -889,6 +1121,12 @@ export const compareVoiceStability = (
       up: upSpikes,
       down: downSpikes,
     },
+    bodySpikes: {
+      advisoryContrastDb: SPIKE_ADVISORY_CONTRAST_DB,
+      supportedFrameCount: bodyContrasts.length,
+      up: bodyUpSpikes,
+      down: bodyDownSpikes,
+    },
     body: buildBody(
       alignedSource,
       alignedCandidate,
@@ -896,6 +1134,7 @@ export const compareVoiceStability = (
       expressiveFrames,
       alignedFrameCount,
     ),
+    intraRunBody,
     expressiveRetention: {
       sourceEventCount: expressiveEvents.length,
       evaluatedEventCount: retentionRatios.length,

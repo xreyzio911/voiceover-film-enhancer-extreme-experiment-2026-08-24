@@ -1,5 +1,17 @@
 # Lessons
 
+## 2026-08-05 - Separate Broadband Cleanup From Voiced-Body Instability
+
+- What went wrong: Broadband local-contrast spikes can look like severe volume dropouts when the rendered file intentionally removes low-frequency thumps or rumble.
+- Rule to prevent it: Keep broadband spike evidence as an artifact lane, but judge voice stability with source-supported 180-3000 Hz body evidence, absolute source/candidate drift, and intra-run body-spread metrics.
+- How to verify next time: Reproduce the exact source/result pair, compare body-band and broadband event lanes separately, then render through the app before claiming a DSP change improved delivered audio.
+
+## 2026-08-05 - Batch Alignment Should Follow Speech, Not Room Time
+
+- What went wrong: Whole-file integrated loudness can be biased by long pauses, tails, or room tone, causing batch alignment offsets that do not match perceived dialogue loudness.
+- Rule to prevent it: Plan batch alignment from speech-weighted energy measured from the final emitted WAV blob; keep true-peak and positive-gain headroom validation after rendering.
+- How to verify next time: Contract-test the measurement source and run a sparse-speech/long-room batch fixture before changing alignment thresholds.
+
 ## 2026-07-24 - Judge Micro-Dips In The Speech Body, Not Gain Motion Alone
 
 - What went wrong: A 100 ms source-relative gain jump looked like a new dip even where the output level stayed stable, while a separate 12 ms 180-3000 Hz V was real but hidden inside a broadband emotional impact.

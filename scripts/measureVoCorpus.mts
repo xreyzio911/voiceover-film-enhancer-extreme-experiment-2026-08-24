@@ -610,11 +610,29 @@ const summarize = (
     unmatchedResultCount: discovery.unmatchedResults.length,
     missingRootCount: discovery.missingRoots.length,
     corpusMedian: {
+      sourceSignedDriftDbPerMinute: median(
+        values((metrics) => metrics.drift.sourceSignedSlopeDbPerMinute),
+      ),
+      candidateSignedDriftDbPerMinute: median(
+        values((metrics) => metrics.drift.candidateSignedSlopeDbPerMinute),
+      ),
       signedDriftDbPerMinute: median(values((metrics) => metrics.drift.signedSlopeDbPerMinute)),
       upwardAddedSpikeP95Db: median(values((metrics) => metrics.spikes.up.p95AddedContrastDb)),
       downwardAddedSpikeP95Db: median(values((metrics) => metrics.spikes.down.p95AddedContrastDb)),
+      bodyUpwardAddedSpikeP95Db: median(
+        values((metrics) => metrics.bodySpikes.up.p95AddedContrastDb),
+      ),
+      bodyDownwardAddedSpikeP95Db: median(
+        values((metrics) => metrics.bodySpikes.down.p95AddedContrastDb),
+      ),
       bodyFloorFillDeltaDb: median(values((metrics) => metrics.body.floorFillDeltaDb)),
       bodySpreadDeltaDb: median(values((metrics) => metrics.body.spreadDeltaDb)),
+      intraRunBodySpreadDeltaMedianDb: median(
+        values((metrics) => metrics.intraRunBody.spreadDeltaMedianDb),
+      ),
+      intraRunBodySpreadDeltaP90Db: median(
+        values((metrics) => metrics.intraRunBody.spreadDeltaP90Db),
+      ),
       expressiveContrastRetentionP10Ratio: median(
         values((metrics) => metrics.expressiveRetention.contrastRetentionP10Ratio),
       ),
@@ -686,10 +704,12 @@ const main = async () => {
       frameMs: DEFAULT_FRAME_MS,
       decodedChunkSeconds: DEFAULT_CHUNK_SECONDS,
       processingModel: "one pair at a time; source and result read sequentially in bounded ranges",
-      drift: "median candidate-minus-source dB by 10 s source-speech section; bounded-lag robust slopes in dB/min",
+      drift: "median source, candidate, and candidate-minus-source dB by 10 s source-speech section; bounded-lag robust absolute and processing-delta slopes in dB/min",
       alignment: "gain-centered global envelope lag searched within +/-250 ms before comparison",
-      spikes: "candidate local up/down contrast beyond the source +/-20 ms neighborhood; event-peak P95, advisory 1.5 dB event count, and strongest five source-timeline event windows",
+      spikes: "broadband candidate local up/down contrast beyond the source +/-20 ms neighborhood; retains cleanup-artifact visibility separately from voice-body stability",
+      bodySpikes: "180-3000 Hz candidate local up/down contrast beyond the source +/-20 ms neighborhood; event-peak P95, advisory 1.5 dB event count, and strongest five source-timeline event windows",
       body: "source-body-supported non-expressive speech, using 180-3000 Hz P10 floor/fill and P90-P10 spread after per-file static-gain centering",
+      intraRunBody: "source-run 300 ms medians at 100 ms hops with >=80% body support, source body >= file median-18 dB, expressive windows excluded, and >=5 windows per eligible run; reports candidate-minus-source run-spread median and P90",
       expressiveRetention: "source-only local emphasis/crest events; best candidate support within +/-20 ms reported separately",
       adjudication: "advisory comparative evidence only; no accept, reject, cancellation, or delivery gate",
     },
