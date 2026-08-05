@@ -16,6 +16,7 @@ const finalPolishFilterSource = readFileSync(
   new URL("./finalPolishFilter.ts", import.meta.url),
   "utf8",
 );
+const gitignoreSource = readFileSync(new URL("../../.gitignore", import.meta.url), "utf8");
 
 const textBetween = (source: string, startMarker: string, endMarker: string) => {
   const start = source.indexOf(startMarker);
@@ -36,6 +37,11 @@ const assertMarkersInOrder = (source: string, markers: string[]) => {
     cursor = index + marker.length;
   }
 };
+
+test("private local voice corpora are protected by exact root ignores", () => {
+  assert.match(gitignoreSource, /^\/bug\/\r?$/m);
+  assert.match(gitignoreSource, /^\/another testing\/\r?$/m);
+});
 
 test("speech-bearing input without a usable gain plan remains a source-preserving output", () => {
   const outcome = resolveGainPlannerOutcome({

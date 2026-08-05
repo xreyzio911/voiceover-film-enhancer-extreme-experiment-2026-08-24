@@ -47,9 +47,13 @@ test("static gain is invisible to drift, spike, and speech-body stability metric
   assert.ok(Math.abs(report.drift.signedSlopeDbPerMinute ?? Infinity) < 1e-9);
   assert.equal(report.spikes.up.countAboveAdvisoryContrast, 0);
   assert.equal(report.spikes.down.countAboveAdvisoryContrast, 0);
+  assert.equal(report.bodySpikes.up.countAboveAdvisoryContrast, 0);
+  assert.equal(report.bodySpikes.down.countAboveAdvisoryContrast, 0);
   assert.ok(Math.abs(report.body.floorFillDeltaDb ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.body.spreadDeltaDb ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.body.bodyBalanceDeltaDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunBody.spreadDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunBody.spreadDeltaP90Db ?? Infinity) < 1e-9);
 });
 
 test("robust section slopes retain signed slow rise and fall despite one outlier", () => {
@@ -65,8 +69,11 @@ test("robust section slopes retain signed slow rise and fall despite one outlier
 
   assert.ok((rising.drift.signedSlopeDbPerMinute ?? 0) > 1);
   assert.ok((rising.drift.risingSlopeP75DbPerMinute ?? 0) > 1);
+  assert.ok(Math.abs(rising.drift.sourceSignedSlopeDbPerMinute ?? Infinity) < 0.1);
+  assert.ok((rising.drift.candidateSignedSlopeDbPerMinute ?? 0) > 1);
   assert.ok((falling.drift.signedSlopeDbPerMinute ?? 0) < -1);
   assert.ok((falling.drift.fallingSlopeP25DbPerMinute ?? 0) < -1);
+  assert.ok((falling.drift.candidateSignedSlopeDbPerMinute ?? 0) < -1);
 });
 
 test("reports processing-added local upward and downward spike contrast", () => {
@@ -83,6 +90,63 @@ test("reports processing-added local upward and downward spike contrast", () => 
   assert.ok((report.spikes.down.p95AddedContrastDb ?? 0) > 4);
   assert.equal(report.spikes.up.countAboveAdvisoryContrast, 1);
   assert.equal(report.spikes.down.countAboveAdvisoryContrast, 1);
+});
+
+test("separates removed low-frequency artifacts from speech-body dropouts", () => {
+  const sourceBodyDb = speech(2_500, -25);
+  const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
+  const sourceFrameDb = sourceBodyDb.map((value) => value + 1);
+  const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
+  for (let index = 1_200; index < 1_204; index += 1) {
+    candidateFrameDb[index] -= 24;
+  }
+
+  const report = compareVoiceStability(
+    evidence(sourceFrameDb, sourceBodyDb),
+    evidence(candidateFrameDb, candidateBodyDb),
+  );
+
+  assert.ok((report.spikes.down.p95AddedContrastDb ?? 0) > 15);
+  assert.equal(report.bodySpikes.down.countAboveAdvisoryContrast, 0);
+  assert.equal(report.bodySpikes.up.countAboveAdvisoryContrast, 0);
+});
+
+test("speech-body spike lane still reports a genuine processing-added body dip", () => {
+  const sourceFrameDb = speech(2_500);
+  const sourceBodyDb = sourceFrameDb.map((value) => value - 1);
+  const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
+  const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
+  for (let index = 1_200; index < 1_204; index += 1) {
+    candidateBodyDb[index] -= 7;
+  }
+
+  const report = compareVoiceStability(
+    evidence(sourceFrameDb, sourceBodyDb),
+    evidence(candidateFrameDb, candidateBodyDb),
+  );
+
+  assert.ok((report.bodySpikes.down.p95AddedContrastDb ?? 0) > 5);
+  assert.equal(report.bodySpikes.down.countAboveAdvisoryContrast, 1);
+});
+
+test("intra-run body metric exposes sustained word-scale worsening without using pause floor", () => {
+  const sourceFrameDb = speech(3_000);
+  const sourceBodyDb = sourceFrameDb.map((value) => value - 1);
+  const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
+  const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
+  for (let index = 1_200; index < 1_250; index += 1) {
+    candidateBodyDb[index] -= 6;
+  }
+
+  const report = compareVoiceStability(
+    evidence(sourceFrameDb, sourceBodyDb),
+    evidence(candidateFrameDb, candidateBodyDb),
+  );
+
+  assert.ok(report.intraRunBody.eligibleRunCount >= 1);
+  assert.ok((report.intraRunBody.spreadDeltaMedianDb ?? 0) > 1);
+  assert.ok((report.intraRunBody.spreadDeltaP90Db ?? 0) > 1);
+  assert.ok(report.intraRunBody.worsenedRunCount >= 1);
 });
 
 test("reports deterministic top-five clustered spike windows for audition", () => {
