@@ -117,6 +117,11 @@ test("planner no-plan output stays source-preserving through every later deliver
     "const alignBatchMixReadyOutputs = async",
     "const applyFinalConsonantResidualToOutputs = async",
   );
+  const batchPlanningMeasurementBlock = textBetween(
+    batchAlignmentBlock,
+    "for (const target of variantTargets)",
+    "const groupMeasurements =",
+  );
   const renderFallbackBlock = sourceBetween(
     "const renderMixReadyWithFallbacks = async",
     "let lastMixError: unknown = null",
@@ -389,10 +394,16 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "the memory-bounded long-form limitation must remain explicit and observable",
   );
   assertMarkersInOrder(batchAlignmentBlock, [
-    "const speechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, inputName)",
+    "const speechLevelDb = await measureBatchSpeechLevelDbFromBlob(",
+    "target.entry.blob",
     "values.push(speechLevelDb)",
     "planBatchSpeechAlignment(groupMeasurements)",
   ]);
+  assert.doesNotMatch(
+    batchPlanningMeasurementBlock,
+    /target\.entry\.blob\.arrayBuffer\(\)/,
+    "planning evidence must slice bounded windows from the final Blob instead of copying a long WAV into WASM",
+  );
   assert.doesNotMatch(
     batchAlignmentBlock,
     /const loudness = await analyzeIntegratedLoudness\(activeFfmpeg, inputName\)[\s\S]{0,240}?values\.push\(loudness\.inputI\)/,
@@ -403,6 +414,7 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "resolveSafePositiveDeliveryGainDb({",
     "sourceSafetyEvidence:",
     "renderedSafetyEvidence:",
+    "recycleBeforeFullBlobCopy(target.entry, \"render\")",
     "`volume=${authorizedOffsetDb.toFixed(2)}dB",
     "const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, outputName)",
     "const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName)",
@@ -1212,7 +1224,7 @@ test("corrective ownership is one pass per file and cannot be exhausted by earli
   assert.doesNotMatch(voLevelerSource, /resolveCorrectiveMaxFilesPerBatch/);
 });
 
-test("final residual sweep covers every output after optional batch alignment and before exposure", () => {
+test("final residual sweep precedes batch measurement so alignment uses the final candidate bytes", () => {
   const batchAlignmentBlock = sourceBetween(
     "const alignBatchMixReadyOutputs = async",
     "const applyFinalConsonantResidualToOutputs = async",
@@ -1270,8 +1282,8 @@ test("final residual sweep covers every output after optional batch alignment an
     "batch alignment must not duplicate the shared final residual sweep",
   );
   assertMarkersInOrder(finalDeliveryBlock, [
-    "alignBatchMixReadyOutputs(",
     "applyFinalConsonantResidualToOutputs(",
+    "alignBatchMixReadyOutputs(",
     "buildFinalReviewBundles(",
     "setOutputs([...finalOutputEntries])",
   ]);

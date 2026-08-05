@@ -3,8 +3,10 @@ import test from "node:test";
 import { decodeWav, encodeWavFloat32 } from "./webAudioRender.ts";
 import {
   estimateCanonicalMonoFloat32WavBytes,
+  inspectMonoFloat32WavBlob,
   inspectMonoFloat32Wav,
   shouldUseBoundedWavQc,
+  sliceMonoFloat32WavBlob,
   sliceMonoFloat32Wav,
 } from "./boundedWavWindow.ts";
 
@@ -56,6 +58,40 @@ test("clamps the final bounded window without padding or timing drift", () => {
   assert.equal(window.startSample, 86_400);
   assert.equal(window.sampleCount, 9_600);
   assert.equal(window.durationSec, 0.2);
+});
+
+test("slices a final-WAV Blob without materializing the complete file", async () => {
+  class WholeReadTrackingBlob extends Blob {
+    wholeRead = false;
+    largestSliceBytes = 0;
+
+    override async arrayBuffer() {
+      this.wholeRead = true;
+      return super.arrayBuffer();
+    }
+
+    override slice(start?: number, end?: number, contentType?: string) {
+      const safeStart = start ?? 0;
+      const safeEnd = end ?? this.size;
+      this.largestSliceBytes = Math.max(this.largestSliceBytes, safeEnd - safeStart);
+      return super.slice(start, end, contentType);
+    }
+  }
+
+  const sampleRate = 48_000;
+  const samples = buildRamp(sampleRate, 4);
+  const blob = new WholeReadTrackingBlob([encodeWavFloat32(samples, sampleRate, 1)]);
+  const info = await inspectMonoFloat32WavBlob(blob);
+  const window = await sliceMonoFloat32WavBlob(blob, info, 1.25, 0.5);
+  const decoded = decodeWav(window.bytes);
+
+  assert.equal(blob.wholeRead, false, "bounded Blob inspection must never call whole-file arrayBuffer()");
+  assert.ok(blob.largestSliceBytes < blob.size);
+  assert.equal(info.durationSec, 4);
+  assert.equal(window.startSample, 60_000);
+  assert.equal(window.sampleCount, 24_000);
+  assert.ok(Math.abs(decoded.samples[0] - samples[60_000]) < 1e-7);
+  assert.ok(Math.abs(decoded.samples.at(-1)! - samples[83_999]) < 1e-7);
 });
 
 test("rejects stereo or non-float input instead of silently misreading QC evidence", () => {
