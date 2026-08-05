@@ -5299,9 +5299,12 @@ describe("actor-decay regressions", () => {
       maximumAddedLiftDb <= 4.5 + 1e-6,
       `residual authority must not exceed the documented 4.5 dB tier cap, got ${maximumAddedLiftDb.toFixed(3)} dB`,
     );
+    const minimumValleyCenterLiftDb = Math.min(
+      ...[75, 175, 275].map((frame) => addedLiftDb[frame]),
+    );
     assert.ok(
-      maximumAddedLiftDb >= 2.5,
-      `the bounded tier must retain material recurrent-valley support, got ${maximumAddedLiftDb.toFixed(3)} dB`,
+      minimumValleyCenterLiftDb >= 3.2,
+      `local-contrast projection must retain material recurrent recovery, got ${minimumValleyCenterLiftDb.toFixed(3)} dB`,
     );
     assert.ok(
       maximumAddedLocalContrastDb <= 1.9 + 1e-6,
