@@ -9,7 +9,7 @@
 - [x] Remove the remaining long-WAV measurement copy, refresh the worker before unavoidable large alignment renders, and run the source-relative consonant residual before alignment so the batch anchor sees the final pre-alignment candidate bytes.
 - [x] Protect private local review corpora with exact root-only ignores for `/bug/` and `/another testing/`.
 - [x] Measure all 31 adjudicated exact delivered browser WAV pairs with full source/result SHA-256 identities rather than accepting stale path discovery or a manifest that predates protected-output overrides.
-- [ ] Run focused tests, full audio-QC suite, TypeScript, lint, production build, security audit, independent re-review, and final deployment/runtime checks after the bounded-Blob correction.
+- [x] Run focused tests, full audio-QC suite, TypeScript, lint, production build, security audit, independent re-review, and final deployment/runtime checks after the bounded-Blob correction.
 
 ## Evidence
 
@@ -18,6 +18,9 @@
 - Existing Seth broadband down-spikes were not treated as a planner/tail failure because source/body evidence showed LF cleanup dominance, not voiced-body collapse.
 - Remaining worst-decile intra-run results (Antonio `+2.29 dB`, Arthur `+1.84 dB`, Julie `+1.23 dB`, Seth `+0.79 dB`) stay advisory: they are not sufficient evidence for a word-scale compressor, release rewrite, or candidate rejection without a creating-stage diagnosis and level-matched audition.
 - PostCSS override bumped to `8.5.25` after `npm audit --omit=dev` found the advisory; audit is now clean.
+- Final verification passed: 74/74 focused stability/bounded-memory contracts, 472 audio-QC tests with 1 intentional optional skip, TypeScript, lint with no errors (only 2 pre-existing warnings in an untracked diagnostic script), `npm audit --omit=dev` with 0 vulnerabilities, and the production build. `git diff --check` reported only Windows line-ending notices, and the existing Audio Splitter Turbopack trace warning remained non-blocking. Independent correctness and security re-reviews found no actionable issue after the final-byte ordering, content-hash, and bounded-Blob fixes.
+- GitHub `main` commit `eb04ad0a88296ba0689b097aef1ff565cb468510` reached Vercel Production as READY deployment `dpl_CawtAXqsJj7WN1XS7ivddNCnRd59`, with `voiceover-film-enhancer-experiment.vercel.app` attached and no app-origin console errors in the exact X Chrome profile (`xreyzio911`).
+- Production browser proof used Mix-ready / Balanced / Balanced / Medium on two real two-file batches. Alessia plus Vittoria completed 2/2 with 0 failures and correctly failed open when their 1.0-1.6% speech evidence was insufficient. The contrastive Liv plus Antonio batch completed 2/2 with 0 failures and 295.7 MB of outputs; the final-byte speech-energy pass measured a `-24.6 dB` clean anchor, omitted Liv's unsafe requested `+2.0 dB` because noise-and-peak headroom was not proven, and authorized Antonio's bounded `-2.0 dB` correction. This exercises both non-destructive omission and an actual alignment render without adding a hard quality gate or cancelling either enhanced output.
 
 # Actor Decrescendo and Cinematic Body Recovery
 
