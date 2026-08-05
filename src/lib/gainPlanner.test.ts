@@ -5227,6 +5227,55 @@ describe("actor-decay regressions", () => {
     assert.deepEqual(speechRuns, runSnapshot);
   });
 
+  it("cinematic stability: caps residual word-scale authority when the established plan deepens a valley", () => {
+    const totalFrames = 400;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const establishedGainDb = new Float32Array(totalFrames);
+    const speechRuns = [{ startFrame: 50, endFrame: 350 }];
+    const unitLevelsDb = [-32, -23, -31, -22, -32, -23];
+    for (let unit = 0; unit < unitLevelsDb.length; unit += 1) {
+      const startFrame = 50 + unit * 50;
+      const endFrame = startFrame + 50;
+      for (let frame = startFrame; frame < endFrame; frame += 1) {
+        frameDb[frame] = unitLevelsDb[unit];
+        speechBodyFrameDb[frame] = unitLevelsDb[unit];
+        if (unit % 2 === 0) establishedGainDb[frame] = -6;
+      }
+    }
+
+    const frameSnapshot = [...frameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const gainSnapshot = new Float32Array(establishedGainDb);
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const stabilizedGainDb = stabilizeRecurrentWordScaleBody(
+      establishedGainDb,
+      frameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      -82,
+      14,
+      0.9,
+      FRAME_MS,
+    );
+
+    let maximumAddedLiftDb = 0;
+    for (let frame = 0; frame < totalFrames; frame += 1) {
+      maximumAddedLiftDb = Math.max(
+        maximumAddedLiftDb,
+        stabilizedGainDb[frame] - establishedGainDb[frame],
+      );
+    }
+    assert.ok(
+      maximumAddedLiftDb <= 4.5 + 1e-6,
+      `residual authority must not exceed the documented 4.5 dB tier cap, got ${maximumAddedLiftDb.toFixed(3)} dB`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(establishedGainDb, gainSnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+  });
+
   it("cinematic stability: narrows recurrent word-scale body deficits while retaining a hot voiced phrase", () => {
     const totalFrames = 500;
     const frameDb = new Array<number>(totalFrames).fill(-82);

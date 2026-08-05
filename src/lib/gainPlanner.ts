@@ -1486,7 +1486,8 @@ export const stabilizeRecurrentWordScaleBody = (
       );
       const floorMarginDb = localBodyDb[index] - (noiseFloorDb + 8);
       const floorAuthority = 1 / (1 + Math.exp(-floorMarginDb / 4));
-      requestedLiftDb[index] = residualLiftDb * floorAuthority;
+      requestedLiftDb[index] =
+        Math.min(WORD_SCALE_BODY_MAX_LIFT_DB, residualLiftDb) * floorAuthority;
     }
 
     type ValleyUnit = Readonly<{
