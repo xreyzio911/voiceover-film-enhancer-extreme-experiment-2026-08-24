@@ -10,6 +10,7 @@ import {
 } from "./voiceStabilityMetrics.ts";
 import {
   discoverCorpusPairs,
+  hashFileSha256,
   MAX_EXPLICIT_PAIRS,
   parseMeasureVoCorpusArguments,
   prepareLedgerOutputPath,
@@ -593,6 +594,20 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
       ],
     },
   );
+});
+
+test("corpus evidence records a deterministic full-file SHA-256 identity", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-corpus-hash-"));
+  const fixture = path.join(root, "fixture.wav");
+  try {
+    await writeFile(fixture, "abc", "utf8");
+    assert.equal(
+      await hashFileSha256(fixture),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("explicit pairs resolve deterministically inside the repo and stay bounded", async () => {
