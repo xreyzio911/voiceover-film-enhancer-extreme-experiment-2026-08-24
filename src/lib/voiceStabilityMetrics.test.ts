@@ -55,6 +55,9 @@ test("static gain is invisible to drift, spike, and speech-body stability metric
   assert.ok(Math.abs(report.body.bodyBalanceDeltaDb ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.intraRunBody.spreadDeltaMedianDb ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.intraRunBody.spreadDeltaP90Db ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.spreadDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.riseDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.fallDeltaMedianDb ?? Infinity) < 1e-9);
 });
 
 test("robust section slopes retain signed slow rise and fall despite one outlier", () => {
@@ -148,6 +151,35 @@ test("intra-run body metric exposes sustained word-scale worsening without using
   assert.ok((report.intraRunBody.spreadDeltaMedianDb ?? 0) > 1);
   assert.ok((report.intraRunBody.spreadDeltaP90Db ?? 0) > 1);
   assert.ok(report.intraRunBody.worsenedRunCount >= 1);
+});
+
+test("intra-run arc keeps expressive body-supported head-mid-tail shape visible", () => {
+  const sourceFrameDb = new Array<number>(600).fill(-30);
+  const sourceBodyDb = new Array<number>(600).fill(-38);
+  for (let index = 200; index < 400; index += 1) {
+    sourceFrameDb[index] = -20;
+    sourceBodyDb[index] = -20;
+  }
+  const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
+  const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
+
+  const report = compareVoiceStability(
+    evidence(sourceFrameDb, sourceBodyDb),
+    evidence(candidateFrameDb, candidateBodyDb),
+  );
+
+  assert.ok(report.intraRunArc.eligibleRunCount >= 1);
+  assert.ok(
+    (report.intraRunArc.sourceRiseMedianDb ?? 0) > 12,
+    `expected a material source head-to-mid rise, got ${report.intraRunArc.sourceRiseMedianDb}`,
+  );
+  assert.ok(
+    (report.intraRunArc.sourceFallMedianDb ?? 0) < -12,
+    `expected a material source mid-to-tail fall, got ${report.intraRunArc.sourceFallMedianDb}`,
+  );
+  assert.ok(Math.abs(report.intraRunArc.riseDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.fallDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.spreadDeltaMedianDb ?? Infinity) < 1e-9);
 });
 
 test("reports deterministic top-five clustered spike windows for audition", () => {

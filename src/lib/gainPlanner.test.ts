@@ -5144,6 +5144,172 @@ describe("actor-decay regressions", () => {
     }
   });
 
+  it("cinematic stability: partially supports both quiet flanks of an extreme head-mid-tail body arc", () => {
+    const totalFrames = 360;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [{ startFrame: 30, endFrame: 330 }];
+    for (let frame = 30; frame < 330; frame += 1) {
+      const levelDb = frame < 120 || frame >= 240 ? -34 : -24;
+      frameDb[frame] = levelDb;
+      loudnessFrameDb[frame] = levelDb;
+      speechBodyFrameDb[frame] = levelDb;
+    }
+
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      noiseFloorDb: -82,
+      speechThresholdDb: -60,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.9,
+    });
+
+    const measureLevelDb = (frame: number) =>
+      frameDb[frame] + gainDbAtFrame(plan.gainCurve, frame);
+    const sourceHeadToMidDb = frameDb[180] - frameDb[75];
+    const sourceTailToMidDb = frameDb[180] - frameDb[285];
+    const outputHeadToMidDb = measureLevelDb(180) - measureLevelDb(75);
+    const outputTailToMidDb = measureLevelDb(180) - measureLevelDb(285);
+    const headRecoveryDb = sourceHeadToMidDb - outputHeadToMidDb;
+    const tailRecoveryDb = sourceTailToMidDb - outputTailToMidDb;
+    let largestGainStepDb = 0;
+    for (let frame = 31; frame < 330; frame += 1) {
+      largestGainStepDb = Math.max(
+        largestGainStepDb,
+        Math.abs(
+          gainDbAtFrame(plan.gainCurve, frame) -
+            gainDbAtFrame(plan.gainCurve, frame - 1),
+        ),
+      );
+    }
+
+    const arcLedger =
+      `head recovery ${headRecoveryDb.toFixed(2)}, tail recovery ${tailRecoveryDb.toFixed(2)}, ` +
+      `retained head ${outputHeadToMidDb.toFixed(2)}, retained tail ${outputTailToMidDb.toFixed(2)}, ` +
+      `slew ${largestGainStepDb.toFixed(3)} dB`;
+    for (const [flank, recoveredDb, retainedDb] of [
+      ["head", headRecoveryDb, outputHeadToMidDb],
+      ["tail", tailRecoveryDb, outputTailToMidDb],
+    ] as const) {
+      assert.ok(
+        recoveredDb >= 2.5 && recoveredDb <= 4.5,
+        `extreme ${flank} arc needs bounded partial support (${arcLedger})`,
+      );
+      assert.ok(
+        retainedDb >= 5.5,
+        `head-mid-tail shape must remain clearly expressive on the ${flank} flank (${arcLedger})`,
+      );
+    }
+    assert.ok(
+      Math.abs(headRecoveryDb - tailRecoveryDb) <= 1,
+      `opposite arc flanks need comparable support (${arcLedger})`,
+    );
+    assert.ok(
+      largestGainStepDb <= 0.3,
+      `arc support must stay below the existing 0.3 dB/10 ms slew contract (${arcLedger})`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+  });
+
+  it("cinematic stability: narrows recurrent word-scale body deficits while retaining a hot voiced phrase", () => {
+    const totalFrames = 500;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const loudnessFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [{ startFrame: 50, endFrame: 450 }];
+    const unitLevelsDb = [-32, -23, -31, -22, -32, -14, -30, -23];
+    for (let unit = 0; unit < unitLevelsDb.length; unit += 1) {
+      const startFrame = 50 + unit * 50;
+      const endFrame = startFrame + 50;
+      for (let frame = startFrame; frame < endFrame; frame += 1) {
+        frameDb[frame] = unitLevelsDb[unit];
+        loudnessFrameDb[frame] = unitLevelsDb[unit];
+        speechBodyFrameDb[frame] = unitLevelsDb[unit];
+      }
+    }
+
+    const frameSnapshot = [...frameDb];
+    const loudnessSnapshot = [...loudnessFrameDb];
+    const bodySnapshot = [...speechBodyFrameDb];
+    const runSnapshot = speechRuns.map((run) => ({ ...run }));
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      noiseFloorDb: -82,
+      speechThresholdDb: -60,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.9,
+    });
+
+    const ordinaryUnitIndexes = [0, 1, 2, 3, 4, 6, 7];
+    const sourceOrdinaryDb = ordinaryUnitIndexes.map((unit) => unitLevelsDb[unit]);
+    const outputOrdinaryDb = ordinaryUnitIndexes.map((unit) => {
+      const centerFrame = 50 + unit * 50 + 25;
+      return frameDb[centerFrame] + gainDbAtFrame(plan.gainCurve, centerFrame);
+    });
+    const sourceOrdinarySpreadDb = Math.max(...sourceOrdinaryDb) - Math.min(...sourceOrdinaryDb);
+    const outputOrdinarySpreadDb = Math.max(...outputOrdinaryDb) - Math.min(...outputOrdinaryDb);
+    const narrowingDb = sourceOrdinarySpreadDb - outputOrdinarySpreadDb;
+    const outputOrdinarySortedDb = [...outputOrdinaryDb].sort((left, right) => left - right);
+    const outputOrdinaryMedianDb = outputOrdinarySortedDb[Math.floor(outputOrdinarySortedDb.length / 2)];
+    const expressiveCenterFrame = 50 + 5 * 50 + 25;
+    const expressiveOutputDb =
+      frameDb[expressiveCenterFrame] + gainDbAtFrame(plan.gainCurve, expressiveCenterFrame);
+    const retainedExpressiveAdvantageDb = expressiveOutputDb - outputOrdinaryMedianDb;
+    let largestGainStepDb = 0;
+    for (let frame = 51; frame < 450; frame += 1) {
+      largestGainStepDb = Math.max(
+        largestGainStepDb,
+        Math.abs(
+          gainDbAtFrame(plan.gainCurve, frame) -
+            gainDbAtFrame(plan.gainCurve, frame - 1),
+        ),
+      );
+    }
+
+    const wordLedger =
+      `source spread ${sourceOrdinarySpreadDb.toFixed(2)}, output spread ${outputOrdinarySpreadDb.toFixed(2)}, ` +
+      `narrowing ${narrowingDb.toFixed(2)}, expressive advantage ${retainedExpressiveAdvantageDb.toFixed(2)}, ` +
+      `slew ${largestGainStepDb.toFixed(3)} dB`;
+    assert.ok(
+      narrowingDb >= 3.5 && narrowingDb <= 6,
+      `recurrent 300-1000 ms body deficits need a material but bounded source-adaptive ride (${wordLedger})`,
+    );
+    assert.ok(
+      retainedExpressiveAdvantageDb >= 8,
+      `hot voiced expression must remain clearly dominant (${wordLedger})`,
+    );
+    assert.ok(
+      largestGainStepDb <= 0.3,
+      `word-scale support must keep the existing slew contract (${wordLedger})`,
+    );
+    assert.deepEqual(frameDb, frameSnapshot);
+    assert.deepEqual(loudnessFrameDb, loudnessSnapshot);
+    assert.deepEqual(speechBodyFrameDb, bodySnapshot);
+    assert.deepEqual(speechRuns, runSnapshot);
+  });
+
   it("cinematic stability: does not spend phrase-wide trend recovery on a localized terminal fade", () => {
     const totalFrames = 260;
     const frameDb = new Array<number>(totalFrames).fill(-82);
