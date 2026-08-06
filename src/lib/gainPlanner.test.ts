@@ -5227,6 +5227,118 @@ describe("actor-decay regressions", () => {
     assert.deepEqual(speechRuns, runSnapshot);
   });
 
+  it("cinematic stability: keeps the established recurrent-valley shoulder on its original slew owner", () => {
+    const totalFrames = 400;
+    const sourceFrameDb = new Array<number>(totalFrames).fill(-20);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-20);
+    const speechRuns = [{ startFrame: 20, endFrame: 380 }];
+    for (const valleyStartFrame of [90, 170, 250]) {
+      for (let frame = valleyStartFrame; frame < valleyStartFrame + 8; frame += 1) {
+        sourceFrameDb[frame] = -32;
+        speechBodyFrameDb[frame] = -32;
+      }
+    }
+
+    const recoveredGainDb = recoverRecurrentBodySpeechValleys(
+      new Float32Array(totalFrames),
+      sourceFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      14,
+      FRAME_MS,
+    );
+    let largestShoulderStepDb = 0;
+    for (let frame = 70; frame < 120; frame += 1) {
+      largestShoulderStepDb = Math.max(
+        largestShoulderStepDb,
+        Math.abs(recoveredGainDb[frame] - recoveredGainDb[frame - 1]),
+      );
+    }
+
+    assert.ok(
+      largestShoulderStepDb >= 0.29 && largestShoulderStepDb <= 0.295001,
+      `the established valley stage must retain its 0.295 dB/10 ms shoulder instead of inheriting the newer word-scale slew, got ${largestShoulderStepDb.toFixed(4)} dB`,
+    );
+  });
+
+  it("cinematic stability: gives a contiguous crescendo time-local arc support without recurrence evidence", () => {
+    const totalFrames = 360;
+    const sourceFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [{ startFrame: 30, endFrame: 330 }];
+    for (let frame = 30; frame < 330; frame += 1) {
+      const crescendoProgress = Math.min(1, (frame - 30) / 199);
+      const levelDb = -33 + 9 * crescendoProgress;
+      sourceFrameDb[frame] = levelDb;
+      speechBodyFrameDb[frame] = levelDb;
+    }
+
+    const stabilizedGainDb = stabilizeRecurrentWordScaleBody(
+      new Float32Array(totalFrames),
+      sourceFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      -82,
+      14,
+      0.5,
+      FRAME_MS,
+    );
+    const headEndFrame = 30 + Math.round((330 - 30) * 0.18);
+    const headLiftDb = Array.from(stabilizedGainDb.slice(30, headEndFrame)).reduce(
+      (sum, gainDb) => sum + gainDb,
+      0,
+    ) / (headEndFrame - 30);
+    let loudestInteriorFrame = 90;
+    for (let frame = 91; frame < 270; frame += 1) {
+      if (sourceFrameDb[frame] > sourceFrameDb[loudestInteriorFrame]) {
+        loudestInteriorFrame = frame;
+      }
+    }
+    const riseCorrectionDb = headLiftDb - stabilizedGainDb[loudestInteriorFrame];
+
+    assert.ok(
+      riseCorrectionDb >= 2.5 && riseCorrectionDb <= 5,
+      `a single contiguous crescendo needs bounded phrase-head recovery without a recurrence gate, got ${riseCorrectionDb.toFixed(3)} dB`,
+    );
+  });
+
+  it("cinematic stability: does not mistake one short inter-word gap for a phrase arc", () => {
+    const totalFrames = 300;
+    const sourceFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [{ startFrame: 30, endFrame: 270 }];
+    for (let frame = 30; frame < 270; frame += 1) {
+      const levelDb = frame >= 145 && frame < 160 ? -45 : -24;
+      sourceFrameDb[frame] = levelDb;
+      speechBodyFrameDb[frame] = levelDb;
+    }
+
+    const stabilizedGainDb = stabilizeRecurrentWordScaleBody(
+      new Float32Array(totalFrames),
+      sourceFrameDb,
+      speechBodyFrameDb,
+      speechRuns,
+      -82,
+      14,
+      0.9,
+      FRAME_MS,
+    );
+    const maximumGapLiftDb = Math.max(...stabilizedGainDb.slice(145, 160));
+    const maximumSteadyLiftDb = Math.max(
+      ...stabilizedGainDb.slice(70, 130),
+      ...stabilizedGainDb.slice(180, 240),
+    );
+
+    assert.ok(
+      maximumGapLiftDb < 0.3,
+      `a two-sided peak-following plateau must reject an isolated 150 ms word gap, got ${maximumGapLiftDb.toFixed(3)} dB`,
+    );
+    assert.ok(
+      maximumSteadyLiftDb < 0.2,
+      `a steady loud passage must remain effectively untouched, got ${maximumSteadyLiftDb.toFixed(3)} dB`,
+    );
+  });
+
   it("cinematic stability: caps residual word-scale authority when the established plan deepens a valley", () => {
     const totalFrames = 400;
     const frameDb = new Array<number>(totalFrames).fill(-82);
