@@ -320,8 +320,11 @@ const WORD_SCALE_BODY_LONG_UNIT_START_MS = 1_000;
 const WORD_SCALE_BODY_LONG_UNIT_FULL_MS = 1_800;
 const WORD_SCALE_BODY_LOCAL_SHOULDER_MS = 400;
 const WORD_SCALE_BODY_LOCAL_CORE_MS = 60;
-// Leave a small Float32/linear-conversion margin under the 0.3 dB contract.
+// Recurrent-valley owner: keep its corpus-validated shoulder independent from
+// the word-scale tier so either owner can be evaluated without hidden coupling.
 const BODY_DYNAMICS_MAX_GAIN_STEP_DB = 0.24;
+// Leave a small Float32/linear-conversion margin under the 0.3 dB contract.
+const WORD_SCALE_BODY_MAX_GAIN_STEP_DB = 0.24;
 const DENSE_BODY_PEAK_RELAXATION_CURVE = 24;
 
 /**
@@ -1385,23 +1388,23 @@ const projectWordScaleLiftWithoutLocalCrests = (
     // downward so the bounded contrast cannot introduce a new 10 ms edge.
     projectedLiftDb[0] = Math.min(
       projectedLiftDb[0],
-      BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
     );
     for (let index = 1; index < projectedLiftDb.length; index += 1) {
       projectedLiftDb[index] = Math.min(
         projectedLiftDb[index],
-        projectedLiftDb[index - 1] + BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        projectedLiftDb[index - 1] + WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
       );
     }
     const lastIndex = projectedLiftDb.length - 1;
     projectedLiftDb[lastIndex] = Math.min(
       projectedLiftDb[lastIndex],
-      BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+      WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
     );
     for (let index = projectedLiftDb.length - 2; index >= 0; index -= 1) {
       projectedLiftDb[index] = Math.min(
         projectedLiftDb[index],
-        projectedLiftDb[index + 1] + BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        projectedLiftDb[index + 1] + WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
       );
     }
   }
@@ -1648,13 +1651,13 @@ export const stabilizeRecurrentWordScaleBody = (
     for (let index = 1; index < requestedLiftDb.length; index += 1) {
       requestedLiftDb[index] = Math.max(
         requestedLiftDb[index],
-        requestedLiftDb[index - 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        requestedLiftDb[index - 1] - WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
       );
     }
     for (let index = requestedLiftDb.length - 2; index >= 0; index -= 1) {
       requestedLiftDb[index] = Math.max(
         requestedLiftDb[index],
-        requestedLiftDb[index + 1] - BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        requestedLiftDb[index + 1] - WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
       );
     }
     const projectedLiftDb = projectWordScaleLiftWithoutLocalCrests(
@@ -1705,7 +1708,7 @@ const projectWordScaleGainWithoutWorseningEdges = (
         establishedGainDbCurve[frame] - establishedGainDbCurve[frame - 1],
       );
       const allowedStepDb = Math.max(
-        BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
         establishedStepDb,
       );
       projectedGainDbCurve[frame] = Math.min(
@@ -1718,7 +1721,7 @@ const projectWordScaleGainWithoutWorseningEdges = (
         establishedGainDbCurve[frame + 1] - establishedGainDbCurve[frame],
       );
       const allowedStepDb = Math.max(
-        BODY_DYNAMICS_MAX_GAIN_STEP_DB,
+        WORD_SCALE_BODY_MAX_GAIN_STEP_DB,
         establishedStepDb,
       );
       projectedGainDbCurve[frame] = Math.min(

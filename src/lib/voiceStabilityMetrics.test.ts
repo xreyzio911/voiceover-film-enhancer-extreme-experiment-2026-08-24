@@ -57,8 +57,8 @@ test("static gain is invisible to drift, spike, and speech-body stability metric
   assert.ok(Math.abs(report.intraRunBody.spreadDeltaMedianDb ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.intraRunBody.spreadDeltaP90Db ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.intraRunArc.spreadDeltaMedianDb ?? Infinity) < 1e-9);
-  assert.ok(Math.abs(report.intraRunArc.riseDeltaMedianDb ?? Infinity) < 1e-9);
-  assert.ok(Math.abs(report.intraRunArc.fallDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.riseToPeakDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.fallFromPeakDeltaMedianDb ?? Infinity) < 1e-9);
 });
 
 test("robust section slopes retain signed slow rise and fall despite one outlier", () => {
@@ -154,12 +154,22 @@ test("intra-run body metric exposes sustained word-scale worsening without using
   assert.ok(report.intraRunBody.worsenedRunCount >= 1);
 });
 
-test("intra-run arc keeps expressive body-supported head-mid-tail shape visible", () => {
-  const sourceFrameDb = new Array<number>(600).fill(-30);
-  const sourceBodyDb = new Array<number>(600).fill(-38);
-  for (let index = 200; index < 400; index += 1) {
-    sourceFrameDb[index] = -20;
+test("intra-run arc keeps expressive speech-supported rise and fall visible", () => {
+  const sourceFrameDb = new Array<number>(600).fill(-60);
+  const sourceBodyDb = new Array<number>(600).fill(-60);
+  for (let index = 100; index < 220; index += 1) {
+    const progress = (index - 100) / 119;
+    sourceBodyDb[index] = -35 + progress * 15;
+    sourceFrameDb[index] = sourceBodyDb[index] + 1;
+  }
+  for (let index = 220; index < 380; index += 1) {
     sourceBodyDb[index] = -20;
+    sourceFrameDb[index] = -19;
+  }
+  for (let index = 380; index < 500; index += 1) {
+    const progress = (index - 380) / 119;
+    sourceBodyDb[index] = -20 - progress * 15;
+    sourceFrameDb[index] = sourceBodyDb[index] + 1;
   }
   const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
   const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
@@ -171,16 +181,80 @@ test("intra-run arc keeps expressive body-supported head-mid-tail shape visible"
 
   assert.ok(report.intraRunArc.eligibleRunCount >= 1);
   assert.ok(
-    (report.intraRunArc.sourceRiseMedianDb ?? 0) > 12,
-    `expected a material source head-to-mid rise, got ${report.intraRunArc.sourceRiseMedianDb}`,
+    (report.intraRunArc.sourceRiseToPeakMedianDb ?? 0) > 8,
+    `expected a material source head-to-peak rise, got ${report.intraRunArc.sourceRiseToPeakMedianDb}`,
   );
   assert.ok(
-    (report.intraRunArc.sourceFallMedianDb ?? 0) < -12,
-    `expected a material source mid-to-tail fall, got ${report.intraRunArc.sourceFallMedianDb}`,
+    (report.intraRunArc.sourceFallFromPeakMedianDb ?? 0) > 8,
+    `expected a material source peak-to-tail fall, got ${report.intraRunArc.sourceFallFromPeakMedianDb}`,
   );
-  assert.ok(Math.abs(report.intraRunArc.riseDeltaMedianDb ?? Infinity) < 1e-9);
-  assert.ok(Math.abs(report.intraRunArc.fallDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.riseToPeakDeltaMedianDb ?? Infinity) < 1e-9);
+  assert.ok(Math.abs(report.intraRunArc.fallFromPeakDeltaMedianDb ?? Infinity) < 1e-9);
   assert.ok(Math.abs(report.intraRunArc.spreadDeltaMedianDb ?? Infinity) < 1e-9);
+});
+
+test("intra-run arc measures a sustained crescendo against its interior peak", () => {
+  const sourceFrameDb = new Array<number>(400).fill(-60);
+  const sourceBodyDb = new Array<number>(400).fill(-60);
+  for (let index = 100; index < 250; index += 1) {
+    const progress = (index - 100) / 149;
+    sourceFrameDb[index] = -30 + progress * 9;
+    sourceBodyDb[index] = sourceFrameDb[index] - 1;
+  }
+  for (let index = 250; index < 300; index += 1) {
+    sourceFrameDb[index] = -21;
+    sourceBodyDb[index] = -22;
+  }
+  const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
+  const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
+  for (let index = 100; index < 250; index += 1) {
+    const progress = (index - 100) / 149;
+    const arcCorrectionDb = (1 - progress) * 4;
+    candidateFrameDb[index] += arcCorrectionDb;
+    candidateBodyDb[index] += arcCorrectionDb;
+  }
+
+  const report = compareVoiceStability(
+    evidence(sourceFrameDb, sourceBodyDb),
+    evidence(candidateFrameDb, candidateBodyDb),
+  );
+
+  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.intraRunArc.eligibleRunCount, 1);
+  assert.ok(
+    (report.intraRunArc.sourceRiseToPeakMedianDb ?? 0) >= 7,
+    `expected the 9 dB crescendo to remain visible, got ${report.intraRunArc.sourceRiseToPeakMedianDb}`,
+  );
+  assert.ok(
+    (report.intraRunArc.riseToPeakDeltaMedianDb ?? 0) <= -2.5,
+    `expected head recovery to reduce the measured rise, got ${report.intraRunArc.riseToPeakDeltaMedianDb}`,
+  );
+});
+
+test("intra-run arc derives separate runs from speech instead of pause room tone", () => {
+  const sourceFrameDb = new Array<number>(575).fill(-60);
+  const sourceBodyDb = new Array<number>(575).fill(-60);
+  for (const [start, end] of [[100, 250], [325, 475]] as const) {
+    for (let index = start; index < end; index += 1) {
+      sourceFrameDb[index] = -24;
+      sourceBodyDb[index] = -25;
+    }
+  }
+  // Deliberately above the old median-minus-24 dB arc threshold while the
+  // broadband evidence is a real 1.5 s pause below the speech detector.
+  for (let index = 250; index < 325; index += 1) sourceBodyDb[index] = -42;
+  const candidateFrameDb = sourceFrameDb.map((value) => value + 8);
+  const candidateBodyDb = sourceBodyDb.map((value) => value + 8);
+
+  const report = compareVoiceStability(
+    evidence(sourceFrameDb, sourceBodyDb),
+    evidence(candidateFrameDb, candidateBodyDb),
+  );
+
+  assert.equal(report.intraRunArc.eligibleRunCount, 2);
+  assert.ok(
+    Math.abs(report.intraRunArc.fallFromPeakDeltaMedianDb ?? Infinity) < 1e-9,
+  );
 });
 
 test("reports deterministic top-five clustered spike windows for audition", () => {
@@ -606,6 +680,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
       "tasks/render-evidence/current-goal/audition.json",
     ]),
     {
+      externalResultRoot: null,
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [],
       pairsJson: null,
@@ -621,6 +696,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
       "clips/b-source.wav|clips/b-result.wav|audition-b",
     ]),
     {
+      externalResultRoot: null,
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [
         "clips/a-source.wav|clips/a-result.wav|audition-a",
@@ -637,6 +713,23 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
       "tasks/render-evidence/current-goal/pairs.json",
     ]),
     {
+      externalResultRoot: null,
+      output: "tasks/render-evidence/current-goal/audition.json",
+      pairSpecs: [],
+      pairsJson: "tasks/render-evidence/current-goal/pairs.json",
+    },
+  );
+  assert.deepEqual(
+    parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--pairs-json",
+      "tasks/render-evidence/current-goal/pairs.json",
+      "--external-result-root",
+      "A:/CodexTaskEvidence/current-run",
+    ]),
+    {
+      externalResultRoot: "A:/CodexTaskEvidence/current-run",
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [],
       pairsJson: "tasks/render-evidence/current-goal/pairs.json",
@@ -767,6 +860,51 @@ test("explicit pairs resolve deterministically inside the repo and stay bounded"
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit pairs may read results from one exact external evidence root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-repo-"));
+  const externalRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-results-"));
+  const siblingRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-sibling-"));
+  try {
+    const source = path.join(root, "clips/source.wav");
+    const result = path.join(externalRoot, "batch-01/result.wav");
+    const siblingResult = path.join(siblingRoot, "result.wav");
+    await mkdir(path.dirname(source), { recursive: true });
+    await mkdir(path.dirname(result), { recursive: true });
+    await writeFile(source, new Uint8Array());
+    await writeFile(result, new Uint8Array());
+    await writeFile(siblingResult, new Uint8Array());
+
+    const [pair] = await resolveExplicitCorpusPairs(
+      root,
+      [`clips/source.wav|${result}|external-result`],
+      externalRoot,
+    );
+
+    assert.equal(pair.source.relativePath, "clips/source.wav");
+    assert.equal(pair.result.path, path.resolve(result));
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`clips/source.wav|${siblingResult}|external-sibling`],
+        externalRoot,
+      ),
+      /external result root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${result}|${result}|external-source`],
+        externalRoot,
+      ),
+      /source path must stay inside the repository/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+    await rm(siblingRoot, { recursive: true, force: true });
   }
 });
 

@@ -92,6 +92,15 @@ const bytesAsBlobPart = (bytes: Uint8Array): ArrayBuffer => {
   return copy;
 };
 
+const readOwnedBlobPart = async (blob: Blob, start: number, end: number): Promise<ArrayBuffer> => {
+  const slice = blob.slice(start, end);
+  const buffer = await slice.arrayBuffer();
+  if (buffer.byteLength !== Math.max(0, end - start)) {
+    throw new Error("Corrupt WAV: output assembly read returned an unexpected byte length.");
+  }
+  return buffer;
+};
+
 const readAscii = (view: DataView, offset: number, length: number) => {
   let value = "";
   for (let index = 0; index < length; index += 1) {
@@ -704,12 +713,13 @@ export const tameCanonicalMonoFloat32WavBlobInChunks = async (
     return { blob: wavBlob, stats };
   }
 
-  const parts: BlobPart[] = [wavBlob.slice(0, wav.dataOffset)];
+  const parts: BlobPart[] = [await readOwnedBlobPart(wavBlob, 0, wav.dataOffset)];
   let nextOriginalSample = 0;
   for (const replacement of replacements) {
     if (replacement.startSample > nextOriginalSample) {
       parts.push(
-        wavBlob.slice(
+        await readOwnedBlobPart(
+          wavBlob,
           wav.dataOffset + nextOriginalSample * FLOAT32_BYTES,
           wav.dataOffset + replacement.startSample * FLOAT32_BYTES,
         ),
@@ -720,14 +730,15 @@ export const tameCanonicalMonoFloat32WavBlobInChunks = async (
   }
   if (nextOriginalSample < wav.sampleCount) {
     parts.push(
-      wavBlob.slice(
+      await readOwnedBlobPart(
+        wavBlob,
         wav.dataOffset + nextOriginalSample * FLOAT32_BYTES,
         wav.dataOffset + wav.dataLength,
       ),
     );
   }
   const dataEnd = wav.dataOffset + wav.dataLength;
-  if (dataEnd < wavBlob.size) parts.push(wavBlob.slice(dataEnd, wavBlob.size));
+  if (dataEnd < wavBlob.size) parts.push(await readOwnedBlobPart(wavBlob, dataEnd, wavBlob.size));
 
   return {
     blob: new Blob(parts, { type: wavBlob.type || "audio/wav" }),

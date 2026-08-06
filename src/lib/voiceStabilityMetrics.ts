@@ -22,6 +22,7 @@ const INTRA_RUN_MIN_BODY_SUPPORT_RATIO = 0.8;
 const INTRA_RUN_SOURCE_FLOOR_RELATIVE_DB = -18;
 const INTRA_RUN_MIN_WINDOWS = 5;
 const INTRA_RUN_WORSENED_DELTA_DB = 0.5;
+const INTRA_RUN_ARC_EDGE_FRACTION = 0.2;
 
 /**
  * Pre-computed, fixed-duration mono envelope evidence. All level arrays use
@@ -73,7 +74,7 @@ export type FlattenedExpressiveEvent = Readonly<{
 }>;
 
 export type VoiceStabilityReport = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   /** These measurements are comparative evidence and never a delivery gate. */
   advisoryOnly: true;
   frameMs: number | null;
@@ -163,7 +164,7 @@ export type VoiceStabilityReport = Readonly<{
     spreadDeltaP90Db: number | null;
     worsenedRunCount: number;
   }>;
-  /** Advisory ungated body-supported intra-run arc shape; no expressive or -18 dB floor exclusion. */
+  /** Advisory speech-derived, body-supported intra-run arc shape; no expressive exclusion. */
   intraRunArc: Readonly<{
     windowMs: number;
     hopMs: number;
@@ -174,14 +175,14 @@ export type VoiceStabilityReport = Readonly<{
     /** Candidate-minus-source run spread; positive means less stable. */
     spreadDeltaMedianDb: number | null;
     spreadDeltaP90Db: number | null;
-    sourceRiseMedianDb: number | null;
-    candidateRiseMedianDb: number | null;
-    /** Candidate-minus-source mid-minus-head rise. */
-    riseDeltaMedianDb: number | null;
-    sourceFallMedianDb: number | null;
-    candidateFallMedianDb: number | null;
-    /** Candidate-minus-source tail-minus-mid fall. */
-    fallDeltaMedianDb: number | null;
+    sourceRiseToPeakMedianDb: number | null;
+    candidateRiseToPeakMedianDb: number | null;
+    /** Candidate-minus-source interior-peak-minus-head rise. */
+    riseToPeakDeltaMedianDb: number | null;
+    sourceFallFromPeakMedianDb: number | null;
+    candidateFallFromPeakMedianDb: number | null;
+    /** Candidate-minus-source interior-peak-minus-tail fall. */
+    fallFromPeakDeltaMedianDb: number | null;
   }>;
   expressiveRetention: Readonly<{
     /** Events are located from source-only local contrast and crest evidence. */
@@ -830,33 +831,40 @@ const buildIntraRunBody = (
 
 const summarizeIntraRunArcShape = (values: readonly number[]) => {
   if (values.length < INTRA_RUN_MIN_WINDOWS) return null;
-  const firstThirdEnd = Math.max(1, Math.floor(values.length / 3));
-  const finalThirdStart = Math.min(
-    values.length - 1,
-    Math.ceil((values.length * 2) / 3),
+  const edgeCount = Math.max(
+    1,
+    Math.round(values.length * INTRA_RUN_ARC_EDGE_FRACTION),
   );
-  const head = finiteMedian(values.slice(0, firstThirdEnd));
-  const mid = finiteMedian(values.slice(firstThirdEnd, finalThirdStart));
-  const tail = finiteMedian(values.slice(finalThirdStart));
+  if (values.length <= edgeCount * 2) return null;
+  const headDb = finiteMedian(values.slice(0, edgeCount));
+  const tailDb = finiteMedian(values.slice(values.length - edgeCount));
+  const interior = values
+    .slice(edgeCount, values.length - edgeCount)
+    .filter(finite);
   const p90 = finitePercentile(values, 90);
   const p10 = finitePercentile(values, 10);
   if (
-    head === null ||
-    mid === null ||
-    tail === null ||
+    headDb === null ||
+    tailDb === null ||
+    interior.length === 0 ||
     p90 === null ||
     p10 === null
   ) return null;
+  // Each value is already a robust 300 ms window median. Use the loudest
+  // sustained interior window as the peak; an interior median averages a
+  // crescendo away and therefore cannot measure the arc it names.
+  const peakDb = Math.max(...interior);
   return {
     spreadDb: p90 - p10,
-    riseDb: mid - head,
-    fallDb: tail - mid,
+    riseToPeakDb: peakDb - headDb,
+    fallFromPeakDb: peakDb - tailDb,
   };
 };
 
 const buildIntraRunArc = (
   source: VoiceEnvelopeEvidence,
   candidate: VoiceEnvelopeEvidence,
+  speechMask: readonly boolean[],
   bodySupportMask: readonly boolean[],
   alignedFrameCount: number,
 ) => {
@@ -874,12 +882,12 @@ const buildIntraRunArc = (
     candidateSpreadMedianDb: null,
     spreadDeltaMedianDb: null,
     spreadDeltaP90Db: null,
-    sourceRiseMedianDb: null,
-    candidateRiseMedianDb: null,
-    riseDeltaMedianDb: null,
-    sourceFallMedianDb: null,
-    candidateFallMedianDb: null,
-    fallDeltaMedianDb: null,
+    sourceRiseToPeakMedianDb: null,
+    candidateRiseToPeakMedianDb: null,
+    riseToPeakDeltaMedianDb: null,
+    sourceFallFromPeakMedianDb: null,
+    candidateFallFromPeakMedianDb: null,
+    fallFromPeakDeltaMedianDb: null,
   } as const;
   const frameCount = Math.min(
     alignedFrameCount,
@@ -895,6 +903,8 @@ const buildIntraRunArc = (
   const arcSupportMask = Array.from(
     { length: frameCount },
     (_, index) => (
+      speechMask[index] === true &&
+      bodySupportMask[index] === true &&
       finite(source.speechBodyDb[index]) &&
       finite(candidate.speechBodyDb[index]) &&
       source.speechBodyDb[index] >= supportFloorDb
@@ -904,12 +914,12 @@ const buildIntraRunArc = (
   const sourceSpreads: number[] = [];
   const candidateSpreads: number[] = [];
   const spreadDeltas: number[] = [];
-  const sourceRises: number[] = [];
-  const candidateRises: number[] = [];
-  const riseDeltas: number[] = [];
-  const sourceFalls: number[] = [];
-  const candidateFalls: number[] = [];
-  const fallDeltas: number[] = [];
+  const sourceRisesToPeak: number[] = [];
+  const candidateRisesToPeak: number[] = [];
+  const riseToPeakDeltas: number[] = [];
+  const sourceFallsFromPeak: number[] = [];
+  const candidateFallsFromPeak: number[] = [];
+  const fallFromPeakDeltas: number[] = [];
   for (const run of deriveActiveRuns(arcSupportMask, frameCount)) {
     const sourceWindowMedians: number[] = [];
     const candidateWindowMedians: number[] = [];
@@ -939,12 +949,12 @@ const buildIntraRunArc = (
     sourceSpreads.push(sourceArc.spreadDb);
     candidateSpreads.push(candidateArc.spreadDb);
     spreadDeltas.push(candidateArc.spreadDb - sourceArc.spreadDb);
-    sourceRises.push(sourceArc.riseDb);
-    candidateRises.push(candidateArc.riseDb);
-    riseDeltas.push(candidateArc.riseDb - sourceArc.riseDb);
-    sourceFalls.push(sourceArc.fallDb);
-    candidateFalls.push(candidateArc.fallDb);
-    fallDeltas.push(candidateArc.fallDb - sourceArc.fallDb);
+    sourceRisesToPeak.push(sourceArc.riseToPeakDb);
+    candidateRisesToPeak.push(candidateArc.riseToPeakDb);
+    riseToPeakDeltas.push(candidateArc.riseToPeakDb - sourceArc.riseToPeakDb);
+    sourceFallsFromPeak.push(sourceArc.fallFromPeakDb);
+    candidateFallsFromPeak.push(candidateArc.fallFromPeakDb);
+    fallFromPeakDeltas.push(candidateArc.fallFromPeakDb - sourceArc.fallFromPeakDb);
   }
 
   return {
@@ -954,17 +964,17 @@ const buildIntraRunArc = (
     candidateSpreadMedianDb: finiteMedian(candidateSpreads),
     spreadDeltaMedianDb: finiteMedian(spreadDeltas),
     spreadDeltaP90Db: finitePercentile(spreadDeltas, 90),
-    sourceRiseMedianDb: finiteMedian(sourceRises),
-    candidateRiseMedianDb: finiteMedian(candidateRises),
-    riseDeltaMedianDb: finiteMedian(riseDeltas),
-    sourceFallMedianDb: finiteMedian(sourceFalls),
-    candidateFallMedianDb: finiteMedian(candidateFalls),
-    fallDeltaMedianDb: finiteMedian(fallDeltas),
+    sourceRiseToPeakMedianDb: finiteMedian(sourceRisesToPeak),
+    candidateRiseToPeakMedianDb: finiteMedian(candidateRisesToPeak),
+    riseToPeakDeltaMedianDb: finiteMedian(riseToPeakDeltas),
+    sourceFallFromPeakMedianDb: finiteMedian(sourceFallsFromPeak),
+    candidateFallFromPeakMedianDb: finiteMedian(candidateFallsFromPeak),
+    fallFromPeakDeltaMedianDb: finiteMedian(fallFromPeakDeltas),
   };
 };
 
 const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   advisoryOnly: true,
   frameMs: null,
   alignedFrameCount: 0,
@@ -1026,12 +1036,12 @@ const emptyReport = (notes: readonly string[]): VoiceStabilityReport => ({
     candidateSpreadMedianDb: null,
     spreadDeltaMedianDb: null,
     spreadDeltaP90Db: null,
-    sourceRiseMedianDb: null,
-    candidateRiseMedianDb: null,
-    riseDeltaMedianDb: null,
-    sourceFallMedianDb: null,
-    candidateFallMedianDb: null,
-    fallDeltaMedianDb: null,
+    sourceRiseToPeakMedianDb: null,
+    candidateRiseToPeakMedianDb: null,
+    riseToPeakDeltaMedianDb: null,
+    sourceFallFromPeakMedianDb: null,
+    candidateFallFromPeakMedianDb: null,
+    fallFromPeakDeltaMedianDb: null,
   },
   expressiveRetention: {
     sourceEventCount: 0,
@@ -1264,6 +1274,7 @@ export const compareVoiceStability = (
   const intraRunArc = buildIntraRunArc(
     alignedSource,
     alignedCandidate,
+    speechMask,
     bodySupportMask,
     alignedFrameCount,
   );
@@ -1274,11 +1285,11 @@ export const compareVoiceStability = (
     notes.push("No speech run had enough non-expressive body-supported windows for intra-run spread.");
   }
   if (intraRunArc.eligibleRunCount === 0) {
-    notes.push("No speech run had enough body-supported windows for intra-run arc shape.");
+    notes.push("No speech-derived run had enough body-supported windows for intra-run arc shape.");
   }
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     advisoryOnly: true,
     frameMs: alignedSource.frameMs,
     alignedFrameCount,

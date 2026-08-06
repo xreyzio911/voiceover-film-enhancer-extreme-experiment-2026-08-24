@@ -416,11 +416,11 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "renderedSafetyEvidence:",
     "recycleBeforeFullBlobCopy(target.entry, \"render\")",
     "`volume=${authorizedOffsetDb.toFixed(2)}dB",
-    "const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, outputName)",
+    "const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(",
     "const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName)",
   ]);
   assertMarkersInOrder(batchSpeechEvidenceBlock, [
-    "planDistributedSpeechEvidenceWindows(durationSec)",
+    "planDistributedSpeechEvidenceWindows(durationSec, speechSpans)",
     "measureFinalPolishEvidenceFromVirtualWav(",
     "window.startSec",
     "window.durationSec",
@@ -435,6 +435,50 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     batchAlignmentBlock,
     /omittedPositiveAlignmentCount[\s\S]*?requestedOffsetDb > 0 && authorizedOffsetDb <= 0[\s\S]*?omittedPositiveAlignmentCount \+= 1[\s\S]*?alignedCount === 0[\s\S]*?omittedPositiveAlignmentCount > 0/,
     "an omitted positive offset must not be reported as already aligned",
+  );
+});
+
+test("batch speech alignment reuses full-file speech spans and refuses thin sampled evidence", () => {
+  const batchAlignmentBlock = sourceBetween(
+    "const alignBatchMixReadyOutputs = async",
+    "const applyFinalConsonantResidualToOutputs = async",
+  );
+  const batchSpeechEvidenceBlock = sourceBetween(
+    "const measureBatchSpeechLevelDbFromVirtualWav = async (",
+    "const recoverFinalPolishEvidenceFromExactWav = async (",
+  );
+  const processFilesBlock = sourceBetween(
+    "const processFiles = async () =>",
+    "const downloadOutputsSequentially = async",
+  );
+
+  assertMarkersInOrder(processFilesBlock, [
+    "const speechSpansByBase = new Map<string, SpeechSpan[]>()",
+    "analysisResult.speechSpans.length > 0",
+    "speechSpansByBase.set(job.base, [...analysisResult.speechSpans])",
+    "speechSpansByBase.set(job.base, speechRenderPlan.speechSpans)",
+    "alignBatchMixReadyOutputs(",
+    "speechSpansByBase",
+  ]);
+  assert.match(
+    batchAlignmentBlock,
+    /target\.entry\.partIndex === undefined[\s\S]*?speechSpansByBase\.get\(target\.entry\.sourceBase\)/,
+    "absolute full-file speech spans must never be applied to local-time long-form parts",
+  );
+  assert.match(
+    batchAlignmentBlock,
+    /measureBatchSpeechLevelDbFromBlob\([\s\S]*?speechSpans/,
+    "planning measurements should receive known speech spans",
+  );
+  assert.match(
+    batchAlignmentBlock,
+    /measureBatchSpeechLevelDbFromVirtualWav\([\s\S]*?speechSpans/,
+    "post-alignment verification should measure the same speech-aware windows",
+  );
+  assert.equal(
+    (batchSpeechEvidenceBlock.match(/hasSufficientBatchSpeechEvidence\(/g) ?? []).length,
+    2,
+    "both Blob and virtual-WAV measurements must require four usable sampled windows or genuine full coverage",
   );
 });
 

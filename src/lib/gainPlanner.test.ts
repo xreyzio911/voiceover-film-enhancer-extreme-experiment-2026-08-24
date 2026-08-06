@@ -5256,21 +5256,20 @@ describe("actor-decay regressions", () => {
     }
 
     assert.ok(
-      largestShoulderStepDb >= 0.29 && largestShoulderStepDb <= 0.295001,
-      `the established valley stage must retain its 0.295 dB/10 ms shoulder instead of inheriting the newer word-scale slew, got ${largestShoulderStepDb.toFixed(4)} dB`,
+      largestShoulderStepDb >= 0.239 && largestShoulderStepDb <= 0.240001,
+      `the recurrent valley stage must retain the corpus-validated 0.24 dB/10 ms shoulder, got ${largestShoulderStepDb.toFixed(4)} dB`,
     );
   });
 
-  it("cinematic stability: gives a contiguous crescendo time-local arc support without recurrence evidence", () => {
+  it("cinematic stability: leaves a native monotonic crescendo outside the recurrent word-scale owner", () => {
     const totalFrames = 360;
     const sourceFrameDb = new Array<number>(totalFrames).fill(-82);
     const speechBodyFrameDb = new Array<number>(totalFrames).fill(-82);
     const speechRuns = [{ startFrame: 30, endFrame: 330 }];
     for (let frame = 30; frame < 330; frame += 1) {
       const crescendoProgress = Math.min(1, (frame - 30) / 199);
-      const levelDb = -33 + 9 * crescendoProgress;
-      sourceFrameDb[frame] = levelDb;
-      speechBodyFrameDb[frame] = levelDb;
+      sourceFrameDb[frame] = -33 + 9 * crescendoProgress;
+      speechBodyFrameDb[frame] = sourceFrameDb[frame];
     }
 
     const stabilizedGainDb = stabilizeRecurrentWordScaleBody(
@@ -5283,22 +5282,10 @@ describe("actor-decay regressions", () => {
       0.5,
       FRAME_MS,
     );
-    const headEndFrame = 30 + Math.round((330 - 30) * 0.18);
-    const headLiftDb = Array.from(stabilizedGainDb.slice(30, headEndFrame)).reduce(
-      (sum, gainDb) => sum + gainDb,
-      0,
-    ) / (headEndFrame - 30);
-    let loudestInteriorFrame = 90;
-    for (let frame = 91; frame < 270; frame += 1) {
-      if (sourceFrameDb[frame] > sourceFrameDb[loudestInteriorFrame]) {
-        loudestInteriorFrame = frame;
-      }
-    }
-    const riseCorrectionDb = headLiftDb - stabilizedGainDb[loudestInteriorFrame];
 
     assert.ok(
-      riseCorrectionDb >= 2.5 && riseCorrectionDb <= 5,
-      `a single contiguous crescendo needs bounded phrase-head recovery without a recurrence gate, got ${riseCorrectionDb.toFixed(3)} dB`,
+      Math.max(...stabilizedGainDb.map(Math.abs)) <= 1e-6,
+      "a native one-direction phrase is not recurrent valley evidence and must keep its actor-owned arc",
     );
   });
 
@@ -5683,8 +5670,8 @@ describe("actor-decay regressions", () => {
       `source deficit ${sourceDeficitDb.toFixed(4)}, output deficit ${outputDeficitDb.toFixed(4)}, ` +
       `source expression ${sourceExpressiveContrastDb.toFixed(2)}, output expression ${outputExpressiveContrastDb.toFixed(2)}, ` +
       `slew ${largestGainStepDb.toFixed(3)}, quiet control ${outputQuietContrastDb.toFixed(2)} dB`;
-    // With a 16-frame clean gap, the stricter 0.24 dB/frame two-sided slew can
-    // supply roughly 2 dB of relative fill without creating a new gain step.
+    // With a 16-frame clean gap, the 0.24 dB/frame two-sided slew can supply
+    // roughly 2 dB of relative fill without creating a new gain step.
     assert.ok(
       outputDeficitDb >= 7.5 && outputDeficitDb <= 8.2,
       `recurrent 80 ms body holes need bounded fill without hard flattening (${stabilityLedger})`,

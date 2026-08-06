@@ -10,6 +10,9 @@
  *   npm run measure:vo-corpus -- --out tasks/render-evidence/current-goal/voice-stability-baseline.json
  *   npm run measure:vo-corpus -- --out tasks/render-evidence/current-goal/audition.json \
  *     --pair "clips/source.wav|clips/result.wav|audition-id"
+ *   npm run measure:vo-corpus -- --out tasks/render-evidence/current-goal/external-audition.json \
+ *     --pairs-json tasks/render-evidence/current-goal/external-pairs.json \
+ *     --external-result-root "A:/CodexTaskEvidence/current-run"
  */
 import { createHash } from "node:crypto";
 import {
@@ -302,18 +305,54 @@ const parseExplicitPairSpec = (spec: string) => {
   return { sourcePath, resultPath, id };
 };
 
+type ExternalResultRoot = Readonly<{
+  absolutePath: string;
+  realPath: string;
+}>;
+
+const resolveExternalResultRoot = async (requestedPath: string): Promise<ExternalResultRoot> => {
+  if (!path.isAbsolute(requestedPath)) {
+    throw new Error("--external-result-root requires an absolute directory path.");
+  }
+  const absolutePath = path.resolve(requestedPath);
+  let info;
+  try {
+    info = await stat(absolutePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`External result root does not exist: ${requestedPath}`);
+    }
+    throw error;
+  }
+  if (!info.isDirectory()) {
+    throw new Error(`External result root is not a directory: ${requestedPath}`);
+  }
+  return {
+    absolutePath,
+    realPath: await realpath(absolutePath),
+  };
+};
+
 const resolveExplicitWav = async (
   repoRoot: string,
   realRepoRoot: string,
   requestedPath: string,
   role: "source" | "result",
+  externalResultRoot: ExternalResultRoot | null,
 ) => {
   if (path.extname(requestedPath).toLowerCase() !== ".wav") {
     throw new Error(`Explicit ${role} path must end in .wav.`);
   }
   const absolutePath = path.resolve(repoRoot, requestedPath);
-  if (!isPathInside(repoRoot, absolutePath)) {
-    throw new Error(`Explicit ${role} path must stay inside the repository.`);
+  const isLexicallyInsideRepo = isPathInside(repoRoot, absolutePath);
+  const isLexicallyInsideExternalResultRoot = role === "result"
+    && externalResultRoot !== null
+    && isPathInside(externalResultRoot.absolutePath, absolutePath);
+  if (!isLexicallyInsideRepo && !isLexicallyInsideExternalResultRoot) {
+    const boundary = role === "result" && externalResultRoot !== null
+      ? "the repository or the external result root"
+      : "the repository";
+    throw new Error(`Explicit ${role} path must stay inside ${boundary}.`);
   }
   let info;
   try {
@@ -326,8 +365,15 @@ const resolveExplicitWav = async (
   }
   if (!info.isFile()) throw new Error(`Explicit ${role} WAV is not a file: ${requestedPath}`);
   const realFilePath = await realpath(absolutePath);
-  if (!isPathInside(realRepoRoot, realFilePath)) {
-    throw new Error(`Explicit ${role} path must resolve inside the repository.`);
+  const isReallyInsideRepo = isPathInside(realRepoRoot, realFilePath);
+  const isReallyInsideExternalResultRoot = role === "result"
+    && externalResultRoot !== null
+    && isPathInside(externalResultRoot.realPath, realFilePath);
+  if (!isReallyInsideRepo && !isReallyInsideExternalResultRoot) {
+    const boundary = role === "result" && externalResultRoot !== null
+      ? "the repository or the external result root"
+      : "the repository";
+    throw new Error(`Explicit ${role} path must resolve inside ${boundary}.`);
   }
   return {
     absolutePath,
@@ -339,19 +385,35 @@ const resolveExplicitWav = async (
 export const resolveExplicitCorpusPairs = async (
   repoRoot: string,
   pairSpecs: readonly string[],
+  externalResultRootPath: string | null = null,
 ): Promise<readonly CorpusPair[]> => {
   if (pairSpecs.length > MAX_EXPLICIT_PAIRS) {
     throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
   }
   const realRepoRoot = await realpath(repoRoot);
+  const externalResultRoot = externalResultRootPath === null
+    ? null
+    : await resolveExternalResultRoot(externalResultRootPath);
   const seenIds = new Set<string>();
   const pairs: CorpusPair[] = [];
   for (const pairSpec of pairSpecs) {
     const parsed = parseExplicitPairSpec(pairSpec);
     if (seenIds.has(parsed.id)) throw new Error(`Duplicate explicit pair id: ${parsed.id}`);
     seenIds.add(parsed.id);
-    const source = await resolveExplicitWav(repoRoot, realRepoRoot, parsed.sourcePath, "source");
-    const result = await resolveExplicitWav(repoRoot, realRepoRoot, parsed.resultPath, "result");
+    const source = await resolveExplicitWav(
+      repoRoot,
+      realRepoRoot,
+      parsed.sourcePath,
+      "source",
+      externalResultRoot,
+    );
+    const result = await resolveExplicitWav(
+      repoRoot,
+      realRepoRoot,
+      parsed.resultPath,
+      "result",
+      externalResultRoot,
+    );
     pairs.push({
       id: parsed.id,
       corpus: "explicit",
@@ -666,11 +728,11 @@ const summarize = (
       intraRunArcSpreadDeltaP90Db: median(
         values((metrics) => metrics.intraRunArc.spreadDeltaP90Db),
       ),
-      intraRunArcRiseDeltaMedianDb: median(
-        values((metrics) => metrics.intraRunArc.riseDeltaMedianDb),
+      intraRunArcRiseToPeakDeltaMedianDb: median(
+        values((metrics) => metrics.intraRunArc.riseToPeakDeltaMedianDb),
       ),
-      intraRunArcFallDeltaMedianDb: median(
-        values((metrics) => metrics.intraRunArc.fallDeltaMedianDb),
+      intraRunArcFallFromPeakDeltaMedianDb: median(
+        values((metrics) => metrics.intraRunArc.fallFromPeakDeltaMedianDb),
       ),
       expressiveContrastRetentionP10Ratio: median(
         values((metrics) => metrics.expressiveRetention.contrastRetentionP10Ratio),
@@ -682,6 +744,7 @@ const summarize = (
 export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) => {
   let output: string | null = null;
   let pairsJson: string | null = null;
+  let externalResultRoot: string | null = null;
   const pairSpecs: string[] = [];
   for (let index = 0; index < argumentsList.length; index += 1) {
     const argument = argumentsList[index];
@@ -696,6 +759,18 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
       const pairsJsonPath = argumentsList[index + 1];
       if (pairsJsonPath === undefined) throw new Error("--pairs-json requires a JSON path.");
       pairsJson = pairsJsonPath;
+      index += 1;
+      continue;
+    }
+    if (argument === "--external-result-root") {
+      if (externalResultRoot !== null) {
+        throw new Error("--external-result-root may only be supplied once.");
+      }
+      const externalRootPath = argumentsList[index + 1];
+      if (externalRootPath === undefined) {
+        throw new Error("--external-result-root requires an absolute directory path.");
+      }
+      externalResultRoot = externalRootPath;
       index += 1;
       continue;
     }
@@ -714,7 +789,10 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
   if (output === null || output.trim() === "") {
     throw new Error("Usage requires --out <tasks/render-evidence/...json>.");
   }
-  return { output, pairSpecs: [...pairSpecs], pairsJson };
+  if (externalResultRoot !== null && pairsJson === null && pairSpecs.length === 0) {
+    throw new Error("--external-result-root requires --pairs-json or at least one --pair.");
+  }
+  return { externalResultRoot, output, pairSpecs: [...pairSpecs], pairsJson };
 };
 
 type ExplicitPairManifestEntry = Readonly<{
@@ -792,7 +870,9 @@ const toLedgerCorpusFile = (file: CorpusFile) => ({
 
 const main = async () => {
   const repoRoot = process.cwd();
-  const { output, pairSpecs, pairsJson } = parseMeasureVoCorpusArguments(process.argv.slice(2));
+  const { externalResultRoot, output, pairSpecs, pairsJson } = parseMeasureVoCorpusArguments(
+    process.argv.slice(2),
+  );
   const outputPath = await prepareLedgerOutputPath(repoRoot, output);
   const jsonPairSpecs = pairsJson ? await readExplicitPairSpecsJson(repoRoot, pairsJson) : [];
   const explicitPairSpecs = [...pairSpecs, ...jsonPairSpecs];
@@ -802,7 +882,7 @@ const main = async () => {
   const discovery: CorpusDiscovery = explicitPairSpecs.length === 0
     ? await discoverCorpusPairs(repoRoot)
     : {
-        pairs: await resolveExplicitCorpusPairs(repoRoot, explicitPairSpecs),
+        pairs: await resolveExplicitCorpusPairs(repoRoot, explicitPairSpecs, externalResultRoot),
         unmatchedSources: [],
         unmatchedResults: [],
         missingRoots: [],
@@ -816,7 +896,7 @@ const main = async () => {
   }
 
   const ledger = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     advisoryOnly: true,
     generatedAt: new Date().toISOString(),
     definitions: {
@@ -830,7 +910,7 @@ const main = async () => {
       bodySpikes: "180-3000 Hz candidate local up/down contrast beyond the source +/-20 ms neighborhood; event-peak P95, advisory 1.5 dB event count, and strongest five source-timeline event windows",
       body: "source-body-supported non-expressive speech, using 180-3000 Hz P10 floor/fill and P90-P10 spread after per-file static-gain centering",
       intraRunBody: "source-run 300 ms medians at 100 ms hops with >=80% body support, source body >= file median-18 dB, expressive windows excluded, and >=5 windows per eligible run; reports candidate-minus-source run-spread median and P90",
-      intraRunArc: "source-run 300 ms medians at 100 ms hops with >=80% body support and >=5 windows per eligible run; keeps expressive body-supported windows, uses only the existing median-24 dB body-support boundary, and reports ungated spread plus signed head/mid/tail rise and fall",
+      intraRunArc: "speech-derived source runs of 300 ms body medians at 100 ms hops with >=80% support and >=5 windows; robust first/last 20% medians are measured against the loudest sustained interior window, reporting rise-to-peak and fall-from-peak without expressive exclusion",
       expressiveRetention: "source-only local emphasis/crest events; best candidate support within +/-20 ms reported separately",
       adjudication: "advisory comparative evidence only; no accept, reject, cancellation, or delivery gate",
     },

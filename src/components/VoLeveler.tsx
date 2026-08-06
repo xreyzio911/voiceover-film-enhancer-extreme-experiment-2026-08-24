@@ -101,8 +101,10 @@ import {
 import { buildFinalPolishFilter } from "../lib/finalPolishFilter";
 import { measureNativeFinalToneSpectrumDb } from "../lib/finalToneEvidence";
 import {
+  hasSufficientBatchSpeechEvidence,
   planBatchSpeechAlignment,
   planDistributedSpeechEvidenceWindows,
+  selectDistributedSpeechEvidenceWindowsWithConfig as selectDistributedAnalysisWindowsWithConfig,
 } from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import {
@@ -123,6 +125,7 @@ import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlo
 import { estimateVoZipBytes, planVoZipExportParts } from "../lib/downloadPolicy";
 import { shouldEmitMixReadyOutput } from "../lib/outputDeliveryPolicy";
 import {
+  normalizeFfmpegProgressRatio,
   runFfmpegOperationWithOneResetRetry,
   shouldPublishGenericFfmpegProgress,
   shouldRecycleFfmpegBeforeOperation,
@@ -678,6 +681,7 @@ type FailedOptimization = {
 type AnalysisResult = {
   analysis: FileAnalysis;
   ffmpeg: FFmpeg;
+  speechSpans: readonly SpeechSpan[];
 };
 
 type QueueItemStatus = "pending" | "working" | "done" | "error";
@@ -1276,9 +1280,9 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
 
     ffmpeg.on("progress", ({ progress }) => {
       const activeBase = activeQueueBaseRef.current;
-      if (progress > 0 && shouldPublishGenericFfmpegProgress(activeBase)) {
-        setStatus(`Processing ${(progress * 100).toFixed(0)}%`);
-        const clampedProgress = clamp(progress, 0, 1);
+      const clampedProgress = normalizeFfmpegProgressRatio(progress);
+      if (clampedProgress !== null && shouldPublishGenericFfmpegProgress(activeBase)) {
+        setStatus(`Processing ${(clampedProgress * 100).toFixed(0)}%`);
         if (Math.abs(clampedProgress - activeQueueProgressRef.current) >= 0.03 || clampedProgress >= 0.995) {
           activeQueueProgressRef.current = clampedProgress;
           updateQueueItem(activeBase, {
@@ -2721,90 +2725,6 @@ const summarizeFailureReason = (error: unknown) => {
     };
   };
 
-  const selectDistributedAnalysisWindowsWithConfig = (
-    speechSpans: SpeechSpan[],
-    durationSeconds: number,
-    windowSec: number,
-    targetCount: number
-  ) => {
-    const maxStart = Math.max(0, durationSeconds - windowSec);
-
-    type Candidate = { startSec: number; occupancyPct: number; centerSec: number; spanLenSec: number };
-    const candidates: Candidate[] = [];
-
-    for (const span of speechSpans) {
-      const spanLenSec = span.endSec - span.startSec;
-      if (spanLenSec <= 0.05) continue;
-      const stepSec = spanLenSec > windowSec ? Math.max(10, windowSec * 0.75) : spanLenSec;
-      const centerStart = span.startSec + spanLenSec / 2;
-      for (let t = span.startSec; t <= span.endSec; t += stepSec) {
-        const centerSec = clamp(t, span.startSec, span.endSec);
-        const startSec = clamp(centerSec - windowSec / 2, 0, maxStart);
-        const occupancyPct = speechOccupancyPctInWindow(speechSpans, startSec, windowSec);
-        candidates.push({ startSec, occupancyPct, centerSec, spanLenSec });
-      }
-      const centeredStart = clamp(centerStart - windowSec / 2, 0, maxStart);
-      candidates.push({
-        startSec: centeredStart,
-        occupancyPct: speechOccupancyPctInWindow(speechSpans, centeredStart, windowSec),
-        centerSec: centerStart,
-        spanLenSec,
-      });
-    }
-
-    if (candidates.length === 0) {
-      const starts: number[] = [];
-      const count = Math.min(targetCount, Math.max(1, Math.ceil(durationSeconds / windowSec)));
-      for (let i = 0; i < count; i += 1) {
-        const ratio = count === 1 ? 0 : i / (count - 1);
-        starts.push(clamp(ratio * maxStart, 0, maxStart));
-      }
-      return starts.map((startSec) => ({
-        startSec,
-        durationSec: Math.min(windowSec, durationSeconds - startSec),
-        occupancyPct: 0,
-      }));
-    }
-
-    const buckets = new Map<number, Candidate[]>();
-    for (const candidate of candidates) {
-      const bucketIndex = clamp(Math.floor((candidate.centerSec / Math.max(durationSeconds, 1e-6)) * targetCount), 0, targetCount - 1);
-      const bucket = buckets.get(bucketIndex) ?? [];
-      bucket.push(candidate);
-      buckets.set(bucketIndex, bucket);
-    }
-
-    const selected: Candidate[] = [];
-    for (let bucketIndex = 0; bucketIndex < targetCount; bucketIndex += 1) {
-      const bucket = buckets.get(bucketIndex);
-      if (!bucket || bucket.length === 0) continue;
-      bucket.sort((a, b) => b.occupancyPct - a.occupancyPct || a.startSec - b.startSec);
-      selected.push(bucket[0]);
-    }
-
-    const selectedKeys = new Set(selected.map((item) => item.startSec.toFixed(2)));
-    const remaining = [...candidates]
-      .filter((candidate) => !selectedKeys.has(candidate.startSec.toFixed(2)))
-      .sort((a, b) => b.occupancyPct - a.occupancyPct || a.startSec - b.startSec);
-
-    for (const candidate of remaining) {
-      if (selected.length >= targetCount) break;
-      const tooClose = selected.some((picked) => Math.abs(picked.startSec - candidate.startSec) < windowSec * 0.35);
-      if (tooClose) continue;
-      selected.push(candidate);
-    }
-
-    const thresholdCandidates = selected.filter((candidate) => candidate.occupancyPct >= 12);
-    const finalList = thresholdCandidates.length > 0 ? thresholdCandidates : selected;
-    finalList.sort((a, b) => a.startSec - b.startSec);
-
-    return finalList.slice(0, targetCount).map((candidate) => ({
-      startSec: candidate.startSec,
-      durationSec: Math.min(windowSec, Math.max(1, durationSeconds - candidate.startSec)),
-      occupancyPct: candidate.occupancyPct,
-    }));
-  };
-
   const selectSpeechAnchoredAnalysisWindow = (
     speechSpans: SpeechSpan[],
     durationSeconds: number,
@@ -3174,9 +3094,9 @@ const summarizeFailureReason = (error: unknown) => {
     limitReason?: string;
   };
 
-  function limitAnalysisWindows<T>(windows: T[], maxDistributedWindows?: number): T[] {
+  function limitAnalysisWindows<T>(windows: readonly T[], maxDistributedWindows?: number): T[] {
     if (!maxDistributedWindows || maxDistributedWindows <= 0 || windows.length <= maxDistributedWindows) {
-      return windows;
+      return [...windows];
     }
     if (maxDistributedWindows === 1) return [windows[Math.floor(windows.length / 2)]];
     const selected: T[] = [];
@@ -3194,6 +3114,7 @@ const summarizeFailureReason = (error: unknown) => {
     options: AnalysisOptions = {},
   ): Promise<AnalysisResult> => {
     let durationSeconds: number | null = null;
+    let analysisSpeechSpans: readonly SpeechSpan[] = [];
     const recoveryInputs = Array.from(new Set([inputName, ...recoveryInputNames]));
     const recoveryInputBytes = new Map<string, Uint8Array>();
     const ensureRecoveryInputBytes = async (name: string) => {
@@ -3230,6 +3151,7 @@ const summarizeFailureReason = (error: unknown) => {
           silenceSpans: coarseMap.silenceSpans,
           speechSpans: coarseMap.speechSpans,
         };
+        analysisSpeechSpans = coarseMap.speechSpans;
         const bootstrapWindow = selectSpeechAnchoredAnalysisWindow(
           coarseMap.speechSpans,
           durationSeconds,
@@ -3269,7 +3191,7 @@ const summarizeFailureReason = (error: unknown) => {
 
     if (durationSeconds === null || durationSeconds < DISTRIBUTED_ANALYSIS_THRESHOLD_SECONDS) {
       baseAnalysis.longSparseModeEligible = false;
-      return { analysis: baseAnalysis, ffmpeg };
+      return { analysis: baseAnalysis, ffmpeg, speechSpans: analysisSpeechSpans };
     }
 
     const silenceDb = clamp(
@@ -3290,6 +3212,7 @@ const summarizeFailureReason = (error: unknown) => {
         silenceMapResult = await runSilenceMapAnalysis(ffmpeg, inputName, silenceDb, durationSeconds);
       }
       const { silenceSpans, speechSpans } = silenceMapResult;
+      analysisSpeechSpans = speechSpans;
       const speechStats = computeSpeechMapStats(speechSpans, silenceSpans, durationSeconds);
       baseAnalysis.speechDutyCyclePct = speechStats.speechDutyCyclePct;
       baseAnalysis.speechSegmentCount = speechStats.speechSegmentCount;
@@ -3300,7 +3223,7 @@ const summarizeFailureReason = (error: unknown) => {
       const useDistributedCoverage =
         durationSeconds >= DISTRIBUTED_ANALYSIS_THRESHOLD_SECONDS || speechStats.longSparseModeEligible;
       if (!useDistributedCoverage) {
-        return { analysis: baseAnalysis, ffmpeg };
+        return { analysis: baseAnalysis, ffmpeg, speechSpans: analysisSpeechSpans };
       }
 
       const distributedWindowSec = speechStats.longSparseModeEligible
@@ -3378,6 +3301,7 @@ const summarizeFailureReason = (error: unknown) => {
         return {
           analysis: aggregateWindowAnalyses(baseAnalysis, windowAnalyses, speechStats),
           ffmpeg,
+          speechSpans: analysisSpeechSpans,
         };
       }
     } catch (error) {
@@ -3386,7 +3310,7 @@ const summarizeFailureReason = (error: unknown) => {
       );
     }
 
-    return { analysis: baseAnalysis, ffmpeg };
+    return { analysis: baseAnalysis, ffmpeg, speechSpans: analysisSpeechSpans };
   };
 
   const analyzeRenderedPcmWindows = async (
@@ -5854,6 +5778,7 @@ const summarizeFailureReason = (error: unknown) => {
       string,
       PlannerDeliverySafetyEvidence | null
     >,
+    speechSpansByBase: ReadonlyMap<string, readonly SpeechSpan[]>,
   ) => {
     type AlignmentTarget = { entry: OutputEntry; index: number; groupId: string };
 
@@ -5946,11 +5871,16 @@ const summarizeFailureReason = (error: unknown) => {
           groupedTargets.set(target.groupId, group);
 
           const inputName = `batch_align_${target.index}_measure.wav`;
+          const speechSpans =
+            target.entry.partIndex === undefined && target.entry.sourceBase
+              ? speechSpansByBase.get(target.entry.sourceBase)
+              : undefined;
           try {
             const speechLevelDb = await measureBatchSpeechLevelDbFromBlob(
               activeFfmpeg,
               target.entry.blob,
               inputName,
+              speechSpans,
             );
             speechLevelByIndex.set(target.index, speechLevelDb);
             if (speechLevelDb !== null && Number.isFinite(speechLevelDb)) {
@@ -5990,6 +5920,10 @@ const summarizeFailureReason = (error: unknown) => {
 
           let authorizedGroupCount = 0;
           for (const target of groupTargets) {
+            const speechSpans =
+              target.entry.partIndex === undefined && target.entry.sourceBase
+                ? speechSpansByBase.get(target.entry.sourceBase)
+                : undefined;
             const requestedOffsetDb = plan.offsetDb;
             const authorizedOffsetDb =
               requestedOffsetDb > 0
@@ -6056,7 +5990,11 @@ const summarizeFailureReason = (error: unknown) => {
                   )}s`,
                 );
               }
-              const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(activeFfmpeg, outputName);
+              const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(
+                activeFfmpeg,
+                outputName,
+                speechSpans,
+              );
               const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName);
               if (alignedLoudness.inputTP !== null && alignedLoudness.inputTP > -1.5) {
                 throw new Error(`true peak ${alignedLoudness.inputTP.toFixed(2)} dBTP exceeds -1.5 dBTP gate`);
@@ -6778,10 +6716,11 @@ const summarizeFailureReason = (error: unknown) => {
   const measureBatchSpeechLevelDbFromVirtualWav = async (
     ffmpeg: FFmpeg,
     targetName: string,
+    speechSpans: readonly SpeechSpan[] = [],
   ) => {
     const durationSec = await probeInputDurationSeconds(ffmpeg, targetName);
     if (durationSec === null || !Number.isFinite(durationSec) || durationSec <= 0) return null;
-    const windows = planDistributedSpeechEvidenceWindows(durationSec);
+    const windows = planDistributedSpeechEvidenceWindows(durationSec, speechSpans);
     const speechLevelsDb: number[] = [];
     for (const window of windows) {
       try {
@@ -6801,6 +6740,12 @@ const summarizeFailureReason = (error: unknown) => {
         );
       }
     }
+    if (!hasSufficientBatchSpeechEvidence(windows, speechLevelsDb.length, durationSec)) {
+      appendLog(
+        `[BatchAlign] ${targetName}: only ${speechLevelsDb.length}/${windows.length} usable speech window(s); alignment skipped.`,
+      );
+      return null;
+    }
     return percentile(speechLevelsDb, 50);
   };
 
@@ -6808,9 +6753,10 @@ const summarizeFailureReason = (error: unknown) => {
     ffmpeg: FFmpeg,
     blob: Blob,
     targetName: string,
+    speechSpans: readonly SpeechSpan[] = [],
   ) => {
     const info = await inspectMonoFloat32WavBlob(blob);
-    const windows = planDistributedSpeechEvidenceWindows(info.durationSec);
+    const windows = planDistributedSpeechEvidenceWindows(info.durationSec, speechSpans);
     const speechLevelsDb: number[] = [];
     for (let index = 0; index < windows.length; index += 1) {
       const window = windows[index];
@@ -6835,6 +6781,12 @@ const summarizeFailureReason = (error: unknown) => {
       } finally {
         await safeDeleteFile(ffmpeg, windowName);
       }
+    }
+    if (!hasSufficientBatchSpeechEvidence(windows, speechLevelsDb.length, info.durationSec)) {
+      appendLog(
+        `[BatchAlign] ${targetName}: only ${speechLevelsDb.length}/${windows.length} usable speech window(s); alignment skipped.`,
+      );
+      return null;
     }
     return percentile(speechLevelsDb, 50);
   };
@@ -7872,6 +7824,7 @@ const summarizeFailureReason = (error: unknown) => {
         string,
         PlannerDeliverySafetyEvidence | null
       >();
+      const speechSpansByBase = new Map<string, SpeechSpan[]>();
       let batchReference: BatchReference | null = null;
       const needsAnalysis = true;
 
@@ -7910,6 +7863,9 @@ const summarizeFailureReason = (error: unknown) => {
             ffmpeg = analysisResult.ffmpeg;
             const analysis = analysisResult.analysis;
             analysisByBase.set(job.base, analysis);
+            if (analysisResult.speechSpans.length > 0) {
+              speechSpansByBase.set(job.base, [...analysisResult.speechSpans]);
+            }
             analyses.push(analysis);
             if (analysis.coldOpenDipDb !== null) {
               appendLog(
@@ -8123,6 +8079,9 @@ const summarizeFailureReason = (error: unknown) => {
           try {
             speechRenderPlan = await buildSpeechRenderPlan(ffmpeg, job.inputName, profile);
             if (speechRenderPlan) {
+              if (!speechSpansByBase.has(job.base)) {
+                speechSpansByBase.set(job.base, speechRenderPlan.speechSpans);
+              }
               appendLog(
                 `[SegmentPlan] ${job.base}: ${speechRenderPlan.mode} ready with ${
                   speechRenderPlan.speechSpans.length
@@ -9578,6 +9537,7 @@ const summarizeFailureReason = (error: unknown) => {
             ffmpeg,
             finalOutputEntries,
             sourceSafetyEvidenceByBase,
+            speechSpansByBase,
           );
         } catch (error) {
           hadErrors = true;

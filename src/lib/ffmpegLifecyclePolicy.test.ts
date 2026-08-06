@@ -2,11 +2,22 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  normalizeFfmpegProgressRatio,
   runFfmpegOperationWithOneResetRetry,
   shouldPublishGenericFfmpegProgress,
   shouldRecycleFfmpegBeforeOperation,
   shouldRetryFfmpegOperationAfterReset,
 } from "./ffmpegLifecyclePolicy.ts";
+
+test("generic FFmpeg progress rejects non-finite values and clamps untrusted ratios", () => {
+  assert.equal(normalizeFfmpegProgressRatio(0.42), 0.42);
+  assert.equal(normalizeFfmpegProgressRatio(1.4), 1);
+  assert.equal(normalizeFfmpegProgressRatio(7_686_015_263.79), 1);
+  assert.equal(normalizeFfmpegProgressRatio(0), null);
+  assert.equal(normalizeFfmpegProgressRatio(-0.1), null);
+  assert.equal(normalizeFfmpegProgressRatio(Number.NaN), null);
+  assert.equal(normalizeFfmpegProgressRatio(Number.POSITIVE_INFINITY), null);
+});
 
 test("generic FFmpeg progress only updates an active file queue item", () => {
   assert.equal(shouldPublishGenericFfmpegProgress("episode-01"), true);

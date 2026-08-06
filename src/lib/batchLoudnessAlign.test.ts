@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  hasSufficientBatchSpeechEvidence,
   planBatchSpeechAlignment,
   planDistributedSpeechEvidenceWindows,
 } from "./batchLoudnessAlign.ts";
@@ -108,4 +109,84 @@ test("batch speech evidence window planning fails soft on invalid durations", ()
   assert.deepEqual(planDistributedSpeechEvidenceWindows(Number.NaN), []);
   assert.deepEqual(planDistributedSpeechEvidenceWindows(0), []);
   assert.deepEqual(planDistributedSpeechEvidenceWindows(-1), []);
+});
+
+test("batch speech evidence follows distributed speech instead of a blind time grid", () => {
+  const durationSec = 900;
+  const speechSpans = [
+    { startSec: 36, endSec: 52 },
+    { startSec: 176, endSec: 194 },
+    { startSec: 326, endSec: 342 },
+    { startSec: 476, endSec: 494 },
+    { startSec: 626, endSec: 642 },
+    { startSec: 776, endSec: 794 },
+  ];
+
+  const windows = planDistributedSpeechEvidenceWindows(durationSec, speechSpans);
+  const overlapSeconds = (
+    window: { startSec: number; durationSec: number },
+    span: { startSec: number; endSec: number },
+  ) => Math.max(
+    0,
+    Math.min(window.startSec + window.durationSec, span.endSec) - Math.max(window.startSec, span.startSec),
+  );
+
+  assert.ok(windows.length >= 4, "distributed long-form evidence needs at least four speech-bearing samples");
+  assert.ok(windows.every((window) => window.durationSec === 30), "speech-aware evidence should prefer 30 s windows");
+  assert.ok(
+    windows.every((window) => speechSpans.some((span) => overlapSeconds(window, span) >= 8)),
+    "every selected window should contain substantial known speech",
+  );
+  assert.ok(
+    windows.reduce((total, window) => total + window.durationSec, 0) <= 360,
+    "occupancy-ranked evidence must retain the six-minute decode ceiling",
+  );
+});
+
+test("batch alignment requires four usable samples unless one window covers the full file", () => {
+  assert.equal(
+    hasSufficientBatchSpeechEvidence([{ startSec: 0, durationSec: 120 }], 1, 120),
+    true,
+  );
+  assert.equal(
+    hasSufficientBatchSpeechEvidence(
+      [
+        { startSec: 0, durationSec: 30 },
+        { startSec: 120, durationSec: 30 },
+        { startSec: 240, durationSec: 30 },
+        { startSec: 360, durationSec: 30 },
+      ],
+      3,
+      600,
+    ),
+    false,
+  );
+  assert.equal(
+    hasSufficientBatchSpeechEvidence(
+      [
+        { startSec: 0, durationSec: 30 },
+        { startSec: 120, durationSec: 30 },
+        { startSec: 240, durationSec: 30 },
+        { startSec: 360, durationSec: 30 },
+      ],
+      4,
+      600,
+    ),
+    true,
+  );
+});
+
+test("speech-aware evidence keeps the six-minute decode ceiling on dense very long speech", () => {
+  const durationSec = 3_600;
+  const windows = planDistributedSpeechEvidenceWindows(
+    durationSec,
+    [{ startSec: 0, endSec: durationSec }],
+  );
+
+  assert.equal(windows.length, 12);
+  assert.ok(windows.every((window) => window.durationSec === 30));
+  assert.equal(
+    windows.reduce((total, window) => total + window.durationSec, 0),
+    360,
+  );
 });

@@ -3,6 +3,11 @@ export const shouldPublishGenericFfmpegProgress = (
 ): activeQueueBase is string =>
   Boolean(activeQueueBase?.trim());
 
+export const normalizeFfmpegProgressRatio = (progress: number) => {
+  if (!Number.isFinite(progress) || progress <= 0) return null;
+  return Math.min(1, progress);
+};
+
 export const shouldRecycleFfmpegBeforeOperation = (
   cumulativeAudioSec: number,
   thresholdSeconds: number,

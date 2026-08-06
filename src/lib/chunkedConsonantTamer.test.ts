@@ -399,6 +399,7 @@ const encodeFfmpegExtensibleFloat32Wav = (
 class TrackingBlob extends Blob {
   readonly readSizes: number[];
   directArrayBufferCalls = 0;
+  failSliceReads = false;
 
   constructor(parts: BlobPart[], options?: BlobPropertyBag, readSizes: number[] = []) {
     super(parts, options);
@@ -417,6 +418,9 @@ class TrackingBlob extends Blob {
     Object.defineProperty(nativeSlice, "arrayBuffer", {
       configurable: true,
       value: async () => {
+        if (this.failSliceReads) {
+          throw new Error("poisoned source slice read");
+        }
         readSizes.push(nativeSlice.size);
         return originalArrayBuffer();
       },
@@ -976,6 +980,41 @@ describe("chunked mono float WAV consonant tamer", () => {
       Math.max(...input.readSizes) <= maximumPaddedRead,
       `largest read should fit one padded core (${maximumPaddedRead} bytes)`,
     );
+  });
+
+  it("materializes changed output bytes instead of retaining source Blob slices", async () => {
+    const sampleRate = 48_000;
+    const durationSec = 3;
+    const sourceSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec,
+      bodyRmsDb: -24,
+      consonantPeakDb: -10,
+      consonantCentersSec: [0.45, 1.45, 2.45],
+    });
+    const renderedSamples = synthesizeVoicedFricativeTake({
+      sampleRate,
+      durationSec,
+      bodyRmsDb: -24,
+      consonantPeakDb: -4,
+      consonantCentersSec: [0.45, 1.45, 2.45],
+    });
+    const reference = buildRenderedConsonantReference(sourceSamples, sampleRate);
+    assert.ok(reference);
+    const encoded = encodeWavFloat32(renderedSamples, sampleRate, 1);
+    const input = new TrackingBlob([bytesAsBlobPart(encoded)], { type: "audio/wav" });
+
+    const result = await tameCanonicalMonoFloat32WavBlobInChunks(input, reference, {
+      coreChunkDurationSec: 0.75,
+      contextDurationMs: 500,
+    });
+
+    assert.notEqual(result.blob, input);
+    assert.ok(result.stats.changedSampleCount > 0);
+    input.failSliceReads = true;
+    const output = decodeWav(await result.blob.arrayBuffer());
+    assert.equal(output.sampleRate, sampleRate);
+    assert.equal(output.samples.length, renderedSamples.length);
   });
 
   it("fails open when a lower-rate compact reference cannot represent a native above-Nyquist event", async () => {
