@@ -472,6 +472,12 @@
 
 ## Review Evidence
 
-- Full audio-QC suite: 549 tests, 548 pass, 1 intentional skip, 0 failures.
-- TypeScript, production build, dependency audit, and local X-profile UI smoke passed.
+- Delivery crest authority now uses a robust speech-frame P95 peak instead of a global maximum; click, non-speech impulse, duration-duplication, level-invariance, plateau-blend, and scene-blend regressions pass. A 27-source calibration run measured crest prominence P10/P25/P50/P75/P90/P95 at 16.16/18.36/19.39/21.15/22.29/23.64 dB, supporting the continuous 21-25 dB authority ramp.
+- Post-run bed acceleration observes the full 240 ms fast-release region and requires complete body plus fricative veto evidence. Missing either lane fails safe to the slower release, while scream, yell, onomatopoeia, consonant, and room/tail contracts remain green.
+- Batch evidence uses continuous duration weighting and disables plateau blending for mixed explicit/legacy duration groups. Source observability shares an exact 96 MiB sample/duration bound and reuses one prepared source session for candidate and post-polish comparisons.
+- Added advisory-only gain-motion, limiter-pressure, and shared blind audition evidence. None can alter rendering, ranking, rejection, or output bytes; limiter reporting deliberately makes no unavailable gain-reduction claim.
+- Dependency verification resolves `nanoid@3.3.18`, `postcss@8.5.26`, `js-yaml@4.3.1`, and `sharp@0.35.3`; the production dependency audit reports zero vulnerabilities.
+- Final local checks: full audio-QC `548` pass with `1` intentional optional skip, TypeScript pass, lint pass with only two warnings in excluded user-owned diagnostics, production build pass with the existing Audio Splitter NFT trace warning, and clean scoped diff check apart from Windows line-ending notices.
+- Exact X-profile browser QA at `http://localhost:3000` confirmed title `Shorts Projektt | Voiceover Experiment`, visible Experiment identity, simplified Voiceover and Splitter copy, a clean desktop layout, and zero error console entries.
+- Audible-quality status remains conditional until an exact current delivered WAV is completed through the browser path and level-matched auditioned; code metrics and synthetic tests are not presented as listening proof.
 - Kimi K3 consultation was requested, but the plugin failed inside its CLI/model lookup before returning advice.
