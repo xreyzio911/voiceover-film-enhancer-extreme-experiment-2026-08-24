@@ -468,7 +468,7 @@
 - [x] Set browser metadata to include `Experiment` and add a focused contract that prevents the production-style title from returning.
 - [x] Run focused RED/GREEN tests, the full audio-QC suite, TypeScript, lint, production build, dependency audit, diff check, and independent correctness/audio/security review.
 - [x] Verify the local UI and browser title in the X Chrome profile with no console errors.
-- [ ] Commit only the explicit release allowlist, push `main`, deploy the exact commit to the specified Vercel project, and verify the READY production deployment and visible Experiment identity in the X profile.
+- [x] Commit only the explicit release allowlist, push `main`, deploy the exact commit to the specified Vercel project, and verify the READY production deployment and visible Experiment identity in the X profile.
 
 ## Review Evidence
 
@@ -479,5 +479,6 @@
 - Dependency verification resolves `nanoid@3.3.18`, `postcss@8.5.26`, `js-yaml@4.3.1`, and `sharp@0.35.3`; the production dependency audit reports zero vulnerabilities.
 - Final local checks: full audio-QC `548` pass with `1` intentional optional skip, TypeScript pass, lint pass with only two warnings in excluded user-owned diagnostics, production build pass with the existing Audio Splitter NFT trace warning, and clean scoped diff check apart from Windows line-ending notices.
 - Exact X-profile browser QA at `http://localhost:3000` confirmed title `Shorts Projektt | Voiceover Experiment`, visible Experiment identity, simplified Voiceover and Splitter copy, a clean desktop layout, and zero error console entries.
+- GitHub `main` reached code-bearing commit `e7c8a298a5139056005271371d093434826869c7`. Vercel production deployment `dpl_CQySug3NYzVWTqhNZYsMhKx6acKP` was `READY`, `Current`, and attached to `https://voiceover-film-enhancer-experiment.vercel.app/`; the X-profile production smoke returned the signed-in Experiment workspace and the deployment-filtered runtime log showed the primary-domain request at HTTP 200 with zero warning, error, or fatal entries.
 - Audible-quality status remains conditional until an exact current delivered WAV is completed through the browser path and level-matched auditioned; code metrics and synthetic tests are not presented as listening proof.
 - Kimi K3 consultation was requested, but the plugin failed inside its CLI/model lookup before returning advice.
