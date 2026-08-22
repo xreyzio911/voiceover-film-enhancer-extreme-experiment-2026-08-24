@@ -37,6 +37,8 @@ type ReviewAuditionPanelProps = Readonly<{
   challengerUrl: string | null;
 }>;
 
+const AUDITION_SYNC_TOLERANCE_SECONDS = 0.08;
+
 const formatTime = (seconds: number) => {
   const safeSeconds = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
   const minutes = Math.floor(safeSeconds / 60);
@@ -66,7 +68,7 @@ export default function ReviewAuditionPanel({
   const [isPlaying, setIsPlaying] = useState(false);
   const [sourceTimeSec, setSourceTimeSec] = useState(0);
   const [labelsRevealed, setLabelsRevealed] = useState(false);
-  const [levelMatchEnabled, setLevelMatchEnabled] = useState(false);
+  const [levelMatchEnabled, setLevelMatchEnabled] = useState(true);
   const [playbackIssue, setPlaybackIssue] = useState<string | null>(null);
 
   const winner = manifest.candidates.find((candidate) => candidate.role === "winner") ?? null;
@@ -174,6 +176,27 @@ export default function ReviewAuditionPanel({
     },
     [getAudio, sourceDurationSec, tracks],
   );
+
+  const synchronizeToSourceClock = useCallback(() => {
+    const currentSourceTime = sourceAudioRef.current?.currentTime;
+    if (typeof currentSourceTime !== "number" || !Number.isFinite(currentSourceTime)) {
+      return;
+    }
+    setSourceTimeSec(currentSourceTime);
+    for (const track of tracks) {
+      if (track.id === "source") continue;
+      const audio = getAudio(track.id);
+      if (!audio) continue;
+      const targetTime = resolveAuditionTrackTime(
+        currentSourceTime,
+        track.alignmentOffsetSec,
+        track.durationSec,
+      );
+      if (Math.abs(audio.currentTime - targetTime) > AUDITION_SYNC_TOLERANCE_SECONDS) {
+        audio.currentTime = targetTime;
+      }
+    }
+  }, [getAudio, tracks]);
 
   useEffect(() => {
     for (const track of tracks) {
@@ -349,7 +372,7 @@ export default function ReviewAuditionPanel({
         preload="auto"
         src={sourceUrl}
         className={styles.hiddenAudio}
-        onTimeUpdate={() => setSourceTimeSec(sourceAudioRef.current?.currentTime ?? 0)}
+        onTimeUpdate={synchronizeToSourceClock}
         onEnded={() => {
           pauseAll();
           setIsPlaying(false);

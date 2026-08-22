@@ -260,7 +260,9 @@ test("QC review audition is shared, blind by default, and level matched without 
   assert.match(lab, /<ReviewAuditionPanel/);
   assert.doesNotMatch(lab, /<audio[\s\S]{0,180}?\bcontrols\b/);
   assert.match(audition, /labelsRevealed[^\n]*useState\(false\)/);
-  assert.match(audition, /levelMatchEnabled[^\n]*useState\(false\)/);
+  assert.match(audition, /levelMatchEnabled[^\n]*useState\(true\)/);
+  assert.match(audition, /AUDITION_SYNC_TOLERANCE_SECONDS/);
+  assert.match(audition, /Math\.abs\(audio\.currentTime - targetTime\)/);
   assert.match(audition, /speechKWeightedEnergyDb/);
   assert.match(audition, /estimatedOffsetSec/);
   assert.match(audition, /resolveAuditionBookmarks/);
