@@ -9,6 +9,7 @@ import {
   computeSpeechBodyFrameDb,
   emitSendcmdScript,
   limitEmbeddedPerformancePositiveGainAuthority,
+  measureGainMotionStage,
   planGainCurve,
   RENDERED_CONSONANT_SOURCE_FRAME_MS,
   recoverRecurrentBodySpeechValleys,
@@ -28,6 +29,73 @@ const FRAME_SAMPLES = (SAMPLE_RATE * FRAME_MS) / 1000;
 
 const dbToLin = (db: number) => Math.pow(10, db / 20);
 const gainDbAtFrame = (curve: Float32Array, frame: number) => 20 * Math.log10(curve[frame] + 1e-9);
+
+describe("realized gain-motion telemetry", () => {
+  it("reports in-domain first differences without counting class boundaries", () => {
+    const stage = measureGainMotionStage(
+      "painted",
+      new Float32Array([0, 0, 0.1, 0.3, 0.7, 1.5, 1.5, 0.5, 0.5, 0.5]),
+      [
+        { startFrame: 1, endFrame: 6, runClass: "body-speech" },
+        { startFrame: 6, endFrame: 10, runClass: "transient-breath" },
+      ],
+      10,
+    );
+
+    assert.equal(stage.frameMs, 10);
+    assert.equal(stage.bodySpeech?.transitionCount, 4);
+    assert.ok(Math.abs((stage.bodySpeech?.maxDbPerFrame ?? 0) - 0.8) < 1e-6);
+    assert.equal(stage.transient?.transitionCount, 3);
+    assert.ok(Math.abs((stage.transient?.maxDbPerFrame ?? 0) - 1) < 1e-6);
+    assert.equal(stage.silence, null);
+  });
+
+  it("reports within-silence motion without counting speech boundaries", () => {
+    const stage = measureGainMotionStage(
+      "final-post-dip",
+      new Float32Array([0, 0.2, 0.5, 2, 3, 3.5, 1, 1.4]),
+      [{ startFrame: 2, endFrame: 5, runClass: "body-speech" }],
+      10,
+    );
+
+    assert.equal(stage.bodySpeech?.transitionCount, 2);
+    assert.ok(Math.abs((stage.bodySpeech?.maxDbPerFrame ?? 0) - 1.5) < 1e-6);
+    assert.equal(stage.silence?.transitionCount, 3);
+    assert.ok(Math.abs((stage.silence?.maxDbPerFrame ?? 0) - 2.5) < 1e-6);
+  });
+
+  it("attaches advisory per-stage motion evidence to the final plan", () => {
+    const frameDb = new Array<number>(80).fill(-80);
+    for (let frame = 10; frame < 70; frame += 1) {
+      frameDb[frame] = frame < 40 ? -34 : -24;
+    }
+    const plan = planGainCurve({
+      frameDb,
+      speechBodyFrameDb: [...frameDb],
+      speechRuns: [{ startFrame: 10, endFrame: 70 }],
+      noiseFloorDb: -80,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: 10,
+    });
+
+    assert.equal(plan.gainMotion.advisoryOnly, true);
+    assert.deepEqual(
+      plan.gainMotion.stages.map((stage) => stage.stage),
+      [
+        "painted",
+        "valley-relaxed",
+        "embedded-limited",
+        "trend-balanced",
+        "recurrent-supported",
+        "word-scale-supported",
+        "word-scale-slewed",
+        "final-post-dip",
+      ],
+    );
+    assert.ok(plan.gainMotion.stages.at(-1)?.bodySpeech);
+  });
+});
 
 const synthesizeTake = (
   spans: Array<{ startSec: number; endSec: number; rmsDb: number }>,
@@ -4130,6 +4198,349 @@ describe("ramp placement", () => {
     );
   });
 
+  it("shortens only an audible high-gain post-run bed release while preserving the speech body", () => {
+    const buildPlan = (bedDb: number) => {
+      const frameDb = new Array<number>(240).fill(bedDb);
+      const speechBodyFrameDb = new Array<number>(240).fill(-90);
+      const fricativeFrameDb = new Array<number>(240).fill(-90);
+      for (let frame = 50; frame < 150; frame += 1) frameDb[frame] = -40;
+      return planGainCurve({
+        frameDb,
+        speechRuns: [{ startFrame: 50, endFrame: 150 }],
+        noiseFloorDb: bedDb,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.2,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.2,
+        speechBodyFrameDb,
+        fricativeFrameDb,
+        fricativeNoiseFloorDb: -90,
+      });
+    };
+
+    const audibleBedPlan = buildPlan(-72);
+    const inaudibleBedPlan = buildPlan(-84);
+    const audibleSpeechGainDb = gainDbAtFrame(audibleBedPlan.gainCurve, 100);
+    const inaudibleSpeechGainDb = gainDbAtFrame(inaudibleBedPlan.gainCurve, 100);
+    const audibleBedGainAfter300MsDb = gainDbAtFrame(audibleBedPlan.gainCurve, 180);
+    const inaudibleBedGainAfter300MsDb = gainDbAtFrame(inaudibleBedPlan.gainCurve, 180);
+
+    assert.equal(audibleBedPlan.bedReleaseAdaptedRunCount, 1);
+    assert.equal(inaudibleBedPlan.bedReleaseAdaptedRunCount, 0);
+    assert.ok(audibleBedPlan.bedReleaseMaxAccelerationMs >= 200);
+    assert.ok(
+      Math.abs(audibleSpeechGainDb - inaudibleSpeechGainDb) < 0.05,
+      `bed evidence must not change the speech body: ${audibleSpeechGainDb.toFixed(2)} vs ${inaudibleSpeechGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      audibleBedGainAfter300MsDb <= 0.5,
+      `an audible lifted bed should be back near its shallow trim after 300 ms, got ${audibleBedGainAfter300MsDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      inaudibleBedGainAfter300MsDb > audibleBedGainAfter300MsDb + 3,
+      `an already-inaudible bed should keep the existing consonant-safe release (${inaudibleBedGainAfter300MsDb.toFixed(2)} vs ${audibleBedGainAfter300MsDb.toFixed(2)} dB)`,
+    );
+  });
+
+  it("does not shorten audible-bed release when speech-like veto evidence is absent", () => {
+    const frameDb = new Array<number>(240).fill(-72);
+    for (let frame = 50; frame < 150; frame += 1) frameDb[frame] = -40;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 50, endFrame: 150 }],
+      noiseFloorDb: -72,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.2,
+    });
+
+    assert.equal(
+      plan.bedReleaseAdaptedRunCount,
+      0,
+      "missing optional speech-body/fricative evidence must fail open to the consonant-safe release",
+    );
+    assert.ok(
+      gainDbAtFrame(plan.gainCurve, 180) > 3,
+      `missing veto evidence should preserve trailing material, got ${gainDbAtFrame(plan.gainCurve, 180).toFixed(2)} dB`,
+    );
+  });
+
+  it("requires both tail-veto evidence lanes before adapting a post-run release", () => {
+    const buildPlan = (includeBody: boolean, includeFricative: boolean) => {
+      const frameDb = new Array<number>(240).fill(-72);
+      const speechBodyFrameDb = new Array<number>(240).fill(-90);
+      const fricativeFrameDb = new Array<number>(240).fill(-90);
+      for (let frame = 50; frame < 150; frame += 1) frameDb[frame] = -40;
+      return planGainCurve({
+        frameDb,
+        speechRuns: [{ startFrame: 50, endFrame: 150 }],
+        noiseFloorDb: -72,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.2,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.2,
+        speechBodyFrameDb: includeBody ? speechBodyFrameDb : undefined,
+        fricativeFrameDb: includeFricative ? fricativeFrameDb : undefined,
+        fricativeNoiseFloorDb: includeFricative ? -90 : undefined,
+      });
+    };
+
+    for (const plan of [buildPlan(true, false), buildPlan(false, true)]) {
+      assert.equal(
+        plan.bedReleaseAdaptedRunCount,
+        0,
+        "partial tail-veto evidence must preserve the consonant-safe release",
+      );
+      assert.ok(
+        gainDbAtFrame(plan.gainCurve, 180) > 3,
+        "one missing veto lane must not authorize a faster release",
+      );
+    }
+  });
+
+  it("starts audible-bed release adaptation only after a rescued soft tail", () => {
+    const frameDb = new Array<number>(300).fill(-72);
+    const speechBodyFrameDb = new Array<number>(300).fill(-90);
+    const fricativeFrameDb = new Array<number>(300).fill(-90);
+    for (let frame = 50; frame < 150; frame += 1) frameDb[frame] = -40;
+    for (let frame = 150; frame < 175; frame += 1) frameDb[frame] = -57;
+    for (let frame = 175; frame < frameDb.length; frame += 1) frameDb[frame] = -66;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 50, endFrame: 150 }],
+      noiseFloorDb: -72,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.2,
+      speechBodyFrameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -90,
+    });
+
+    const bodyGainDb = gainDbAtFrame(plan.gainCurve, 100);
+    const lastRescuedTailGainDb = gainDbAtFrame(plan.gainCurve, 174);
+    const bedGainAfter300MsDb = gainDbAtFrame(plan.gainCurve, 205);
+
+    assert.equal(plan.tailRescueRunCount, 1);
+    assert.ok(plan.tailRescueFrameCount >= 25);
+    assert.equal(plan.bedReleaseAdaptedRunCount, 1);
+    assert.ok(
+      bodyGainDb - lastRescuedTailGainDb < 1,
+      `bed adaptation must not repaint the rescued tail (${bodyGainDb.toFixed(2)} vs ${lastRescuedTailGainDb.toFixed(2)} dB)`,
+    );
+    assert.ok(
+      bedGainAfter300MsDb <= 0.5,
+      `the release may accelerate only after the rescued tail, got ${bedGainAfter300MsDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("does not accelerate an audible-bed release when the post-run bed is speech-like tail evidence", () => {
+    const frameDb = new Array<number>(260).fill(-72);
+    const speechBodyFrameDb = new Array<number>(260).fill(-82);
+    const fricativeFrameDb = new Array<number>(260).fill(-82);
+    for (let frame = 50; frame < 150; frame += 1) {
+      frameDb[frame] = -40;
+      speechBodyFrameDb[frame] = -40;
+    }
+    for (let frame = 150; frame < 162; frame += 1) {
+      frameDb[frame] = -69;
+      speechBodyFrameDb[frame] = -48;
+      fricativeFrameDb[frame] = -44;
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 50, endFrame: 150 }],
+      noiseFloorDb: -72,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.7,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.2,
+      speechBodyFrameDb,
+      fricativeFrameDb,
+      fricativeNoiseFloorDb: -82,
+    });
+
+    assert.equal(plan.tailRescueRunCount, 0);
+    assert.equal(
+      plan.bedReleaseAdaptedRunCount,
+      0,
+      "speech-like detector-negative tails must veto audible-bed release acceleration",
+    );
+    assert.ok(
+      gainDbAtFrame(plan.gainCurve, 180) > 3,
+      `the ordinary consonant-safe release should preserve the trailing material, got ${gainDbAtFrame(plan.gainCurve, 180).toFixed(2)} dB`,
+    );
+  });
+
+  it("protects one attached fricative frame when noisy-tail rescue declines", () => {
+    const buildPlan = (attachedFricativeDb: number) => {
+      const frameDb = new Array<number>(260).fill(-72);
+      const speechBodyFrameDb = new Array<number>(260).fill(-82);
+      const fricativeFrameDb = new Array<number>(260).fill(-82);
+      for (let frame = 50; frame < 150; frame += 1) {
+        frameDb[frame] = -40;
+        speechBodyFrameDb[frame] = -40;
+      }
+      frameDb[150] = -69;
+      fricativeFrameDb[150] = attachedFricativeDb;
+      return planGainCurve({
+        frameDb,
+        speechRuns: [{ startFrame: 50, endFrame: 150 }],
+        noiseFloorDb: -72,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.7,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.2,
+        speechBodyFrameDb,
+        fricativeFrameDb,
+        fricativeNoiseFloorDb: -82,
+      });
+    };
+
+    const attachedTail = buildPlan(-44);
+    const ordinaryBed = buildPlan(-82);
+
+    assert.equal(attachedTail.tailRescueRunCount, 0);
+    assert.equal(ordinaryBed.tailRescueRunCount, 0);
+    assert.equal(
+      attachedTail.bedReleaseAdaptedRunCount,
+      0,
+      "one attached consonant frame must retain the ordinary safe release even when rescue declines",
+    );
+    assert.equal(ordinaryBed.bedReleaseAdaptedRunCount, 1);
+    assert.ok(
+      gainDbAtFrame(attachedTail.gainCurve, 180) >
+        gainDbAtFrame(ordinaryBed.gainCurve, 180) + 3,
+      "attached fricative ownership must preserve more trailing gain than detector-negative bed",
+    );
+  });
+
+  it("inspects the full accelerated-release region for delayed speech-like tail evidence", () => {
+    const buildPlan = (delayedBodyDb: number) => {
+      const frameDb = new Array<number>(280).fill(-72);
+      const speechBodyFrameDb = new Array<number>(280).fill(-90);
+      const fricativeFrameDb = new Array<number>(280).fill(-90);
+      for (let frame = 50; frame < 150; frame += 1) {
+        frameDb[frame] = -40;
+        speechBodyFrameDb[frame] = -40;
+      }
+      speechBodyFrameDb[168] = delayedBodyDb;
+      return planGainCurve({
+        frameDb,
+        speechRuns: [{ startFrame: 50, endFrame: 150 }],
+        noiseFloorDb: -72,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.7,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        maxGainDb: 14,
+        instabilityHint: 0.2,
+        speechBodyFrameDb,
+        fricativeFrameDb,
+        fricativeNoiseFloorDb: -90,
+      });
+    };
+
+    const delayedTail = buildPlan(-40);
+    const ordinaryBed = buildPlan(-90);
+
+    assert.ok(
+      delayedTail.bedReleaseMaxAccelerationMs < ordinaryBed.bedReleaseMaxAccelerationMs,
+      `speech evidence 180 ms into the release must reduce acceleration (${delayedTail.bedReleaseMaxAccelerationMs} vs ${ordinaryBed.bedReleaseMaxAccelerationMs} ms)`,
+    );
+    assert.ok(
+      gainDbAtFrame(delayedTail.gainCurve, 180) >
+        gainDbAtFrame(ordinaryBed.gainCurve, 180) + 0.2,
+      "delayed speech-like evidence inside the affected release must retain more trailing gain",
+    );
+  });
+
+  it("does not accelerate an audible-bed release when optional veto envelopes are absent", () => {
+    const frameDb = new Array<number>(260).fill(-72);
+    for (let frame = 50; frame < 150; frame += 1) {
+      frameDb[frame] = -40;
+    }
+    for (let frame = 150; frame < 162; frame += 1) {
+      frameDb[frame] = -69;
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 50, endFrame: 150 }],
+      noiseFloorDb: -72,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.7,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.2,
+    });
+
+    assert.equal(
+      plan.bedReleaseAdaptedRunCount,
+      0,
+      "missing optional speech-body/fricative veto evidence must retain the ordinary safe release",
+    );
+    assert.ok(
+      gainDbAtFrame(plan.gainCurve, 180) > 3,
+      `missing veto evidence must not collapse trailing gain, got ${gainDbAtFrame(plan.gainCurve, 180).toFixed(2)} dB`,
+    );
+  });
+
+  it("does not shorten audible-bed release when optional tail-veto evidence is absent", () => {
+    const frameDb = new Array<number>(260).fill(-72);
+    for (let frame = 50; frame < 150; frame += 1) frameDb[frame] = -40;
+    for (let frame = 150; frame < 162; frame += 1) frameDb[frame] = -69;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 50, endFrame: 150 }],
+      noiseFloorDb: -72,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.7,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      maxGainDb: 14,
+      instabilityHint: 0.2,
+    });
+
+    assert.equal(
+      plan.bedReleaseAdaptedRunCount,
+      0,
+      "missing optional speech-body/fricative evidence must fail open by preserving the ordinary release",
+    );
+    assert.ok(
+      gainDbAtFrame(plan.gainCurve, 180) > 3,
+      `the ordinary release should remain when veto evidence is unavailable, got ${gainDbAtFrame(plan.gainCurve, 180).toFixed(2)} dB`,
+    );
+  });
+
   it("protects soft spoken tails that fall just outside the detected speech run", () => {
     const frameDb = new Array<number>(260).fill(-78);
     for (let frame = 50; frame < 170; frame += 1) frameDb[frame] = -30;
@@ -4529,6 +4940,7 @@ describe("spectrum", () => {
     const highSib = computeSibilanceScore(computeLogBandSpectrumDb(high, sampleRate));
     assert.ok(highSib > lowSib + 0.2, `expected sibilance score to rise with HF content: low=${lowSib.toFixed(2)} high=${highSib.toFixed(2)}`);
   });
+
 });
 
 describe("actor-decay regressions", () => {

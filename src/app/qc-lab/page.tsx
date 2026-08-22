@@ -30,12 +30,12 @@ export default async function QcLabPage() {
             <span className={styles.brandMark} aria-hidden="true">SP</span>
             <div>
               <div className={styles.brandName}>Shorts Projektt</div>
-              <div className={styles.brandContext}>Quality workspace</div>
+              <div className={styles.brandContext}>Local QC</div>
             </div>
           </div>
           <div className={styles.navActions}>
             <span className={styles.localBadge}>{email} / Local only</span>
-            <Link href="/" className={styles.backLink}>Back to production</Link>
+            <Link href="/" className={styles.backLink}>Back to app</Link>
             <SignOutButton className={styles.backLink} />
           </div>
         </header>
@@ -43,7 +43,7 @@ export default async function QcLabPage() {
         <section className={styles.pageIntro} aria-labelledby="qc-lab-title">
           <h1 id="qc-lab-title" className={styles.title}>QC Lab</h1>
           <p className={styles.subtitle}>
-            Inspect source quality, compare review bundles, and document delivery decisions.
+            Check WAV quality and review exported bundles.
           </p>
         </section>
 

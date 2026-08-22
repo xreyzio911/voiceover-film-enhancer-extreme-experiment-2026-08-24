@@ -10,10 +10,10 @@ const getErrorText = (error: string | null) => {
     return "This Google account is not allowed to access this app.";
   }
   if (error === "Configuration") {
-    return "Google login is not configured yet. Please check app environment variables.";
+    return "Google login is not configured.";
   }
   if (error === "SigninRequired") {
-    return "Please sign in with an approved Google account.";
+    return "Sign in with an approved Google account.";
   }
   if (error === "OAuthAccountNotLinked") {
     return "This account is not linked for access.";
@@ -50,13 +50,13 @@ export default function LoginCard() {
         <span className={styles.brandMark} aria-hidden="true">SP</span>
         <div>
           <div className={styles.brand}>Shorts Projektt</div>
-          <div className={styles.brandContext}>Voiceover production</div>
+          <div className={styles.brandContext}>Voiceover experiment</div>
         </div>
       </div>
       <div className={styles.copy}>
-        <h1 className={styles.title}>Sign in to production</h1>
+        <h1 className={styles.title}>Sign in</h1>
         <p className={styles.subtitle}>
-          Continue with an approved Google account to access the internal audio workspace.
+          Use an approved Google account to open the workspace.
         </p>
       </div>
       {errorText && <div className={styles.error} role="alert">{errorText}</div>}
@@ -79,10 +79,10 @@ export default function LoginCard() {
           className={`${styles.buttonLabel} ${styles.buttonLabelPending}`}
           aria-hidden="true"
         >
-          Opening Google sign-in
+          Opening Google
         </span>
       </button>
-      <p className={styles.hint}>Access is restricted to approved accounts.</p>
+      <p className={styles.hint}>Approved accounts only.</p>
     </div>
   );
 }

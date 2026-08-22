@@ -9,15 +9,50 @@ export const BATCH_SPEECH_EVIDENCE_SCALED_MIN_WINDOWS = 13;
 export const BATCH_SPEECH_EVIDENCE_SCALED_MAX_WINDOWS = 24;
 export const BATCH_SPEECH_EVIDENCE_MAX_DECODE_SECONDS = 360;
 export const BATCH_SPEECH_EVIDENCE_MIN_USABLE_WINDOWS = 4;
+export const BATCH_SPEECH_PLATEAU_BLEND_START_SECONDS = 1;
+export const BATCH_SPEECH_PLATEAU_BLEND_FULL_SECONDS = 15;
 
 export type BatchSpeechLevelMeasurement = Readonly<{
   id: string;
   speechLevelDb: number | null;
+  speechPlateauDb?: number | null;
+  /** Direct 0..1 authority for blending the robust body plateau over speech power. */
+  plateauBlendAuthority?: number | null;
+  /** Positive, bounded-confidence vote used only when locating the batch anchor. */
+  anchorVoteWeight?: number | null;
+  /** @deprecated Legacy combined confidence; retained as a fail-open import/caller fallback. */
+  evidenceWeight?: number | null;
+}>;
+
+export type BatchSpeechLevelEvidenceSummary = Readonly<{
+  speechLevelDb: number;
+  speechPlateauDb: number;
+  plateauBlendAuthority: number;
+  anchorVoteWeight: number;
+  speechDurationSec: number;
+  /** @deprecated Alias of anchorVoteWeight for older evidence consumers. */
+  evidenceWeight: number;
+  speechFrameCount: number;
+}>;
+
+export type BatchSpeechWindowEvidence = Readonly<{
+  /** Historical K-weighted speech power for the bounded window. */
+  speechLevelDb: number;
+  /** Median speech-body frame level for the same window, when measurable. */
+  speechBodyPlateauDb: number | null;
+  /** Number of speech-body frames supporting the plateau estimate. */
+  speechFrameCount: number;
+  /** Explicit analysis-frame duration; prevents hidden coupling to a 10 ms caller. */
+  speechFrameMs?: number | null;
+  /** Optional direct duration for evidence producers that do not retain frame geometry. */
+  speechDurationSec?: number | null;
 }>;
 
 export type BatchSpeechAlignmentPlan = Readonly<{
   id: string;
   speechLevelDb: number | null;
+  /** Exact evidence lane used to compute this plan's offset. */
+  alignmentLevelDb: number | null;
   offsetDb: number;
   shouldAlign: boolean;
 }>;
@@ -38,11 +73,311 @@ export type RankedSpeechEvidenceWindow = SpeechEvidenceWindow & Readonly<{
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
+const smoothUnitRamp = (value: number, start: number, full: number) => {
+  const normalized = clamp((value - start) / Math.max(full - start, Number.EPSILON), 0, 1);
+  return normalized * normalized * (3 - 2 * normalized);
+};
+
 const median = (values: readonly number[]) => {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+};
+
+const percentileOfSorted = (values: readonly number[], fraction: number) => {
+  if (values.length === 0) return null;
+  const position = clamp(fraction, 0, 1) * (values.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (values[lower] === values[upper]) return values[lower];
+  const mix = position - lower;
+  return values[lower] * (1 - mix) + values[upper] * mix;
+};
+
+const finiteNumber = (value: number | null | undefined): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+export const resolveBatchSpeechAlignmentLevelDb = (
+  measurement: Readonly<{
+    speechLevelDb: number | null;
+    speechPlateauDb?: number | null;
+    plateauBlendAuthority?: number | null;
+    anchorVoteWeight?: number | null;
+    evidenceWeight?: number | null;
+  }>,
+) =>
+  finiteNumber(measurement.speechPlateauDb) && finiteNumber(measurement.speechLevelDb)
+    ? measurement.speechLevelDb +
+      (finiteNumber(measurement.plateauBlendAuthority)
+        ? clamp(measurement.plateauBlendAuthority, 0, 1)
+        : smoothUnitRamp(measurement.evidenceWeight ?? 1, 0.5, 1)) *
+        (measurement.speechPlateauDb - measurement.speechLevelDb)
+    : finiteNumber(measurement.speechPlateauDb)
+      ? measurement.speechPlateauDb
+      : measurement.speechLevelDb;
+
+/**
+ * Interpolate through normalized weighted-CDF midpoints. Unlike a stepwise
+ * weighted median, a tiny vote change produces a tiny anchor change rather
+ * than selecting one file's level wholesale.
+ */
+const interpolatedWeightedQuantile = (
+  entries: readonly Readonly<{ value: number; weight: number }>[],
+  fraction = 0.5,
+) => {
+  const finiteEntries = entries.filter(
+    (entry) => finiteNumber(entry.value) && finiteNumber(entry.weight) && entry.weight > 0,
+  );
+  if (finiteEntries.length === 0) {
+    return median(
+      entries
+        .map((entry) => entry.value)
+        .filter((value): value is number => finiteNumber(value)),
+    );
+  }
+  const ordered = [...finiteEntries].sort((left, right) => left.value - right.value);
+  if (ordered.length === 1) return ordered[0].value;
+  const totalWeight = ordered.reduce((sum, entry) => sum + entry.weight, 0);
+  if (!(totalWeight > 0)) return median(ordered.map((entry) => entry.value));
+  const target = clamp(fraction, 0, 1);
+  let cumulativeWeight = 0;
+  const positioned = ordered.map((entry) => {
+    const position = (cumulativeWeight + entry.weight / 2) / totalWeight;
+    cumulativeWeight += entry.weight;
+    return { value: entry.value, position };
+  });
+  if (target <= positioned[0].position) return positioned[0].value;
+  for (let index = 1; index < positioned.length; index += 1) {
+    const upper = positioned[index];
+    if (target > upper.position) continue;
+    const lower = positioned[index - 1];
+    if (lower.value === upper.value) return lower.value;
+    const mix = clamp(
+      (target - lower.position) /
+        Math.max(upper.position - lower.position, Number.EPSILON),
+      0,
+      1,
+    );
+    return lower.value * (1 - mix) + upper.value * mix;
+  }
+  return positioned.at(-1)?.value ?? null;
+};
+
+const resolveWindowSpeechDurationSec = (window: BatchSpeechWindowEvidence) => {
+  if (finiteNumber(window.speechDurationSec) && window.speechDurationSec > 0) {
+    return window.speechDurationSec;
+  }
+  if (
+    finiteNumber(window.speechFrameCount) &&
+    window.speechFrameCount > 0 &&
+    finiteNumber(window.speechFrameMs) &&
+    window.speechFrameMs > 0
+  ) {
+    return (window.speechFrameCount * window.speechFrameMs) / 1000;
+  }
+  return null;
+};
+
+const resolvePlateauBlendAuthority = (
+  speechDurationSec: number,
+  fallbackEvidenceWeight: number,
+) => speechDurationSec > 0
+  ? smoothUnitRamp(
+      speechDurationSec,
+      BATCH_SPEECH_PLATEAU_BLEND_START_SECONDS,
+      BATCH_SPEECH_PLATEAU_BLEND_FULL_SECONDS,
+    )
+  : smoothUnitRamp(fallbackEvidenceWeight, 0.5, 1);
+
+const resolveAnchorVoteWeightFromDuration = (
+  speechDurationSec: number,
+  fallbackEvidenceWeight: number,
+) => speechDurationSec > 0
+  ? clamp(Math.sqrt(speechDurationSec / 120), 0.5, 2)
+  : clamp(fallbackEvidenceWeight, 0.5, 2);
+
+const resolveMeasurementAnchorVoteWeight = (measurement: BatchSpeechLevelMeasurement) => {
+  if (finiteNumber(measurement.anchorVoteWeight) && measurement.anchorVoteWeight > 0) {
+    return measurement.anchorVoteWeight;
+  }
+  if (finiteNumber(measurement.evidenceWeight) && measurement.evidenceWeight > 0) {
+    return measurement.evidenceWeight;
+  }
+  return 1;
+};
+
+export const summarizeBatchSpeechLevelEvidence = (
+  windows: readonly BatchSpeechWindowEvidence[],
+): BatchSpeechLevelEvidenceSummary | null => {
+  const finiteWindows = windows.filter((window) => finiteNumber(window.speechLevelDb));
+  if (finiteWindows.length === 0) return null;
+  const orderedSpeechLevelsDb = finiteWindows
+    .map((window) => window.speechLevelDb)
+    .sort((left, right) => left - right);
+  const speechLevelDb = percentileOfSorted(orderedSpeechLevelsDb, 0.5);
+  if (!finiteNumber(speechLevelDb)) return null;
+  const plateauWindows = finiteWindows
+    .filter(
+      (window) =>
+        finiteNumber(window.speechBodyPlateauDb) &&
+        finiteNumber(window.speechFrameCount) &&
+        window.speechFrameCount > 0,
+    );
+  const plateauEvidence = plateauWindows.map((window) => ({
+    window,
+    speechDurationSec: resolveWindowSpeechDurationSec(window),
+  }));
+  const hasCompleteDurationEvidence =
+    plateauEvidence.length > 0 &&
+    plateauEvidence.every(
+      (entry) => finiteNumber(entry.speechDurationSec) && entry.speechDurationSec > 0,
+    );
+  const plateauEntries = plateauEvidence
+    .map(({ window, speechDurationSec }) => {
+      return {
+        value: window.speechBodyPlateauDb as number,
+        weight: hasCompleteDurationEvidence ? (speechDurationSec as number) : 1,
+        speechFrameCount: window.speechFrameCount,
+      };
+    });
+  const speechPlateauDb = interpolatedWeightedQuantile(plateauEntries) ?? speechLevelDb;
+  const speechDurationSec = hasCompleteDurationEvidence
+    ? plateauEvidence.reduce(
+        (total, entry) => total + (entry.speechDurationSec as number),
+        0,
+      )
+    : 0;
+  const speechFrameCount = plateauEntries.reduce(
+    (total, entry) => total + entry.speechFrameCount,
+    0,
+  );
+  const fallbackEvidenceWeight = clamp(
+    finiteWindows.length / BATCH_SPEECH_EVIDENCE_MIN_USABLE_WINDOWS,
+    0.5,
+    2,
+  );
+  const plateauBlendAuthority = resolvePlateauBlendAuthority(
+    speechDurationSec,
+    fallbackEvidenceWeight,
+  );
+  const anchorVoteWeight = resolveAnchorVoteWeightFromDuration(
+    speechDurationSec,
+    fallbackEvidenceWeight,
+  );
+  return {
+    speechLevelDb,
+    speechPlateauDb,
+    plateauBlendAuthority,
+    anchorVoteWeight,
+    speechDurationSec,
+    evidenceWeight: anchorVoteWeight,
+    speechFrameCount,
+  };
+};
+
+export const summarizeBatchSpeechGroupEvidence = (
+  measurements: readonly BatchSpeechLevelEvidenceSummary[],
+): BatchSpeechLevelEvidenceSummary | null => {
+  const finiteMeasurements = measurements.filter(
+    (measurement) =>
+      finiteNumber(measurement.speechLevelDb) &&
+      finiteNumber(measurement.speechPlateauDb),
+  );
+  if (finiteMeasurements.length === 0) return null;
+  const hasCompleteDurationEvidence = finiteMeasurements.every(
+    (measurement) =>
+      finiteNumber(measurement.speechDurationSec) && measurement.speechDurationSec > 0,
+  );
+  const hasNoDurationEvidence = finiteMeasurements.every(
+    (measurement) =>
+      !finiteNumber(measurement.speechDurationSec) || measurement.speechDurationSec <= 0,
+  );
+  const hasCompleteLegacyFrameEvidence = finiteMeasurements.every(
+    (measurement) =>
+      finiteNumber(measurement.speechFrameCount) && measurement.speechFrameCount > 0,
+  );
+  const measurementWeight = (measurement: BatchSpeechLevelEvidenceSummary) =>
+    hasCompleteDurationEvidence
+      ? measurement.speechDurationSec
+      : hasNoDurationEvidence && hasCompleteLegacyFrameEvidence
+        ? measurement.speechFrameCount
+        : 1;
+  const speechLevelDb = interpolatedWeightedQuantile(
+    finiteMeasurements.map((measurement) => ({
+      value: measurement.speechLevelDb,
+      weight: measurementWeight(measurement),
+    })),
+  );
+  if (!finiteNumber(speechLevelDb)) return null;
+  const plateauEntries = finiteMeasurements
+    .filter(
+      (measurement) =>
+        finiteNumber(measurement.speechFrameCount) &&
+        measurement.speechFrameCount > 0,
+    )
+    .map((measurement) => ({
+      value: measurement.speechPlateauDb,
+      weight: measurementWeight(measurement),
+    }));
+  const speechFrameCount = finiteMeasurements.reduce(
+    (total, measurement) => total + (
+      finiteNumber(measurement.speechFrameCount) && measurement.speechFrameCount > 0
+        ? measurement.speechFrameCount
+        : 0
+    ),
+    0,
+  );
+  const speechPlateauDb =
+    interpolatedWeightedQuantile(plateauEntries) ??
+    median(finiteMeasurements.map((measurement) => measurement.speechPlateauDb)) ??
+    speechLevelDb;
+  const speechDurationSec = hasCompleteDurationEvidence
+    ? finiteMeasurements.reduce(
+        (total, measurement) => total + measurement.speechDurationSec,
+        0,
+      )
+    : 0;
+  const fallbackAnchorVoteWeight =
+    finiteMeasurements.reduce(
+      (total, measurement) =>
+        total + (
+          finiteNumber(measurement.anchorVoteWeight)
+            ? measurement.anchorVoteWeight
+            : finiteNumber(measurement.evidenceWeight)
+              ? measurement.evidenceWeight
+              : 1
+        ),
+      0,
+    ) / finiteMeasurements.length;
+  const fallbackPlateauBlendAuthority =
+    finiteMeasurements.reduce(
+      (total, measurement) =>
+        total + (
+          finiteNumber(measurement.plateauBlendAuthority)
+            ? clamp(measurement.plateauBlendAuthority, 0, 1)
+            : smoothUnitRamp(measurement.evidenceWeight ?? 1, 0.5, 1)
+        ),
+      0,
+    ) / finiteMeasurements.length;
+  const plateauBlendAuthority = hasCompleteDurationEvidence
+    ? resolvePlateauBlendAuthority(speechDurationSec, fallbackAnchorVoteWeight)
+    : hasNoDurationEvidence
+      ? clamp(fallbackPlateauBlendAuthority, 0, 1)
+      : 0;
+  const anchorVoteWeight = resolveAnchorVoteWeightFromDuration(
+    speechDurationSec,
+    fallbackAnchorVoteWeight,
+  );
+  return {
+    speechLevelDb,
+    speechPlateauDb,
+    plateauBlendAuthority,
+    anchorVoteWeight,
+    speechDurationSec,
+    evidenceWeight: anchorVoteWeight,
+    speechFrameCount,
+  };
 };
 
 export const planBatchSpeechAlignment = (
@@ -58,30 +393,41 @@ export const planBatchSpeechAlignment = (
   const triggerDb = options?.triggerDb ?? BATCH_SPEECH_ALIGN_TRIGGER_DB;
   const maxOffsetDb = options?.maxOffsetDb ?? BATCH_SPEECH_ALIGN_MAX_DB;
   const measured = measurements
-    .map((measurement) => measurement.speechLevelDb)
-    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-  const anchorDb = measured.length >= 2 ? median(measured) : null;
+    .map((measurement) => {
+      const value = resolveBatchSpeechAlignmentLevelDb(measurement);
+      if (!finiteNumber(value)) return null;
+      return {
+        value,
+        weight: resolveMeasurementAnchorVoteWeight(measurement),
+      };
+    })
+    .filter((value): value is Readonly<{ value: number; weight: number }> => value !== null);
+  const anchorDb = measured.length >= 2
+    ? interpolatedWeightedQuantile(measured)
+    : null;
 
   return {
     anchorDb,
     plans: measurements.map((measurement) => {
+      const alignmentLevelDb = resolveBatchSpeechAlignmentLevelDb(measurement);
       if (
         anchorDb === null ||
-        typeof measurement.speechLevelDb !== "number" ||
-        !Number.isFinite(measurement.speechLevelDb)
+        !finiteNumber(alignmentLevelDb)
       ) {
         return {
           id: measurement.id,
           speechLevelDb: measurement.speechLevelDb,
+          alignmentLevelDb: finiteNumber(alignmentLevelDb) ? alignmentLevelDb : null,
           offsetDb: 0,
           shouldAlign: false,
         };
       }
-      const rawOffsetDb = anchorDb - measurement.speechLevelDb;
+      const rawOffsetDb = anchorDb - alignmentLevelDb;
       const shouldAlign = Math.abs(rawOffsetDb) > triggerDb;
       return {
         id: measurement.id,
         speechLevelDb: measurement.speechLevelDb,
+        alignmentLevelDb,
         offsetDb: shouldAlign ? clamp(rawOffsetDb, -maxOffsetDb, maxOffsetDb) : 0,
         shouldAlign,
       };

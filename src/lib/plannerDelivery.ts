@@ -12,6 +12,16 @@ export const PLANNER_DELIVERY_SOURCE_RELATIVE_NOISE_BUDGET_DB = 0.85;
 export const PLANNER_DELIVERY_CLEAN_FLOOR_DB = -60;
 export const PLANNER_DELIVERY_LIMITER_CEILING_DB = -2;
 export const PLANNER_DELIVERY_ALLOWED_LIMITER_DRIVE_DB = 1.5;
+// Repo-local source corpus (27 files) measured P75≈21.2 dB and P95≈23.6 dB
+// with the same P95-frame-peak / median-frame-RMS statistic. Keep ordinary
+// dialogue below that upper quartile out of the expressive limiter lane.
+export const PLANNER_DELIVERY_EXPRESSIVE_CREST_START_DB = 21;
+export const PLANNER_DELIVERY_EXPRESSIVE_CREST_FULL_DB = 25;
+export const PLANNER_DELIVERY_RENDERED_CREST_NEAR_LIMITER_DB = -8;
+export const PLANNER_DELIVERY_RENDERED_CREST_FULL_LIMITER_DB = -4;
+export const PLANNER_DELIVERY_MIN_EXPRESSIVE_LIMITER_DRIVE_DB = 0.25;
+export const PLANNER_DELIVERY_CREST_LOCALIZATION_START_DB = -4;
+export const PLANNER_DELIVERY_CREST_LOCALIZATION_FULL_DB = -0.5;
 
 export type SourceRelativeFinalTone = Readonly<{
   bodyPreservationTiltDb: number;
@@ -37,6 +47,10 @@ export type PlannerDeliverySafetyEvidence = Readonly<{
    * later bounded linear render. Null denotes a mathematically silent buffer.
    */
   samplePeakDb: number | null;
+  /** P95 decoded frame peak restricted to frames owned by the supplied speech mask. */
+  activityPeakDb?: number | null;
+  /** Median decoded activity-frame level used to make crest evidence level-invariant. */
+  activityPlateauDb?: number | null;
 }>;
 
 const clamp = (value: number, min: number, max: number) =>
@@ -52,9 +66,12 @@ const EMPTY_PLANNER_DELIVERY_SAFETY_EVIDENCE: PlannerDeliverySafetyEvidence =
     nearSpeechFloorDb: null,
     nearSpeechFloorConfidence: 0,
     samplePeakDb: null,
+    activityPeakDb: null,
+    activityPlateauDb: null,
   });
 
 const percentileOfSorted = (values: readonly number[], fraction: number) => {
+  if (values.length === 0) return null;
   const position = clamp(fraction, 0, 1) * (values.length - 1);
   const lower = Math.floor(position);
   const upper = Math.ceil(position);
@@ -108,6 +125,45 @@ const measureDecodedSamplePeak = (samples: Float32Array) => {
   return samplePeak;
 };
 
+const measureActivityPeakDb = (
+  samples: Float32Array,
+  sampleRate: number,
+  activityMask: readonly boolean[],
+  frameMs: number,
+  frameCount: number,
+) => {
+  const samplesPerFrame = (sampleRate * frameMs) / 1_000;
+  const framePeakDb: number[] = [];
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    if (!activityMask[frame]) continue;
+    const start = Math.max(0, Math.floor(frame * samplesPerFrame));
+    const end = Math.min(samples.length, Math.ceil((frame + 1) * samplesPerFrame));
+    let framePeak = 0;
+    for (let index = start; index < end; index += 1) {
+      const value = samples[index];
+      if (!Number.isFinite(value)) return null;
+      framePeak = Math.max(framePeak, Math.abs(value));
+    }
+    if (framePeak > 0) framePeakDb.push(20 * Math.log10(framePeak));
+  }
+  return percentileOfSorted(
+    framePeakDb.sort((left, right) => left - right),
+    0.95,
+  );
+};
+
+const measureActivityPlateauDb = (
+  measuredFrames: readonly Readonly<{ frame: number; energyDb: number }>[],
+  activityMask: readonly boolean[],
+) => {
+  const activityFrameDb = measuredFrames
+    .filter((frame) => activityMask[frame.frame])
+    .map((frame) => frame.energyDb)
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  return percentileOfSorted(activityFrameDb, 0.5);
+};
+
 const measureNonzeroDeliveryFrames = (
   samples: Float32Array,
   sampleRate: number,
@@ -143,10 +199,14 @@ const resolveQuietBedConfidence = (
   frameMs: number,
 ) => {
   const orderedDb = frames.map((frame) => frame.energyDb).sort((a, b) => a - b);
+  const p80 = percentileOfSorted(orderedDb, 0.8) ?? quietBedDb;
+  const p35 = percentileOfSorted(orderedDb, 0.35) ?? quietBedDb;
+  const p20 = percentileOfSorted(orderedDb, 0.2) ?? quietBedDb;
+  const p10 = percentileOfSorted(orderedDb, 0.1) ?? quietBedDb;
   const contrastDb =
-    percentileOfSorted(orderedDb, 0.8) - percentileOfSorted(orderedDb, 0.2);
+    p80 - p20;
   const lowerModeSpreadDb =
-    percentileOfSorted(orderedDb, 0.35) - percentileOfSorted(orderedDb, 0.1);
+    p35 - p10;
   const contrastAuthority = contrastDb ** 2 / (contrastDb ** 2 + 8 ** 2);
   const plateauAuthority = 1 / (1 + (lowerModeSpreadDb / 5) ** 2);
   const observedSeconds = (frames.length * frameMs) / 1000;
@@ -205,6 +265,13 @@ export const measurePlannerDeliverySafetyEvidence = (
   );
   const frameCount = Math.min(activityMask.length, possibleFrameCount);
   const samplePeak = measureDecodedSamplePeak(samples);
+  const activityPeakDb = measureActivityPeakDb(
+    samples,
+    sampleRate,
+    activityMask,
+    activityFrameMs,
+    frameCount,
+  );
   const measuredFrames = measureNonzeroDeliveryFrames(
     samples,
     sampleRate,
@@ -219,6 +286,9 @@ export const measurePlannerDeliverySafetyEvidence = (
     .map((frame) => frame.energyDb)
     .sort((left, right) => left - right);
   const nonzeroQuietBedDb = percentileOfSorted(orderedDb, 0.2);
+  if (nonzeroQuietBedDb === null) {
+    return EMPTY_PLANNER_DELIVERY_SAFETY_EVIDENCE;
+  }
   const nonzeroQuietBedConfidence = resolveQuietBedConfidence(
     measuredFrames,
     nonzeroQuietBedDb,
@@ -247,6 +317,10 @@ export const measurePlannerDeliverySafetyEvidence = (
     0,
   );
   const nearSpeechFloorDb = weightedPercentile(nearSpeechEntries, 0.6);
+  const activityPlateauDb = measureActivityPlateauDb(
+    measuredFrames,
+    activityMask,
+  );
   const proximityAuthority =
     totalQuietWeight > 0 ? clamp(totalNearWeight / totalQuietWeight, 0, 1) : 0;
 
@@ -259,6 +333,8 @@ export const measurePlannerDeliverySafetyEvidence = (
         ? 0
         : nonzeroQuietBedConfidence * Math.sqrt(proximityAuthority),
     samplePeakDb: 20 * Math.log10(samplePeak),
+    activityPeakDb,
+    activityPlateauDb,
   };
 };
 
@@ -448,6 +524,22 @@ export const resolveBlendDeliverySafetyEvidence = ({
       floorEnvelopeGainDb +
       wetTransientAllowanceDb,
   );
+  const intendedActivityEnvelopeGainDb =
+    floorEnvelopeGainDb + wetTransientAllowanceDb;
+  const activityPeakEnvelopeDb = finiteNumber(inputSafetyEvidence.activityPeakDb)
+    ? Math.min(
+        limiterCeilingDb,
+        inputSafetyEvidence.activityPeakDb + intendedActivityEnvelopeGainDb,
+      )
+    : null;
+  const activityEnvelopeGainDb =
+    activityPeakEnvelopeDb !== null && finiteNumber(inputSafetyEvidence.activityPeakDb)
+      ? activityPeakEnvelopeDb - inputSafetyEvidence.activityPeakDb
+      : intendedActivityEnvelopeGainDb;
+  const activityPlateauEnvelopeDb = finiteNumber(inputSafetyEvidence.activityPlateauDb)
+    ? inputSafetyEvidence.activityPlateauDb +
+      activityEnvelopeGainDb
+    : null;
 
   return Object.freeze({
     nonzeroQuietBedDb:
@@ -459,6 +551,8 @@ export const resolveBlendDeliverySafetyEvidence = ({
     nearSpeechFloorConfidence:
       inputSafetyEvidence.nearSpeechFloorConfidence,
     samplePeakDb: peakEnvelopeDb,
+    activityPeakDb: activityPeakEnvelopeDb,
+    activityPlateauDb: activityPlateauEnvelopeDb,
   });
 };
 
@@ -486,6 +580,69 @@ const resolveNoiseLaneGainDb = ({
   );
   return requestedGainDb +
     pairedConfidence * (measuredLimitDb - requestedGainDb);
+};
+
+const resolveExpressiveCrestAwareLimiterDriveDb = ({
+  sourcePeakDb,
+  sourceActivityPeakDb,
+  sourceActivityPlateauDb,
+  renderedPeakDb,
+  limiterCeilingDb,
+  allowedLimiterDriveDb,
+}: Readonly<{
+  sourcePeakDb: number;
+  sourceActivityPeakDb: number | null | undefined;
+  sourceActivityPlateauDb: number | null | undefined;
+  renderedPeakDb: number;
+  limiterCeilingDb: number;
+  allowedLimiterDriveDb: number;
+}>) => {
+  const finiteSourceActivityPeakDb = finiteNumber(sourceActivityPeakDb)
+    ? sourceActivityPeakDb
+    : null;
+  const finiteSourceActivityPlateauDb = finiteNumber(sourceActivityPlateauDb)
+    ? sourceActivityPlateauDb
+    : null;
+  const crestProminenceDb =
+    finiteSourceActivityPeakDb !== null && finiteSourceActivityPlateauDb !== null
+      ? finiteSourceActivityPeakDb - finiteSourceActivityPlateauDb
+      : null;
+  const activityLocalizationDb =
+    finiteSourceActivityPeakDb !== null
+      ? finiteSourceActivityPeakDb - sourcePeakDb
+      : null;
+  const expressiveSourceAuthority =
+    finiteNumber(crestProminenceDb) && finiteNumber(activityLocalizationDb)
+    ? smoothUnitRamp(
+        crestProminenceDb,
+        PLANNER_DELIVERY_EXPRESSIVE_CREST_START_DB,
+        PLANNER_DELIVERY_EXPRESSIVE_CREST_FULL_DB,
+      ) *
+      smoothUnitRamp(
+        activityLocalizationDb,
+        PLANNER_DELIVERY_CREST_LOCALIZATION_START_DB,
+        PLANNER_DELIVERY_CREST_LOCALIZATION_FULL_DB,
+      )
+    : 0;
+  const renderedLimiterAuthority = smoothUnitRamp(
+    renderedPeakDb,
+    Math.min(
+      PLANNER_DELIVERY_RENDERED_CREST_NEAR_LIMITER_DB,
+      limiterCeilingDb - 6,
+    ),
+    Math.min(
+      PLANNER_DELIVERY_RENDERED_CREST_FULL_LIMITER_DB,
+      limiterCeilingDb - 2,
+    ),
+  );
+  const expressiveLimiterAuthority =
+    expressiveSourceAuthority * renderedLimiterAuthority;
+  const minimumDriveDb = Math.min(
+    allowedLimiterDriveDb,
+    PLANNER_DELIVERY_MIN_EXPRESSIVE_LIMITER_DRIVE_DB,
+  );
+  return allowedLimiterDriveDb +
+    expressiveLimiterAuthority * (minimumDriveDb - allowedLimiterDriveDb);
 };
 
 /**
@@ -538,7 +695,14 @@ export const resolveSafePositiveDeliveryGainDb = ({
   const limiterHeadroomDb = Math.max(
     0,
     limiterCeilingDb +
-      allowedLimiterDriveDb -
+      resolveExpressiveCrestAwareLimiterDriveDb({
+        sourcePeakDb: sourceSafetyEvidence.samplePeakDb,
+        sourceActivityPeakDb: sourceSafetyEvidence.activityPeakDb,
+        sourceActivityPlateauDb: sourceSafetyEvidence.activityPlateauDb,
+        renderedPeakDb: renderedSafetyEvidence.samplePeakDb,
+        limiterCeilingDb,
+        allowedLimiterDriveDb,
+      }) -
       renderedSafetyEvidence.samplePeakDb,
   );
   return Math.min(

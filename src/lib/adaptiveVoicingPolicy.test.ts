@@ -138,7 +138,7 @@ test("the app uses the adaptive policy and tells users scene fit is reflection-f
   assert.match(voLevelerSource, /cinematicWarmthGainDb: voicingDecision\.warmthGainDb/);
   assert.match(voLevelerSource, /blendIndoorGain: voicingDecision\.syntheticReflectionIndoorGain/);
   assert.match(voLevelerSource, /Scene fit \(dry-safe tone\)/);
-  assert.match(voLevelerSource, /never adds\s+delayed reflections/i);
+  assert.match(voLevelerSource, /never adds delayed reflections/i);
   assert.doesNotMatch(voLevelerSource, /\(profile\?\.emotionProtection \?\? 0\) < 0\.5/);
   assert.doesNotMatch(voLevelerSource.slice(blendFilterStart, blendFilterEnd), /adelay=/);
 });
@@ -154,7 +154,7 @@ test("soften harshness only enables measured adaptive cuts and has no fixed clea
     voLevelerSource,
     /const harshAirCut = controls\.softenHarshness\s+\? profile\?\.topEndHarshnessCutDb \?\? 0\s+: 0/,
   );
-  assert.match(voLevelerSource, /Cuts only measured presence and top-end harshness/i);
+  assert.match(voLevelerSource, /Cuts only measured presence and top-end harshness\./i);
 });
 
 test("matched low-mid tone stays neutral instead of receiving a fixed two-decibel cut", () => {
@@ -167,5 +167,5 @@ test("matched low-mid tone stays neutral instead of receiving a fixed two-decibe
     voLevelerSource,
     /sourceSafeMode\s+\? clamp\(profile\?\.lowMidGainDb \?\? -0\.8, -1\.2, 0\)\s+: \(profile\?\.lowMidGainDb \?\? 0\)/,
   );
-  assert.match(voLevelerSource, /continuously adapts to the\s+measured source/i);
+  assert.match(voLevelerSource, /continuously adapts to the measured source/i);
 });

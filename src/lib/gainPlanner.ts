@@ -105,6 +105,38 @@ export type GainPlannerInput = {
  */
 export type SpeechRunClass = "body-speech" | "transient-breath" | "edge-fragment";
 
+export type GainMotionStageName =
+  | "painted"
+  | "valley-relaxed"
+  | "embedded-limited"
+  | "trend-balanced"
+  | "recurrent-supported"
+  | "word-scale-supported"
+  | "word-scale-slewed"
+  | "final-post-dip";
+
+export type GainMotionDistribution = Readonly<{
+  transitionCount: number;
+  p50DbPerFrame: number;
+  p95DbPerFrame: number;
+  p99DbPerFrame: number;
+  maxDbPerFrame: number;
+}>;
+
+export type GainMotionStage = Readonly<{
+  stage: GainMotionStageName;
+  frameMs: number;
+  bodySpeech: GainMotionDistribution | null;
+  transient: GainMotionDistribution | null;
+  silence: GainMotionDistribution | null;
+}>;
+
+export type GainMotionTelemetry = Readonly<{
+  /** Measurement only; it must never alter gain planning or render selection. */
+  advisoryOnly: true;
+  stages: readonly GainMotionStage[];
+}>;
+
 export type GainPlannerOutput = {
   /** One linear gain per frame. Length = frameDb.length. */
   gainCurve: Float32Array;
@@ -154,12 +186,102 @@ export type GainPlannerOutput = {
   tailRescueFrameCount: number;
   /** Longest soft-tail rescue in milliseconds. */
   tailRescueMaxMs: number;
+  /** Count of body-speech releases shortened because lifted post-run bed would become audible. */
+  bedReleaseAdaptedRunCount: number;
+  /** Largest continuous reduction from the normal 500 ms release. */
+  bedReleaseMaxAccelerationMs: number;
+  /** Realized first-difference evidence for each named gain-planner owner. */
+  gainMotion: GainMotionTelemetry;
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const smoothUnitRamp = (value: number, start: number, full: number) => {
   const t = clamp((value - start) / Math.max(1e-9, full - start), 0, 1);
   return t * t * (3 - 2 * t);
+};
+
+const interpolatedPercentile = (
+  sortedValues: readonly number[],
+  fraction: number,
+) => {
+  const position = Math.min(1, Math.max(0, fraction)) * (sortedValues.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sortedValues[lower];
+  const blend = position - lower;
+  return sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * blend;
+};
+
+const summarizeGainMotion = (
+  values: number[],
+): GainMotionDistribution | null => {
+  if (values.length === 0) return null;
+  const sorted = values.sort((left, right) => left - right);
+  return Object.freeze({
+    transitionCount: sorted.length,
+    p50DbPerFrame: interpolatedPercentile(sorted, 0.5),
+    p95DbPerFrame: interpolatedPercentile(sorted, 0.95),
+    p99DbPerFrame: interpolatedPercentile(sorted, 0.99),
+    maxDbPerFrame: sorted[sorted.length - 1],
+  });
+};
+
+export const measureGainMotionStage = (
+  stage: GainMotionStageName,
+  gainDbCurve: ArrayLike<number>,
+  runs: readonly Readonly<{
+    startFrame: number;
+    endFrame: number;
+    runClass: SpeechRunClass;
+  }>[],
+  frameMs: number,
+): GainMotionStage => {
+  const safeFrameMs = Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 10;
+  const frameDomain = new Uint8Array(gainDbCurve.length);
+  for (const run of runs) {
+    const domain =
+      run.runClass === "body-speech"
+        ? 1
+        : run.runClass === "transient-breath"
+          ? 2
+          : 3;
+    const startFrame = Math.max(0, Math.min(gainDbCurve.length, Math.trunc(run.startFrame)));
+    const endFrame = Math.max(startFrame, Math.min(gainDbCurve.length, Math.trunc(run.endFrame)));
+    for (let frame = startFrame; frame < endFrame; frame += 1) {
+      frameDomain[frame] = domain;
+    }
+  }
+
+  const bodySpeech: number[] = [];
+  const transient: number[] = [];
+  const silence: number[] = [];
+  for (let frame = 1; frame < gainDbCurve.length; frame += 1) {
+    const domain = frameDomain[frame];
+    if (domain !== frameDomain[frame - 1]) continue;
+    const current = gainDbCurve[frame];
+    const previous = gainDbCurve[frame - 1];
+    if (!Number.isFinite(current) || !Number.isFinite(previous)) continue;
+    const deltaDb = Math.abs(current - previous);
+    if (domain === 1) bodySpeech.push(deltaDb);
+    else if (domain === 2) transient.push(deltaDb);
+    else silence.push(deltaDb);
+  }
+
+  return Object.freeze({
+    stage,
+    frameMs: safeFrameMs,
+    bodySpeech: summarizeGainMotion(bodySpeech),
+    transient: summarizeGainMotion(transient),
+    silence: summarizeGainMotion(silence),
+  });
+};
+const medianFinite = (values: readonly number[]) => {
+  const finite = values.filter(Number.isFinite).sort((left, right) => left - right);
+  if (finite.length === 0) return null;
+  const middle = Math.floor(finite.length / 2);
+  return finite.length % 2 === 0
+    ? (finite[middle - 1] + finite[middle]) / 2
+    : finite[middle];
 };
 const softLimitNegativePlannerGainDb = (gainDb: number, limitDb: number) => {
   if (!Number.isFinite(gainDb)) return 0;
@@ -198,6 +320,17 @@ const SOFT_TAIL_RESCUE_NOISE_MARGIN_DB = 8;
 const SOFT_TAIL_RESCUE_SPEECH_MARGIN_DB = 14;
 const SOFT_TAIL_RESCUE_BODY_DROP_DB = 18;
 const SOFT_TAIL_RESCUE_HARD_NOISE_MARGIN_DB = 4;
+const POST_RUN_BED_RELEASE_FAST_MS = 240;
+// The veto must inspect every frame whose gain can be pulled forward by the
+// accelerated release. Attachment decay still gives later evidence less say.
+const POST_RUN_BED_LOOKAHEAD_MS = POST_RUN_BED_RELEASE_FAST_MS;
+const POST_RUN_BED_AUDIBILITY_START_DB = -68;
+const POST_RUN_BED_AUDIBILITY_FULL_DB = -56;
+const POST_RUN_BED_POSITIVE_GAIN_START_DB = 4;
+const POST_RUN_BED_POSITIVE_GAIN_FULL_DB = 10;
+const POST_RUN_BED_SPEECH_BODY_VETO_START_BELOW_THRESHOLD_DB = 10;
+const POST_RUN_BED_SPEECH_BODY_VETO_FULL_ABOVE_THRESHOLD_DB = 2;
+const POST_RUN_BED_FRICATIVE_VETO_FULL_DB = 12;
 const QUIET_BODY_FLOOR_OFFSET_DB = 2.4;
 const QUIET_BODY_FLOOR_LOUDNESS_OFFSET_DB = 1.0;
 const QUIET_BODY_FLOOR_MAX_LIFT_DB = 3.5;
@@ -1897,6 +2030,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     fricativeFrameDb && Number.isFinite(input.fricativeNoiseFloorDb)
       ? (input.fricativeNoiseFloorDb as number) + FRICATIVE_EVIDENCE_MARGIN_DB
       : Number.POSITIVE_INFINITY;
+  const hasCompletePostRunVetoEvidence =
+    hasExplicitSpeechBodyEvidence && fricativeFrameDb !== null;
   const hasFricativeEvidence = (frame: number) =>
     fricativeFrameDb !== null && (fricativeFrameDb[frame] ?? -120) >= fricativeEvidenceFloorDb;
   const gainDbCurve = new Float32Array(frameCount);
@@ -2430,12 +2565,16 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const silenceGainDefaultDb = -expanderDepthDb;
   for (let i = 0; i < frameCount; i += 1) gainDbCurve[i] = silenceGainDefaultDb;
 
-  // 80 ms attack (short, so speech onset is crisp) and 500 ms release
-  // (long, so trailing phonemes survive). Release is equal-power cos² — the
-  // perceptual loudness decays linearly, not exponentially, so soft tails
-  // don't vanish abruptly.
+  // 80 ms attack (short, so speech onset is crisp) and a normal 500 ms
+  // release (long, so trailing phonemes survive). After explicit soft-tail
+  // rescue, a high positive gain may shorten only detector-negative bed toward
+  // 240 ms when that lifted bed would become audible. Speech-body/fricative
+  // tail evidence vetoes that cleanup path. Authority is continuous; the final
+  // applied duration remains frame-quantized. Release remains equal-power cos².
   const attackFrames = Math.max(1, Math.round(80 / frameMs));
   const releaseFrames = Math.max(1, Math.round(500 / frameMs));
+  const fastBedReleaseFrames = Math.max(1, Math.round(POST_RUN_BED_RELEASE_FAST_MS / frameMs));
+  const bedLookaheadFrames = Math.max(1, Math.round(POST_RUN_BED_LOOKAHEAD_MS / frameMs));
   const softTailRescueMaxFrames = Math.max(
     1,
     Math.round(
@@ -2450,6 +2589,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   let tailRescueRunCount = 0;
   let tailRescueFrameCount = 0;
   let tailRescueMaxFrames = 0;
+  let bedReleaseAdaptedRunCount = 0;
+  let bedReleaseMaxAccelerationFrames = 0;
   const protectedEndFrameByRun = new Array<number>(runMeta.length).fill(0);
 
   const resolveSoftTailRescueEndFrame = (meta: RunEntry, nextRunStart: number) => {
@@ -2662,7 +2803,103 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
 
     const releaseStart = softTailEndFrame;
-    const releaseEnd = Math.min(softTailEndFrame + releaseFrames, nextRunStart);
+    const baselineReleaseFrames = Math.max(
+      0,
+      Math.min(releaseFrames, nextRunStart - releaseStart),
+    );
+    const resolveSpeechLikePostRunAuthority = (lookaheadEndFrame: number) => {
+      if (lookaheadEndFrame <= releaseStart) return 0;
+      if (!hasCompletePostRunVetoEvidence) return 1;
+      let attachedSpeechAuthority = 0;
+      for (let frame = releaseStart; frame < lookaheadEndFrame; frame += 1) {
+        const rawBodyDb = speechBodyFrameDb[frame];
+        const bodyAuthority =
+          hasExplicitSpeechBodyEvidence
+            ? smoothUnitRamp(
+                Number.isFinite(rawBodyDb) ? rawBodyDb : -120,
+                input.speechThresholdDb -
+                  POST_RUN_BED_SPEECH_BODY_VETO_START_BELOW_THRESHOLD_DB,
+                input.speechThresholdDb +
+                  POST_RUN_BED_SPEECH_BODY_VETO_FULL_ABOVE_THRESHOLD_DB,
+              )
+            : 0;
+        const rawFricativeDb = fricativeFrameDb?.[frame];
+        const safeFricativeDb = Number.isFinite(rawFricativeDb)
+          ? (rawFricativeDb as number)
+          : -120;
+        const fricativeAuthority =
+          fricativeFrameDb
+            ? smoothUnitRamp(
+                safeFricativeDb - fricativeEvidenceFloorDb,
+                0,
+                POST_RUN_BED_FRICATIVE_VETO_FULL_DB,
+              )
+            : 0;
+        const frameSpeechAuthority =
+          1 - (1 - bodyAuthority) * (1 - fricativeAuthority);
+        const attachmentAuthority = Math.exp(
+          -((frame - releaseStart) * frameMs) /
+            Math.max(POST_RUN_BED_LOOKAHEAD_MS, frameMs),
+        );
+        attachedSpeechAuthority = Math.max(
+          attachedSpeechAuthority,
+          frameSpeechAuthority * attachmentAuthority,
+        );
+      }
+      return clamp(attachedSpeechAuthority, 0, 1);
+    };
+    let adaptedReleaseFrames = baselineReleaseFrames;
+    if (
+      runClass === "body-speech" &&
+      bodyGainAtEnd > 0 &&
+      hasCompletePostRunVetoEvidence &&
+      baselineReleaseFrames > fastBedReleaseFrames
+    ) {
+      const bedLookaheadEnd = Math.min(
+        nextRunStart,
+        releaseStart + bedLookaheadFrames,
+      );
+      const postRunBedDb = medianFinite(
+        input.frameDb.slice(releaseStart, bedLookaheadEnd),
+      );
+      if (postRunBedDb !== null) {
+        const predictedLiftedBedDb = postRunBedDb + bodyGainAtEnd;
+        const positiveGainAuthority = smoothUnitRamp(
+          bodyGainAtEnd,
+          POST_RUN_BED_POSITIVE_GAIN_START_DB,
+          POST_RUN_BED_POSITIVE_GAIN_FULL_DB,
+        );
+        const bedAudibilityAuthority = smoothUnitRamp(
+          predictedLiftedBedDb,
+          POST_RUN_BED_AUDIBILITY_START_DB,
+          POST_RUN_BED_AUDIBILITY_FULL_DB,
+        );
+        const speechLikeTailAuthority =
+          resolveSpeechLikePostRunAuthority(bedLookaheadEnd);
+        const releaseAccelerationAuthority =
+          positiveGainAuthority *
+          bedAudibilityAuthority *
+          (1 - speechLikeTailAuthority);
+        adaptedReleaseFrames = clamp(
+          Math.round(
+            baselineReleaseFrames +
+              (Math.min(fastBedReleaseFrames, baselineReleaseFrames) - baselineReleaseFrames) *
+                releaseAccelerationAuthority,
+          ),
+          Math.min(fastBedReleaseFrames, baselineReleaseFrames),
+          baselineReleaseFrames,
+        );
+      }
+    }
+    const acceleratedFrames = baselineReleaseFrames - adaptedReleaseFrames;
+    if (acceleratedFrames > 0) {
+      bedReleaseAdaptedRunCount += 1;
+      bedReleaseMaxAccelerationFrames = Math.max(
+        bedReleaseMaxAccelerationFrames,
+        acceleratedFrames,
+      );
+    }
+    const releaseEnd = releaseStart + adaptedReleaseFrames;
     const releaseLen = releaseEnd - releaseStart;
     for (let k = 0; k < releaseLen; k += 1) {
       const t = (k + 1) / (releaseLen + 1); // 0 just after run → 1 deep in silence
@@ -2733,6 +2970,12 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     recurrentSupported,
     wordScaleSupported,
     bodySpeechRuns,
+  );
+  const wordScaleSlewedMotion = measureGainMotionStage(
+    "word-scale-slewed",
+    slewed,
+    runMeta,
+    frameMs,
   );
 
   // 7) LOCALIZED absolute-peak guard.
@@ -3005,6 +3248,19 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // 8) Convert to linear.
   const gainCurve = new Float32Array(frameCount);
   for (let i = 0; i < frameCount; i += 1) gainCurve[i] = dbToLin(slewed[i]);
+  const gainMotion: GainMotionTelemetry = Object.freeze({
+    advisoryOnly: true,
+    stages: Object.freeze([
+      measureGainMotionStage("painted", gainDbCurve, runMeta, frameMs),
+      measureGainMotionStage("valley-relaxed", valleyRelaxed, runMeta, frameMs),
+      measureGainMotionStage("embedded-limited", embeddedLimited, runMeta, frameMs),
+      measureGainMotionStage("trend-balanced", trendBalanced, runMeta, frameMs),
+      measureGainMotionStage("recurrent-supported", recurrentSupported, runMeta, frameMs),
+      measureGainMotionStage("word-scale-supported", wordScaleSupported, runMeta, frameMs),
+      wordScaleSlewedMotion,
+      measureGainMotionStage("final-post-dip", slewed, runMeta, frameMs),
+    ]),
+  });
 
   const breathRunCount = runMeta.filter((m) => m.runClass === "transient-breath").length;
   return {
@@ -3036,6 +3292,9 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     tailRescueRunCount,
     tailRescueFrameCount,
     tailRescueMaxMs: tailRescueMaxFrames * frameMs,
+    bedReleaseAdaptedRunCount,
+    bedReleaseMaxAccelerationMs: bedReleaseMaxAccelerationFrames * frameMs,
+    gainMotion,
   };
 };
 

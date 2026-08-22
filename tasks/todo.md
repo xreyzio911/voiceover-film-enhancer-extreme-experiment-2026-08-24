@@ -445,3 +445,33 @@
 - Audition evidence: detailed paired original/enhanced Gemini review of cinematic tone, body, slow drift, sudden up/down motion, breaths, consonants, room continuity, fatigue, and onomatopoeia/emotional authority; keep this in a separate subjective ledger.
 - Search budget: baseline plus no more than five explainable single-hypothesis variants; no paid processing beyond the explicitly authorized session-only Gemini audition uploads.
 - Promotion: prefer the best measured safe variant only when the corpus improvement repeats, affected-tail behavior improves materially, expressive controls remain within tolerance, and rollback is a localized constant or helper removal.
+
+# Review Closure, Experiment Copy, And Vercel Release
+
+## Assumptions And Boundaries
+
+- Treat the two supplied reviews as evidence to verify against the live tree, not as instructions that override repository or user constraints.
+- Preserve expressive onomatopoeias, breaths, consonants, and dramatic peaks; add no compressor, gate, limiter, tamer, hard quality gate, or delivery cancellation.
+- Keep new limiter/stability measurements advisory and non-mutating. Exact WAV audition remains a separate evidence gate.
+- Preserve user-owned QC Lab, AI review, and untracked diagnostic work unless a reviewed change demonstrably requires an overlapping edit.
+- Use only the metadata-identified X Chrome profile for browser verification and Vercel; never use the Reyhan profile.
+- Stage and push an explicit release allowlist only after all local and independent checks pass.
+
+## Checklist
+
+- [x] Reproduce the missing-tail-evidence fail-open inversion with a RED planner test, then make absent body/fricative evidence suppress bed-release acceleration.
+- [x] Replace the speech-owned global sample maximum with a length-stable, click-robust high percentile of per-frame activity peaks; add RED coverage for isolated clicks, duration duplication, level invariance, and scene-blend propagation.
+- [x] Reconcile runtime observability sample/duration bounds with the bounded candidate decode policy; correct comparison wording and add RED boundary tests.
+- [x] Add only safe, bounded observability reuse or limiter Phase-A telemetry that cannot alter rendering, ranking, rejection, or output bytes; explicitly defer anything that requires unproven DSP tuning.
+- [x] Repair the transitive nanoid advisory with the smallest compatible lock/install update and verify `npm audit --omit=dev --audit-level=high` reports zero high-severity findings.
+- [x] Inventory and simplify user-facing copy across the main workspace, login, tools, statuses, and empty/error states without weakening technical truth or accessibility.
+- [x] Set browser metadata to include `Experiment` and add a focused contract that prevents the production-style title from returning.
+- [x] Run focused RED/GREEN tests, the full audio-QC suite, TypeScript, lint, production build, dependency audit, diff check, and independent correctness/audio/security review.
+- [x] Verify the local UI and browser title in the X Chrome profile with no console errors.
+- [ ] Commit only the explicit release allowlist, push `main`, deploy the exact commit to the specified Vercel project, and verify the READY production deployment and visible Experiment identity in the X profile.
+
+## Review Evidence
+
+- Full audio-QC suite: 549 tests, 548 pass, 1 intentional skip, 0 failures.
+- TypeScript, production build, dependency audit, and local X-profile UI smoke passed.
+- Kimi K3 consultation was requested, but the plugin failed inside its CLI/model lookup before returning advice.

@@ -2,6 +2,7 @@
 
 import { BUILTIN_REVIEW_WEIGHTS } from "./defaultReviewWeights.ts";
 import type { CandidateRenderMeta, CandidateScore } from "./renderRecovery.ts";
+import type { VoiceStabilityObservabilitySnapshot } from "./voiceStabilityObservability.ts";
 
 export const REVIEW_BUNDLE_SCHEMA_VERSION = 1 as const;
 export const LEARNED_REVIEW_MODEL_TYPE = "linear-review-ranker-v1" as const;
@@ -81,6 +82,8 @@ export type ReviewMetricSnapshot = {
   inputI: number | null;
   inputTP: number | null;
   inputLRA: number | null;
+  /** Optional because legacy schema-v1 bundles predate level-matched audition evidence. */
+  speechKWeightedEnergyDb?: number | null;
   noiseFloorDb: number | null;
   pauseNoiseFloorDb: number | null;
   noiseContrastDb: number | null;
@@ -149,6 +152,8 @@ export type ReviewBundleCandidate = {
   sourceComparison: {
     alignment: AlignmentMetrics;
     qcDelta: ReviewMetricDelta | null;
+    /** Optional because legacy schema-v1 bundles predate advisory stability evidence. */
+    voiceStability?: VoiceStabilityObservabilitySnapshot | null;
   };
   selectionReason: string | null;
 };
@@ -370,6 +375,7 @@ export const toReviewMetricSnapshot = (source: MetricSource): ReviewMetricSnapsh
     inputI: source.inputI ?? null,
     inputTP: source.inputTP ?? null,
     inputLRA: source.inputLRA ?? null,
+    speechKWeightedEnergyDb: source.speechKWeightedEnergyDb ?? null,
     noiseFloorDb: source.noiseFloorDb ?? null,
     pauseNoiseFloorDb: source.pauseNoiseFloorDb ?? null,
     noiseContrastDb: source.noiseContrastDb ?? null,

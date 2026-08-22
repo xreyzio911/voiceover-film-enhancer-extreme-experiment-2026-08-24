@@ -359,13 +359,6 @@
   }
 }
 
-.reviewAudioGrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-}
-
-.audioCard,
 .reviewCandidateCard {
   border-radius: var(--radius-control);
   border: 1px solid var(--border);
@@ -375,8 +368,68 @@
   gap: 8px;
 }
 
-.audioPlayer {
+.auditionPanel {
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.auditionHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auditionTrackGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.auditionTrackButton {
+  min-height: 58px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  color: var(--text);
+  padding: 9px 12px;
+  display: grid;
+  gap: 3px;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.auditionTrackButton span {
+  color: var(--text-subtle);
+  font-size: 0.8rem;
+}
+
+.auditionTrackButtonActive {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-raised));
+}
+
+.auditionTimeline {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: var(--text-subtle);
+  font-size: 0.82rem;
+}
+
+.auditionTimeline input {
   width: 100%;
+}
+
+.hiddenAudio {
+  display: none;
 }
 
 .reviewCandidateGrid {
@@ -552,7 +605,8 @@
   }
 
   .reportHeader,
-  .autoReviewHeader {
+  .autoReviewHeader,
+  .auditionHeader {
     align-items: stretch;
     flex-direction: column;
   }
@@ -560,6 +614,10 @@
   .reviewCandidateGrid,
   .autoReviewGrid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .auditionTimeline {
+    grid-template-columns: 1fr;
   }
 }
 

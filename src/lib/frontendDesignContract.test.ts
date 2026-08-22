@@ -51,6 +51,18 @@ const lightPalette = {
   focus: "#006cff",
 } as const;
 
+test("the experiment build is unmistakable in the browser tab and primary app copy", () => {
+  const layout = readProjectFile("src/app/layout.tsx");
+  const page = readProjectFile("src/app/page.tsx");
+  const tools = readProjectFile("src/components/AppTools.tsx");
+
+  assert.match(layout, /title:\s*["']Shorts Projektt \| Voiceover Experiment["']/);
+  assert.match(page, />Voiceover Experiment<\/h1>/);
+  assert.match(page, />Experiment<\/div>/);
+  assert.match(tools, /label:\s*["']Voiceover["']/);
+  assert.doesNotMatch(page, /Level, review, and export consistent voiceover from one controlled workspace/);
+});
+
 test("the SRT-derived theme defaults dark, supports light, and preserves the responsive shell", () => {
   const globals = readProjectFile("src/app/globals.css");
   const appTools = readProjectFile("src/components/AppTools.module.css");
@@ -237,6 +249,25 @@ test("QC review controls expose labels, selection state, and live feedback", () 
   assert.match(source, /htmlFor=\{reviewerNoteId\}/);
   assert.match(source, /const active = decision\.issueTags\.includes\(tag\)/);
   assert.match(source, /aria-pressed=\{active\}/);
+});
+
+test("QC review audition is shared, blind by default, and level matched without gain", () => {
+  const lab = readProjectFile("src/components/QcReportLab.tsx");
+  const audition = readProjectFile("src/components/ReviewAuditionPanel.tsx");
+  const helper = readProjectFile("src/lib/reviewAudition.ts");
+  const styles = readProjectFile("src/components/QcReportLab.module.css");
+
+  assert.match(lab, /<ReviewAuditionPanel/);
+  assert.doesNotMatch(lab, /<audio[\s\S]{0,180}?\bcontrols\b/);
+  assert.match(audition, /labelsRevealed[^\n]*useState\(false\)/);
+  assert.match(audition, /levelMatchEnabled[^\n]*useState\(false\)/);
+  assert.match(audition, /speechKWeightedEnergyDb/);
+  assert.match(audition, /estimatedOffsetSec/);
+  assert.match(audition, /resolveAuditionBookmarks/);
+  assert.match(audition, /"Reveal labels"/);
+  assert.match(helper, /trimDb:\s*Math\.min\(0,/);
+  assert.match(styles, /\.auditionPanel\s*\{/);
+  assert.match(styles, /\.hiddenAudio\s*\{[\s\S]*?display:\s*none/);
 });
 
 test("motion is purposeful, short, and preference-aware", () => {

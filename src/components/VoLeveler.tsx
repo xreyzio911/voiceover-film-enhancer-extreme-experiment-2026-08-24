@@ -30,6 +30,8 @@ import {
   resolvePlannerCalibration,
   speechRunsFromMask,
   tameRenderedConsonantPeaks,
+  type GainMotionDistribution,
+  type GainMotionTelemetry,
   type RenderedConsonantReference,
   type RenderedConsonantTamerOptions,
   type SpeechRun as PlannerSpeechRun,
@@ -101,10 +103,25 @@ import {
 import { buildFinalPolishFilter } from "../lib/finalPolishFilter";
 import { measureNativeFinalToneSpectrumDb } from "../lib/finalToneEvidence";
 import {
+  buildLimiterObservabilityStage,
+  formatLimiterObservabilityStage,
+} from "../lib/limiterObservability";
+import {
+  VOICE_STABILITY_RUNTIME_FRAME_MS,
+  VOICE_STABILITY_RUNTIME_MAX_DURATION_SECONDS,
+  createVoiceStabilityObservabilitySourceSession,
+  type VoiceStabilityObservabilitySnapshot,
+} from "../lib/voiceStabilityObservability";
+import {
   hasSufficientBatchSpeechEvidence,
   planBatchSpeechAlignment,
   planDistributedSpeechEvidenceWindows,
+  resolveBatchSpeechAlignmentLevelDb,
   selectDistributedSpeechEvidenceWindowsWithConfig as selectDistributedAnalysisWindowsWithConfig,
+  summarizeBatchSpeechGroupEvidence,
+  summarizeBatchSpeechLevelEvidence,
+  type BatchSpeechLevelEvidenceSummary,
+  type BatchSpeechWindowEvidence,
 } from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import {
@@ -226,7 +243,8 @@ const DISTRIBUTED_ANALYSIS_TARGET_COUNT = 6;
 // Memory-routing boundary, not an audio-quality gate. Large app-rendered
 // pcm_f32 WAVs are QC'd through small exact byte windows so a missing metric
 // cannot become a WASM out-of-memory failure or fake 100% risk score.
-const BOUNDED_CANDIDATE_QC_MIN_SECONDS = 600;
+const BOUNDED_CANDIDATE_QC_MIN_SECONDS =
+  VOICE_STABILITY_RUNTIME_MAX_DURATION_SECONDS;
 const BOUNDED_CANDIDATE_QC_MIN_BYTES = 96 * 1024 * 1024;
 const BOUNDED_CANDIDATE_QC_MIN_COMBINED_BYTES = 40 * 1024 * 1024;
 const BOUNDED_CANDIDATE_QC_WINDOW_SECONDS = 30;
@@ -568,12 +586,23 @@ type FileAnalysis = {
   longSparseModeEligible: boolean | null;
 };
 
+type LimiterAuditInput = Readonly<{
+  inputTruePeakDb: number | null;
+  plannedStaticGainDb: number | null;
+}>;
+
 type FinalPolishEvidence = Pick<
   FileAnalysis,
   "speechBandSpectrumDb" | "speechKWeightedEnergyDb" | "plannerDeliverySafetyEvidence"
 > & {
+  /** Present when this evidence came from a full or bounded QC analysis. */
+  inputTP?: number | null;
   /** Optional native-rate speech spectrum used only for the 10-16 kHz shelf. */
   nativeFinalToneSpectrumDb?: number[] | null;
+  /** Median 180-3000 Hz speech-body frame level for batch plateau alignment. */
+  speechBodyPlateauDb?: number | null;
+  /** Speech-body frame count supporting the plateau estimate. */
+  speechBodyFrameCount?: number;
 };
 
 type BatchReference = {
@@ -784,6 +813,15 @@ const measureFinalPolishEvidenceFromAnalysisSamples = (
       activityMask,
       ENVELOPE_FRAME_MS,
     );
+    const speechBodyFrameDb = computeSpeechBodyFrameDb(
+      samples,
+      sampleRate,
+      ENVELOPE_FRAME_MS,
+    );
+    const speechBodyValuesDb = speechBodyFrameDb.filter(
+      (value, frame) => activityMask[frame] && Number.isFinite(value),
+    );
+    const speechBodyPlateauDb = percentile(speechBodyValuesDb, 50);
     let speechBandSpectrumDb: number[] | null = null;
     try {
       speechBandSpectrumDb = computeLogBandSpectrumDb(
@@ -805,6 +843,8 @@ const measureFinalPolishEvidenceFromAnalysisSamples = (
       speechBandSpectrumDb,
       speechKWeightedEnergyDb,
       plannerDeliverySafetyEvidence,
+      speechBodyPlateauDb,
+      speechBodyFrameCount: speechBodyValuesDb.length,
     };
   } catch {
     return null;
@@ -848,12 +888,15 @@ const mergeNativeFinalToneEvidence = (
     return null;
   }
   return {
+    inputTP: evidence?.inputTP ?? null,
     speechBandSpectrumDb: evidence?.speechBandSpectrumDb ?? null,
     speechKWeightedEnergyDb: evidence?.speechKWeightedEnergyDb ?? null,
     plannerDeliverySafetyEvidence:
       exactPlannerDeliverySafetyEvidence ??
       evidence?.plannerDeliverySafetyEvidence ??
       null,
+    speechBodyPlateauDb: evidence?.speechBodyPlateauDb ?? null,
+    speechBodyFrameCount: evidence?.speechBodyFrameCount ?? 0,
     nativeFinalToneSpectrumDb,
   };
 };
@@ -1894,11 +1937,32 @@ const summarizeFailureReason = (error: unknown) => {
     tailRescueFrameCount: number;
     /** Longest soft-tail rescue in milliseconds. */
     tailRescueMaxMs: number;
+    /** Body-speech releases shortened because positive gain would expose the post-run bed. */
+    bedReleaseAdaptedRunCount: number;
+    /** Largest reduction from the normal consonant-safe release in milliseconds. */
+    bedReleaseMaxAccelerationMs: number;
+    /** Advisory-only realized motion for each named planner stage. */
+    gainMotion: GainMotionTelemetry;
     /** Effective intra-run micro-ride range in dB. Diagnostic. */
     microRideDb: number;
     /** Compact source-relative frame evidence retained for final delivery. */
     sourceConsonantReference: RenderedConsonantReference | null;
   };
+
+  const formatGainMotionDomain = (
+    distribution: GainMotionDistribution | null,
+  ) =>
+    distribution
+      ? `${distribution.p95DbPerFrame.toFixed(3)}/${distribution.maxDbPerFrame.toFixed(3)}`
+      : "-";
+
+  const summarizeGainMotion = (telemetry: GainMotionTelemetry) =>
+    telemetry.stages
+      .map(
+        (stage) =>
+          `${stage.stage} B${formatGainMotionDomain(stage.bodySpeech)} T${formatGainMotionDomain(stage.transient)} S${formatGainMotionDomain(stage.silence)}`,
+      )
+      .join("; ");
 
   /**
    * Decode the full `inputName` to 16 kHz mono Float32, compute the frame
@@ -2124,6 +2188,9 @@ const summarizeFailureReason = (error: unknown) => {
         tailRescueRunCount: plan.tailRescueRunCount,
         tailRescueFrameCount: plan.tailRescueFrameCount,
         tailRescueMaxMs: plan.tailRescueMaxMs,
+        bedReleaseAdaptedRunCount: plan.bedReleaseAdaptedRunCount,
+        bedReleaseMaxAccelerationMs: plan.bedReleaseMaxAccelerationMs,
+        gainMotion: plan.gainMotion,
         microRideDb: plan.microRideDb,
         sourceConsonantReference,
       };
@@ -4848,6 +4915,10 @@ const summarizeFailureReason = (error: unknown) => {
         ffmpeg: activeFfmpeg,
         applied: true,
         polishPasses: 1,
+        limiterAuditInput: {
+          inputTruePeakDb: renderedAnalysis?.inputTP ?? null,
+          plannedStaticGainDb: makeupGainDb,
+        } satisfies LimiterAuditInput,
       };
     } catch (error) {
       appendLog(
@@ -4863,6 +4934,7 @@ const summarizeFailureReason = (error: unknown) => {
         ffmpeg: activeFfmpeg,
         applied: false,
         polishPasses: 0,
+        limiterAuditInput: null,
       };
     } finally {
       await safeDeleteFile(activeFfmpeg, appPassName);
@@ -4946,6 +5018,22 @@ const summarizeFailureReason = (error: unknown) => {
         outputName,
       ],
       "Segment gain match"
+    );
+
+    appendLog(
+      formatLimiterObservabilityStage(
+        buildLimiterObservabilityStage({
+          stageId: `segment-gain-match:${sanitizeBase(inputName)}`,
+          limiterKind: "alimiter",
+          ceilingDb: -2,
+          inputTruePeakDb: loudness.inputTP,
+          outputTruePeakDb: null,
+          plannedStaticGainDb: gainDb,
+          notes: [
+            "Ceiling drive is estimated from measured input true peak and the known static segment gain; FFmpeg alimiter does not expose its reduction envelope.",
+          ],
+        }),
+      ),
     );
 
     return { matched: true, gainDb };
@@ -5723,7 +5811,7 @@ const summarizeFailureReason = (error: unknown) => {
         "-i",
         inputName,
         "-af",
-        `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:print_format=summary`,
+        `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:print_format=json`,
         "-ar",
         "48000",
         "-ac",
@@ -5733,6 +5821,20 @@ const summarizeFailureReason = (error: unknown) => {
         outputName,
       ],
       "One-pass loudnorm"
+    );
+    const renderedData = parseLoudnormJson(resetLogBuffer());
+    appendLog(
+      formatLimiterObservabilityStage(
+        buildLimiterObservabilityStage({
+          stageId: `loudnorm-one-pass:${sanitizeBase(inputName)}`,
+          limiterKind: "loudnorm",
+          ceilingDb: Number(cfg.TP),
+          inputTruePeakDb: parseMaybeNumber(renderedData?.input_tp),
+          outputTruePeakDb: parseMaybeNumber(renderedData?.output_tp),
+          plannedStaticGainDb: null,
+          notes: ["Loudnorm owns the true-peak ceiling internally; dynamic processing is not reported as alimiter reduction."],
+        }),
+      ),
     );
   };
 
@@ -5786,12 +5888,6 @@ const summarizeFailureReason = (error: unknown) => {
       const byteLength = Number.isFinite(entry.size) && entry.size > 0 ? entry.size : entry.blob.size;
       if (!Number.isFinite(byteLength) || byteLength <= 44) return 0;
       return (byteLength - 44) / (48000 * 4);
-    };
-    const medianNumber = (values: number[]) => {
-      const finiteValues = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
-      if (finiteValues.length === 0) return null;
-      const mid = Math.floor(finiteValues.length / 2);
-      return finiteValues.length % 2 === 0 ? (finiteValues[mid - 1] + finiteValues[mid]) / 2 : finiteValues[mid];
     };
     const buildGroupId = (entry: OutputEntry) => {
       const sourceKey = entry.sourceBase ?? entry.name.replace(/_(?:part-\d+_)?(?:blend_)?mixready.*$/i, "");
@@ -5862,8 +5958,8 @@ const summarizeFailureReason = (error: unknown) => {
         }
 
         const groupedTargets = new Map<string, AlignmentTarget[]>();
-        const measurementsByGroup = new Map<string, number[]>();
-        const speechLevelByIndex = new Map<number, number | null>();
+        const measurementsByGroup = new Map<string, BatchSpeechLevelEvidenceSummary[]>();
+        const speechEvidenceByIndex = new Map<number, BatchSpeechLevelEvidenceSummary | null>();
         for (const target of variantTargets) {
           await recycleBeforeOperation("measure");
           const group = groupedTargets.get(target.groupId) ?? [];
@@ -5876,29 +5972,37 @@ const summarizeFailureReason = (error: unknown) => {
               ? speechSpansByBase.get(target.entry.sourceBase)
               : undefined;
           try {
-            const speechLevelDb = await measureBatchSpeechLevelDbFromBlob(
+            const speechEvidence = await measureBatchSpeechLevelDbFromBlob(
               activeFfmpeg,
               target.entry.blob,
               inputName,
               speechSpans,
             );
-            speechLevelByIndex.set(target.index, speechLevelDb);
-            if (speechLevelDb !== null && Number.isFinite(speechLevelDb)) {
+            speechEvidenceByIndex.set(target.index, speechEvidence);
+            if (speechEvidence) {
               const values = measurementsByGroup.get(target.groupId) ?? [];
-              values.push(speechLevelDb);
+              values.push(speechEvidence);
               measurementsByGroup.set(target.groupId, values);
             }
           } catch (error) {
             appendLog(`[BatchAlign] ${target.entry.name}: speech-energy measure skipped (${describeError(error)}).`);
-            speechLevelByIndex.set(target.index, null);
+            speechEvidenceByIndex.set(target.index, null);
           }
           noteProcessedAudio(target.entry);
         }
 
-        const groupMeasurements = Array.from(groupedTargets.keys()).map((groupId) => ({
-          id: groupId,
-          speechLevelDb: medianNumber(measurementsByGroup.get(groupId) ?? []),
-        }));
+        const groupMeasurements = Array.from(groupedTargets.keys()).map((groupId) => {
+          const measurements = measurementsByGroup.get(groupId) ?? [];
+          const summary = summarizeBatchSpeechGroupEvidence(measurements);
+          return {
+            id: groupId,
+            speechLevelDb: summary?.speechLevelDb ?? null,
+            speechPlateauDb: summary?.speechPlateauDb ?? null,
+            plateauBlendAuthority: summary?.plateauBlendAuthority ?? null,
+            anchorVoteWeight: summary?.anchorVoteWeight ?? null,
+            evidenceWeight: summary?.evidenceWeight ?? null,
+          };
+        });
         const alignment = planBatchSpeechAlignment(groupMeasurements);
         if (alignment.anchorDb === null) {
           appendLog(`[BatchAlign] ${variant} skipped (insufficient speech-energy measurements).`);
@@ -5912,7 +6016,7 @@ const summarizeFailureReason = (error: unknown) => {
           if (!plan.shouldAlign) {
             appendLog(
               `[BatchAlign] ${groupLabel} (${variant}): within ${Math.abs(
-                (plan.speechLevelDb ?? alignment.anchorDb) - alignment.anchorDb,
+                (plan.alignmentLevelDb ?? alignment.anchorDb) - alignment.anchorDb,
               ).toFixed(1)} dB of speech-energy batch anchor ${alignment.anchorDb.toFixed(1)} dB.`,
             );
             continue;
@@ -5990,29 +6094,50 @@ const summarizeFailureReason = (error: unknown) => {
                   )}s`,
                 );
               }
-              const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(
+              const afterSpeechEvidence = await measureBatchSpeechLevelDbFromVirtualWav(
                 activeFfmpeg,
                 outputName,
                 speechSpans,
               );
+              const afterAlignmentLevelDb = afterSpeechEvidence
+                ? resolveBatchSpeechAlignmentLevelDb(afterSpeechEvidence)
+                : null;
               const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName);
+              appendLog(
+                formatLimiterObservabilityStage(
+                  buildLimiterObservabilityStage({
+                    stageId: `batch-align:${sanitizeBase(target.entry.name)}`,
+                    limiterKind: "alimiter",
+                    ceilingDb: -2,
+                    inputTruePeakDb: null,
+                    outputTruePeakDb: alignedLoudness.inputTP,
+                    plannedStaticGainDb: authorizedOffsetDb,
+                    notes: [
+                      "The aligned output true peak is measured; input true peak is unavailable at this stage, so ceiling drive remains unknown.",
+                    ],
+                  }),
+                ),
+              );
               if (alignedLoudness.inputTP !== null && alignedLoudness.inputTP > -1.5) {
                 throw new Error(`true peak ${alignedLoudness.inputTP.toFixed(2)} dBTP exceeds -1.5 dBTP gate`);
               }
-              const beforeSpeechLevelDb = speechLevelByIndex.get(target.index);
+              const beforeSpeechEvidence = speechEvidenceByIndex.get(target.index);
+              const beforeAlignmentLevelDb = beforeSpeechEvidence
+                ? resolveBatchSpeechAlignmentLevelDb(beforeSpeechEvidence)
+                : null;
               if (
-                beforeSpeechLevelDb !== null &&
-                beforeSpeechLevelDb !== undefined &&
-                afterSpeechLevelDb !== null &&
-                Number.isFinite(afterSpeechLevelDb)
+                beforeAlignmentLevelDb !== null &&
+                beforeAlignmentLevelDb !== undefined &&
+                afterAlignmentLevelDb !== null &&
+                Number.isFinite(afterAlignmentLevelDb)
               ) {
                 const movedOppositeDirection =
                   authorizedOffsetDb > 0
-                    ? afterSpeechLevelDb < beforeSpeechLevelDb - 0.1
-                    : afterSpeechLevelDb > beforeSpeechLevelDb + 0.1;
+                    ? afterAlignmentLevelDb < beforeAlignmentLevelDb - 0.1
+                    : afterAlignmentLevelDb > beforeAlignmentLevelDb + 0.1;
                 if (movedOppositeDirection) {
                   throw new Error(
-                    `speech energy moved opposite requested offset (${beforeSpeechLevelDb.toFixed(1)} -> ${afterSpeechLevelDb.toFixed(
+                    `speech alignment evidence moved opposite requested offset (${beforeAlignmentLevelDb.toFixed(1)} -> ${afterAlignmentLevelDb.toFixed(
                       1,
                     )} dB, offset ${formatSigned(authorizedOffsetDb, 1)} dB)`,
                   );
@@ -6291,7 +6416,7 @@ const summarizeFailureReason = (error: unknown) => {
           "-i",
           inputName,
           "-af",
-          `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:measured_I=${measuredI}:measured_TP=${measuredTP}:measured_LRA=${measuredLRA}:measured_thresh=${measuredThresh}:offset=${offset}:linear=${linearMode ? "true" : "false"}:print_format=summary`,
+          `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:measured_I=${measuredI}:measured_TP=${measuredTP}:measured_LRA=${measuredLRA}:measured_thresh=${measuredThresh}:offset=${offset}:linear=${linearMode ? "true" : "false"}:print_format=json`,
           "-ar",
           "48000",
           "-ac",
@@ -6302,6 +6427,24 @@ const summarizeFailureReason = (error: unknown) => {
         ],
         "Loudnorm render"
       );
+      const renderedData = parseLoudnormJson(resetLogBuffer());
+      appendLog(
+        formatLimiterObservabilityStage(
+          buildLimiterObservabilityStage({
+            stageId: `loudnorm:${sanitizeBase(inputName)}`,
+            limiterKind: "loudnorm",
+            ceilingDb: Number(cfg.TP),
+            inputTruePeakDb: measuredTP,
+            outputTruePeakDb: parseMaybeNumber(renderedData?.output_tp),
+            plannedStaticGainDb: linearMode ? offset : null,
+            notes: [
+              linearMode
+                ? "Linear loudnorm exposes a known target offset; ceiling drive is an estimate, not a reduction measurement."
+                : "Dynamic loudnorm has no single static gain, so ceiling drive remains unknown.",
+            ],
+          }),
+        ),
+      );
     } catch (error) {
       appendLog(
         `[Loudnorm] ${sanitizeBase(
@@ -6311,6 +6454,21 @@ const summarizeFailureReason = (error: unknown) => {
         )} dB with true-peak limiter.`,
       );
       await runStaticLoudnessFallback(ffmpeg, inputName, outputName, cfg, offset);
+      appendLog(
+        formatLimiterObservabilityStage(
+          buildLimiterObservabilityStage({
+            stageId: `static-loudness-fallback:${sanitizeBase(inputName)}`,
+            limiterKind: "alimiter",
+            ceilingDb: Number(cfg.TP),
+            inputTruePeakDb: measuredTP,
+            outputTruePeakDb: null,
+            plannedStaticGainDb: clamp(offset, -12, 12),
+            notes: [
+              "Static fallback ceiling pressure is estimated before alimiter; output true peak is measured later by delivery QC.",
+            ],
+          }),
+        ),
+      );
     }
   };
 
@@ -6721,7 +6879,7 @@ const summarizeFailureReason = (error: unknown) => {
     const durationSec = await probeInputDurationSeconds(ffmpeg, targetName);
     if (durationSec === null || !Number.isFinite(durationSec) || durationSec <= 0) return null;
     const windows = planDistributedSpeechEvidenceWindows(durationSec, speechSpans);
-    const speechLevelsDb: number[] = [];
+    const speechWindows: BatchSpeechWindowEvidence[] = [];
     for (const window of windows) {
       try {
         const evidence = await measureFinalPolishEvidenceFromVirtualWav(
@@ -6732,7 +6890,12 @@ const summarizeFailureReason = (error: unknown) => {
         );
         const speechLevelDb = evidence?.speechKWeightedEnergyDb;
         if (speechLevelDb !== null && speechLevelDb !== undefined && Number.isFinite(speechLevelDb)) {
-          speechLevelsDb.push(speechLevelDb);
+          speechWindows.push({
+            speechLevelDb,
+            speechBodyPlateauDb: evidence?.speechBodyPlateauDb ?? null,
+            speechFrameCount: evidence?.speechBodyFrameCount ?? 0,
+            speechFrameMs: ENVELOPE_FRAME_MS,
+          });
         }
       } catch (error) {
         appendLog(
@@ -6740,13 +6903,13 @@ const summarizeFailureReason = (error: unknown) => {
         );
       }
     }
-    if (!hasSufficientBatchSpeechEvidence(windows, speechLevelsDb.length, durationSec)) {
+    if (!hasSufficientBatchSpeechEvidence(windows, speechWindows.length, durationSec)) {
       appendLog(
-        `[BatchAlign] ${targetName}: only ${speechLevelsDb.length}/${windows.length} usable speech window(s); alignment skipped.`,
+        `[BatchAlign] ${targetName}: only ${speechWindows.length}/${windows.length} usable speech window(s); alignment skipped.`,
       );
       return null;
     }
-    return percentile(speechLevelsDb, 50);
+    return summarizeBatchSpeechLevelEvidence(speechWindows);
   };
 
   const measureBatchSpeechLevelDbFromBlob = async (
@@ -6757,7 +6920,7 @@ const summarizeFailureReason = (error: unknown) => {
   ) => {
     const info = await inspectMonoFloat32WavBlob(blob);
     const windows = planDistributedSpeechEvidenceWindows(info.durationSec, speechSpans);
-    const speechLevelsDb: number[] = [];
+    const speechWindows: BatchSpeechWindowEvidence[] = [];
     for (let index = 0; index < windows.length; index += 1) {
       const window = windows[index];
       const windowName = `${sanitizeBase(targetName)}_speech_${index}.wav`;
@@ -6772,7 +6935,12 @@ const summarizeFailureReason = (error: unknown) => {
         const evidence = await measureFinalPolishEvidenceFromVirtualWav(ffmpeg, windowName);
         const speechLevelDb = evidence?.speechKWeightedEnergyDb;
         if (speechLevelDb !== null && speechLevelDb !== undefined && Number.isFinite(speechLevelDb)) {
-          speechLevelsDb.push(speechLevelDb);
+          speechWindows.push({
+            speechLevelDb,
+            speechBodyPlateauDb: evidence?.speechBodyPlateauDb ?? null,
+            speechFrameCount: evidence?.speechBodyFrameCount ?? 0,
+            speechFrameMs: ENVELOPE_FRAME_MS,
+          });
         }
       } catch (error) {
         appendLog(
@@ -6782,13 +6950,13 @@ const summarizeFailureReason = (error: unknown) => {
         await safeDeleteFile(ffmpeg, windowName);
       }
     }
-    if (!hasSufficientBatchSpeechEvidence(windows, speechLevelsDb.length, info.durationSec)) {
+    if (!hasSufficientBatchSpeechEvidence(windows, speechWindows.length, info.durationSec)) {
       appendLog(
-        `[BatchAlign] ${targetName}: only ${speechLevelsDb.length}/${windows.length} usable speech window(s); alignment skipped.`,
+        `[BatchAlign] ${targetName}: only ${speechWindows.length}/${windows.length} usable speech window(s); alignment skipped.`,
       );
       return null;
     }
-    return percentile(speechLevelsDb, 50);
+    return summarizeBatchSpeechLevelEvidence(speechWindows);
   };
 
   const recoverFinalPolishEvidenceFromExactWav = async (
@@ -6972,6 +7140,7 @@ const summarizeFailureReason = (error: unknown) => {
     qcSnapshot: ReviewMetricSnapshot | null;
     qcDelta: ReviewMetricDelta | null;
     alignment: AlignmentMetrics;
+    voiceStability: VoiceStabilityObservabilitySnapshot;
     ranking: CandidateRankingBreakdown;
     selectionReason: string | null;
   };
@@ -7051,12 +7220,19 @@ const summarizeFailureReason = (error: unknown) => {
       plan.tailRescueRunCount > 0
         ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
         : "";
+    const bedReleaseNote =
+      plan.bedReleaseAdaptedRunCount > 0
+        ? `, ${plan.bedReleaseAdaptedRunCount} audible bed release${plan.bedReleaseAdaptedRunCount === 1 ? "" : "s"} shortened (max ${plan.bedReleaseMaxAccelerationMs.toFixed(0)} ms)`
+        : "";
     appendLog(
       `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
+      )} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}${bedReleaseNote}).`,
+    );
+    appendLog(
+      `[GainMotion] ${job.base}: p95/max dB per ${plan.frameMs.toFixed(0)} ms; ${summarizeGainMotion(plan.gainMotion)}. Advisory only.`,
     );
 
     context.plan = plan;
@@ -7383,8 +7559,15 @@ const summarizeFailureReason = (error: unknown) => {
             plan.tailRescueRunCount > 0
               ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
               : "";
+          const bedReleaseNote =
+            plan.bedReleaseAdaptedRunCount > 0
+              ? `, ${plan.bedReleaseAdaptedRunCount} audible bed release${plan.bedReleaseAdaptedRunCount === 1 ? "" : "s"} shortened (max ${plan.bedReleaseMaxAccelerationMs.toFixed(0)} ms)`
+              : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}${bedReleaseNote}).`,
+          );
+          appendLog(
+            `[GainMotion] ${job.base}: p95/max dB per ${plan.frameMs.toFixed(0)} ms; ${summarizeGainMotion(plan.gainMotion)}. Advisory only.`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);
@@ -8173,6 +8356,16 @@ const summarizeFailureReason = (error: unknown) => {
             job.base,
             sourceFinalPolishEvidence?.plannerDeliverySafetyEvidence ?? null,
           );
+          const voiceStabilitySession =
+            createVoiceStabilityObservabilitySourceSession({
+              source: sourceDecodedForReview
+                ? {
+                    samples: sourceDecodedForReview.monoSamples,
+                    sampleRate: sourceDecodedForReview.sampleRate,
+                  }
+                : null,
+              frameMs: VOICE_STABILITY_RUNTIME_FRAME_MS,
+            });
 
           const plannerContext = await preparePlannerRenderContext(
             ffmpeg,
@@ -8216,6 +8409,7 @@ const summarizeFailureReason = (error: unknown) => {
           let candidateQcMemoryFailed = false;
           let enhancedLinearRecoveryRequested = false;
           const candidateArtifacts: CandidateReviewArtifact[] = [];
+          let selectedFinalPolishAuditInput: LimiterAuditInput | null = null;
 
           for (let variantIndex = 0; variantIndex < candidateVariants.length; variantIndex += 1) {
             const candidateVariant = candidateVariants[variantIndex];
@@ -8368,6 +8562,23 @@ const summarizeFailureReason = (error: unknown) => {
 
               const candidateBaselineScore = buildCandidateScore(candidateAnalysis);
               const candidateQcSnapshot = toReviewMetricSnapshot(candidateAnalysis);
+              if (candidateOptions.disableLimiter !== true) {
+                appendLog(
+                  formatLimiterObservabilityStage(
+                    buildLimiterObservabilityStage({
+                      stageId: `primary-mix-composite:${candidateLabel}`,
+                      limiterKind: "composite",
+                      ceilingDb: -2,
+                      inputTruePeakDb: fileAnalysis?.inputTP ?? null,
+                      outputTruePeakDb: candidateAnalysis?.inputTP ?? null,
+                      plannedStaticGainDb: null,
+                      notes: [
+                        "Source-to-output composite evidence inventories the primary chain but cannot isolate click-tamer and terminal alimiter action.",
+                      ],
+                    }),
+                  ),
+                );
+              }
               let candidateDecodedForReview: DecodedMonoAudio | null = null;
               if (!useBoundedCandidateReviewMemory) {
                 try {
@@ -8432,6 +8643,14 @@ const summarizeFailureReason = (error: unknown) => {
                 weights: learnedReviewWeights,
               });
               const candidateQcDelta = buildReviewMetricDelta(sourceQcSnapshot, candidateQcSnapshot);
+              const voiceStability = voiceStabilitySession.compare(
+                candidateDecodedForReview
+                  ? {
+                      samples: candidateDecodedForReview.monoSamples,
+                      sampleRate: candidateDecodedForReview.sampleRate,
+                    }
+                  : null,
+              );
               const candidateScore: CandidateScore = {
                 ...candidateBaselineScore,
                 hardGatePenalty: ranking.hardGatePenalty,
@@ -8451,6 +8670,7 @@ const summarizeFailureReason = (error: unknown) => {
                 qcSnapshot: candidateQcSnapshot,
                 qcDelta: candidateQcDelta,
                 alignment,
+                voiceStability,
                 ranking,
                 selectionReason: null,
               });
@@ -8502,7 +8722,7 @@ const summarizeFailureReason = (error: unknown) => {
                 selectedFinalPolishEvidence = candidateFinalPolishEvidence;
                 selectedMeta = candidateMeta;
                 selectedReason = plannerContext.sourcePreservingFallback
-                  ? "source-preserving fallback because the gain planner returned no usable plan; adaptive enhancement not claimed"
+                  ? "Source-preserving fallback: the gain planner returned no usable plan, so no adaptive enhancement or later mastering transform was applied."
                   : "source-first single render; reranking temporarily disabled";
               }
 
@@ -8716,6 +8936,7 @@ const summarizeFailureReason = (error: unknown) => {
               },
             );
             ffmpeg = polishResult.ffmpeg;
+            selectedFinalPolishAuditInput = polishResult.limiterAuditInput;
             if (ffmpeg !== selectedPolishFfmpeg) {
               await writeJobInput(ffmpeg, job);
             }
@@ -8804,6 +9025,14 @@ const summarizeFailureReason = (error: unknown) => {
                     renderedDecodedForReview.sampleRate,
                   )
                 : buildFallbackAlignmentMetrics(sourceDecodedForReview, renderedDecodedForReview);
+            const voiceStability = voiceStabilitySession.compare(
+              renderedDecodedForReview
+                ? {
+                    samples: renderedDecodedForReview.monoSamples,
+                    sampleRate: renderedDecodedForReview.sampleRate,
+                  }
+                : null,
+            );
             const ranking = scoreCandidateWithLearnedWeights({
               baselineScore,
               candidateQc: qcSnapshot,
@@ -8831,6 +9060,7 @@ const summarizeFailureReason = (error: unknown) => {
               qcSnapshot,
               qcDelta: buildReviewMetricDelta(sourceQcSnapshot, qcSnapshot),
               alignment,
+              voiceStability,
               ranking,
               selectionReason: selectionReasonForArtifact,
             };
@@ -8872,6 +9102,7 @@ const summarizeFailureReason = (error: unknown) => {
                 sourceComparison: {
                   alignment: artifact.alignment,
                   qcDelta: artifact.qcDelta,
+                  voiceStability: artifact.voiceStability,
                 },
                 selectionReason: artifact.selectionReason,
               },
@@ -8888,6 +9119,7 @@ const summarizeFailureReason = (error: unknown) => {
                       sourceComparison: {
                         alignment: challenger.alignment,
                         qcDelta: challenger.qcDelta,
+                        voiceStability: challenger.voiceStability,
                       },
                       selectionReason: challenger.selectionReason,
                     },
@@ -8930,6 +9162,23 @@ const summarizeFailureReason = (error: unknown) => {
               },
               selectedReason,
             );
+            if (selectedFinalPolishAuditInput) {
+              appendLog(
+                formatLimiterObservabilityStage(
+                  buildLimiterObservabilityStage({
+                    stageId: `final-polish:${formatCandidateVariant(selectedVariant)}`,
+                    limiterKind: "alimiter",
+                    ceilingDb: -2,
+                    inputTruePeakDb: selectedFinalPolishAuditInput.inputTruePeakDb,
+                    outputTruePeakDb: selectedPostPolishArtifact.qcSnapshot?.inputTP ?? null,
+                    plannedStaticGainDb: selectedFinalPolishAuditInput.plannedStaticGainDb,
+                    notes: [
+                      "Pre/post true peaks come from the existing candidate QC passes; values may represent bounded windows on long files.",
+                    ],
+                  }),
+                ),
+              );
+            }
             selectedFinalPolishEvidence =
               selectedPostPolishArtifact.finalPolishEvidence;
             const postRenderManifest = buildSingleWinnerManifest(selectedPostPolishArtifact, null, selectedReason);
@@ -9046,6 +9295,7 @@ const summarizeFailureReason = (error: unknown) => {
                   ffmpeg = correctiveResult.ffmpeg;
                   let correctiveProcessingFlow: OutputEntry["processingFlow"] =
                     "app";
+                  let correctiveFinalPolishAuditInput: LimiterAuditInput | null = null;
                   if (isAudibilityProtectedRender(correctiveResult.meta)) {
                     appendLog(
                       `[FinalPolish] ${job.base}: skipped corrective final app polish because a source-safe recovery render was selected.`,
@@ -9154,6 +9404,7 @@ const summarizeFailureReason = (error: unknown) => {
                       },
                     );
                     ffmpeg = correctivePolish.ffmpeg;
+                    correctiveFinalPolishAuditInput = correctivePolish.limiterAuditInput;
                     correctiveProcessingFlow = correctivePolish.applied
                       ? "app-final-polish"
                       : "app";
@@ -9170,6 +9421,23 @@ const summarizeFailureReason = (error: unknown) => {
                     correctiveResult.meta,
                     "bounded corrective pass",
                   );
+                  if (correctiveFinalPolishAuditInput) {
+                    appendLog(
+                      formatLimiterObservabilityStage(
+                        buildLimiterObservabilityStage({
+                          stageId: `final-polish-corrective:${formatCandidateVariant(selectedVariant)}`,
+                          limiterKind: "alimiter",
+                          ceilingDb: -2,
+                          inputTruePeakDb: correctiveFinalPolishAuditInput.inputTruePeakDb,
+                          outputTruePeakDb: correctiveArtifact.qcSnapshot?.inputTP ?? null,
+                          plannedStaticGainDb: correctiveFinalPolishAuditInput.plannedStaticGainDb,
+                          notes: [
+                            "Corrective pre/post true peaks reuse existing QC and remain advisory.",
+                          ],
+                        }),
+                      ),
+                    );
+                  }
                   const originalRank = selectedPostPolishArtifact.scoredScore.rankingScore ?? selectedPostPolishArtifact.scoredScore.total;
                   const correctiveRank = correctiveArtifact.scoredScore.rankingScore ?? correctiveArtifact.scoredScore.total;
                   const deliveryDecision = resolveEnhancedDeliveryDecision({
@@ -9668,7 +9936,7 @@ const summarizeFailureReason = (error: unknown) => {
       totalParts: number;
     },
   ) => ({
-    app: "Shorts Projektt Internal VO Optimizer",
+    app: "Shorts Projektt VO Experiment",
     generatedAt,
     totalFiles: outputs.length,
     exportedFiles: manifestOutputs.length,
@@ -9906,7 +10174,7 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={styles.cardHeader}>
             <div className={styles.cardTitleGroup}>
               <h3>Source audio</h3>
-              <p className={styles.cardDescription}>Add the WAV files you want to prepare for delivery.</p>
+              <p className={styles.cardDescription}>Add WAV files to process.</p>
             </div>
           </div>
           <div
@@ -9919,9 +10187,9 @@ const summarizeFailureReason = (error: unknown) => {
             onDragLeave={() => setDragActive(false)}
             onDrop={onDrop}
           >
-            <div className={styles.dropTitle}>Drop WAV files or pick a folder</div>
+            <div className={styles.dropTitle}>Drop WAV files or choose a folder</div>
             <div className={styles.dropHint}>
-              Processing runs locally in the browser. Files never leave this machine.
+              Processing runs in this browser. Files stay on this machine.
             </div>
             <div className={styles.dropHint}>New drops are added to the current queue.</div>
             <div className={styles.controls}>
@@ -9967,7 +10235,7 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={styles.cardHeader}>
             <div className={styles.cardTitleGroup}>
               <h3>Processing profile</h3>
-              <p className={styles.cardDescription}>Set the core behavior while delivery safety checks stay active.</p>
+              <p className={styles.cardDescription}>Choose how the files are processed.</p>
             </div>
           </div>
           <div className={styles.optionGrid}>
@@ -10039,10 +10307,8 @@ const summarizeFailureReason = (error: unknown) => {
             <div>
               <strong>Speech-aware leveler</strong>
               <div className={styles.label}>
-                Plans a gain curve from the actual sentences before any compressor runs. This is the core
-                fix for sudden volume spikes. Classifies breaths and short onomatopoeia runs separately so
-                they sit with the performance instead of spiking above it. Files over 80 minutes use
-                the same planner in memory-bounded, chunk-local parts.
+                Smooths sentence volume while keeping breaths and onomatopoeia natural. Long files are
+                processed in memory-safe chunks.
               </div>
             </div>
             <input
@@ -10055,8 +10321,7 @@ const summarizeFailureReason = (error: unknown) => {
             <div>
               <strong>Cinematic color</strong>
               <div className={styles.label}>
-                Subtle bounded warmth, intelligibility, and edge control that continuously adapts to the
-                measured source, existing tone moves, room, echo, and performance emotion.
+                Adds a light, source-aware tone pass for warmth and clarity.
               </div>
             </div>
             <input
@@ -10089,7 +10354,9 @@ const summarizeFailureReason = (error: unknown) => {
               <label className={styles.toggleRow}>
                 <div>
                   <strong>EQ cleanup</strong>
-                  <div className={styles.label}>HPF + small low-mid shaping for consistency</div>
+                  <div className={styles.label}>
+                    Light high-pass and low-mid cleanup that continuously adapts to the measured source.
+                  </div>
                 </div>
                 <input
                   type="checkbox"
@@ -10101,8 +10368,7 @@ const summarizeFailureReason = (error: unknown) => {
                 <div>
                   <strong>Soften harshness</strong>
                   <div className={styles.label}>
-                    Cuts only measured presence and top-end harshness on bright or emotional lines;
-                    clean sources receive no fixed darkening.
+                    Cuts only measured presence and top-end harshness.
                   </div>
                 </div>
                 <input
@@ -10115,7 +10381,7 @@ const summarizeFailureReason = (error: unknown) => {
                 <div>
                   <strong>Room cleanup (auto detect)</strong>
                   <div className={styles.label}>
-                    Reduces mild room echo/reverb only when needed.
+                    Reduces mild room sound when detected.
                   </div>
                 </div>
                 <input
@@ -10128,8 +10394,7 @@ const summarizeFailureReason = (error: unknown) => {
                 <div>
                   <strong>Scene fit (dry-safe tone)</strong>
                   <div className={styles.label}>
-                    Adds only a tiny source-adaptive tonal fit so VO sits in-picture; it never adds
-                    delayed reflections. Off by default.
+                    Adds a small dry tone match for picture work; never adds delayed reflections.
                   </div>
                 </div>
                 <input
@@ -10142,8 +10407,7 @@ const summarizeFailureReason = (error: unknown) => {
                 <div>
                   <strong>Keep silences clean (expander + NR)</strong>
                   <div className={styles.label}>
-                    Enables the speech-aware expander on the leveler path, and chains measured-SNR
-                    spectral NR (afftdn + anlmdn when severe). Previously labeled &quot;Noise guard&quot;.
+                    Keeps pauses quiet with speech-aware expansion and measured noise reduction.
                   </div>
                 </div>
                 <input
@@ -10156,8 +10420,7 @@ const summarizeFailureReason = (error: unknown) => {
                 <div>
                   <strong>Floor guard</strong>
                   <div className={styles.label}>
-                    Legacy downward curve on the tail. Superseded by the speech-aware expander when the
-                    new leveler is on, but still useful as a safety net on very long or very noisy takes.
+                    Extra tail cleanup for very long or noisy takes.
                   </div>
                 </div>
                 <input
@@ -10171,7 +10434,7 @@ const summarizeFailureReason = (error: unknown) => {
                   <div>
                     <strong>Review reranker</strong>
                     <div className={styles.label}>
-                      Temporarily paused. The current pipeline renders the AI-selected source-first variant once.
+                      Paused. The app renders one selected source-first pass.
                     </div>
                   </div>
                   <span className={styles.reviewModelBadge}>
@@ -10245,7 +10508,7 @@ const summarizeFailureReason = (error: unknown) => {
           </div>
 
           <div className={styles.footerNote}>
-            Processing order is tuned to avoid processor clashes.
+            Processing order is fixed to keep stages from fighting each other.
           </div>
         </div>
       </div>
@@ -10254,7 +10517,7 @@ const summarizeFailureReason = (error: unknown) => {
         <div className={styles.queueHeader}>
           <div className={styles.cardTitleGroup}>
             <h3>Batch queue</h3>
-            <p className={styles.cardDescription}>Follow each file from analysis through final delivery checks.</p>
+            <p className={styles.cardDescription}>Track each file as it runs.</p>
           </div>
           {queueCounts.total > 0 && (
             <div className={styles.queueSummaryBadges}>
@@ -10279,7 +10542,7 @@ const summarizeFailureReason = (error: unknown) => {
 
         <div className={styles.sectionTop}>
           {queueItems.length === 0 ? (
-            <div className={styles.dropHint}>No batch queue yet. Add files and run processing.</div>
+            <div className={styles.dropHint}>No queue yet. Add files and run the batch.</div>
           ) : (
             <>
               <div className={styles.queueActiveBar}>
@@ -10367,7 +10630,7 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={styles.cardHeader}>
             <div className={styles.cardTitleGroup}>
               <h3>Deliverables</h3>
-              <p className={styles.cardDescription}>Download prepared WAV files and review bundles.</p>
+              <p className={styles.cardDescription}>Download WAV files and review bundles.</p>
             </div>
           </div>
           {(outputs.length > 0 || reviewBundles.length > 0) && (
@@ -10422,18 +10685,18 @@ const summarizeFailureReason = (error: unknown) => {
             {outputs.length === 0 && <div className={styles.dropHint}>No output yet.</div>}
             {outputs.map((output, index) => {
               const outputHelpText = output.sourceSafeRecovery
-                ? "Enhanced linear recovery: adaptive review requested one limiter-on, dynamics-off single-pass render from the decoded source. Normal profile high-pass, planner, compression, gating, and later mastering transforms were excluded."
+                ? "Enhanced linear recovery: one direct render from the decoded source, with later mastering skipped."
                 : output.protectedRecovery
-                ? "Protected recovery: an audibility-safe recovery render was selected and kept unchanged through later mastering transforms."
+                ? "Protected recovery: the safer render was kept unchanged."
                 : output.sourcePreservingFallback
                 ? "Source-preserving fallback: the gain planner returned no usable plan, so no adaptive enhancement or later mastering transform was applied."
                 : output.kind === "mixready"
                 ? output.variant === "blend"
-                  ? "Blend mix-ready: subtle scene glue applied; not loudness-normalized."
-                  : "Mix-ready: processed and leveled, but not loudness-normalized. Best for film mix stems."
+                  ? "Blend mix-ready: light scene tone, not loudness-normalized."
+                  : "Mix-ready: leveled WAV for film mix stems."
                 : output.variant === "blend"
-                  ? "Broadcast loudness + blend: subtle scene glue plus ATSC A/85 or EBU R128 normalization."
-                  : "Broadcast loudness: normalized to ATSC A/85 or EBU R128. Use for delivery or QC.";
+                  ? "Broadcast + blend: scene tone with loudness normalization."
+                  : "Broadcast: loudness-normalized WAV for delivery or QC.";
 
               return (
                 <div className={styles.outputItem} key={`${output.name}-${output.size}-${index}`}>
@@ -10501,14 +10764,14 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={styles.cardHeader}>
             <div className={styles.cardTitleGroup}>
               <h3>Activity log</h3>
-              <p className={styles.cardDescription}>Detailed processing evidence for troubleshooting and review.</p>
+              <p className={styles.cardDescription}>Processing details for review.</p>
             </div>
           </div>
           <div className={`${styles.log} ${styles.sectionTop}`}>
             {logs.length === 0 ? "No logs yet." : logs.join("\n")}
           </div>
           <div className={styles.footerNote}>
-            If processing feels slow, run a smaller batch or disable extra features.
+            For faster runs, use a smaller batch or fewer extras.
           </div>
         </div>
       </div>
@@ -10523,9 +10786,9 @@ const summarizeFailureReason = (error: unknown) => {
           onKeyDown={handleFailureWarningKeyDown}
         >
           <div className={styles.warningCard}>
-            <h3 id="failed-title">Some files need re-submission</h3>
+            <h3 id="failed-title">Some files need another run</h3>
             <p className={styles.warningText} id="failed-description">
-              Some audio files failed to optimize on this run. Please re-submit only these files and run again.
+              Re-submit only the files listed below.
             </p>
             <div className={styles.warningList}>
               {failedOptimizations.map((item, index) => (

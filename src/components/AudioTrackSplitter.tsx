@@ -143,7 +143,7 @@ export default function AudioTrackSplitter() {
     const wavs = allFiles.filter((file) => file.name.toLowerCase().endsWith(".wav"));
     const rejected = allFiles.length - wavs.length;
     if (rejected > 0) {
-      setError(`${rejected} unsupported file(s) ignored. Audio Track Splitter accepts .wav files only.`);
+      setError(`${rejected} unsupported file(s) ignored. Use WAV files only.`);
     } else {
       setError(null);
     }
@@ -323,7 +323,7 @@ export default function AudioTrackSplitter() {
           <div className={styles.cardHeader}>
             <div className={styles.cardTitleGroup}>
               <h3>Source tracks</h3>
-              <p className={styles.cardDescription}>Add mixed WAV files to separate dialogue and background audio.</p>
+              <p className={styles.cardDescription}>Add mixed WAV files.</p>
             </div>
           </div>
           <div
@@ -336,13 +336,13 @@ export default function AudioTrackSplitter() {
             onDragLeave={() => setDragActive(false)}
             onDrop={onDrop}
           >
-            <div className={styles.dropTitle}>Drop WAV tracks for stem splitting</div>
+            <div className={styles.dropTitle}>Drop WAV tracks</div>
             <div className={styles.dropHint}>
-              Batch upload shorts drama mixes and export clean BGM and VOCAL stems in one ZIP.
+              Export dialogue and background stems in one ZIP.
             </div>
             <div className={styles.controls}>
               <label className={styles.button}>
-                Select WAV Files
+                Select WAV files
                 <input
                   type="file"
                   accept=".wav"
@@ -378,7 +378,7 @@ export default function AudioTrackSplitter() {
         <div className={styles.card}>
           <div className={styles.cardHeader}>
             <div className={styles.cardTitleGroup}>
-              <h3>Stem export</h3>
+              <h3>Export</h3>
               <p className={styles.cardDescription}>Each source produces a matched background and vocal WAV.</p>
             </div>
           </div>
@@ -388,7 +388,7 @@ export default function AudioTrackSplitter() {
           </div>
           <div className={`${styles.controls} ${styles.sectionTop}`}>
             <button type="button" className={styles.button} onClick={runSplitter} disabled={busy || files.length === 0}>
-              {busy ? "Splitting..." : "Run Audio Splitter"}
+              {busy ? "Splitting..." : "Run splitter"}
             </button>
             {zipBlob && (
               <button
@@ -403,7 +403,7 @@ export default function AudioTrackSplitter() {
           </div>
           <div className={styles.footerNote}>
             Real separation runs on the configured local RoFormer engine. First run may download the model;
-            CUDA acceleration is strongly recommended for drama-length tracks. The ZIP always includes split_report.txt.
+            Long tracks run faster with CUDA. The ZIP includes split_report.txt.
           </div>
           {error && <div className={styles.errorBox}>{error}</div>}
         </div>
@@ -412,7 +412,7 @@ export default function AudioTrackSplitter() {
       <div className={styles.card}>
         <div className={styles.queueHeader}>
           <div className={styles.cardTitleGroup}>
-            <h3>Splitter queue</h3>
+            <h3>Queue</h3>
             <p className={styles.cardDescription}>Track each file through separation and packaging.</p>
           </div>
           {queueCounts.total > 0 && (
@@ -427,7 +427,7 @@ export default function AudioTrackSplitter() {
         </div>
         <div className={styles.queueList}>
           {queueItems.length === 0 ? (
-            <div className={styles.dropHint}>No splitter queue yet. Add WAV files and run the splitter.</div>
+            <div className={styles.dropHint}>No queue yet. Add WAV files and run splitter.</div>
           ) : (
             queueItems.map((item, index) => {
               const statusClass =
@@ -470,7 +470,7 @@ export default function AudioTrackSplitter() {
           <div className={styles.queueHeader}>
             <div className={styles.cardTitleGroup}>
               <h3>Split report</h3>
-              <p className={styles.cardDescription}>Output names, signal checks, and worker warnings.</p>
+              <p className={styles.cardDescription}>Output names, checks, and warnings.</p>
             </div>
             <div className={styles.reportMeta}>
               {report.engine} - {report.succeeded} succeeded / {report.failed} failed

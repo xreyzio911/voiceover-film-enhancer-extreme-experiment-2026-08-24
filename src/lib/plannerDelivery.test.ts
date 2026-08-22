@@ -83,6 +83,8 @@ const safetyEvidence = (
   nearSpeechFloorDb: -72,
   nearSpeechFloorConfidence: 0.9,
   samplePeakDb: -14,
+  activityPeakDb: null,
+  activityPlateauDb: null,
   ...overrides,
 });
 
@@ -92,6 +94,8 @@ test("scene blend derives continuous conservative delivery evidence without deco
       nonzeroQuietBedDb: -70,
       nearSpeechFloorDb: -66,
       samplePeakDb: -12,
+      activityPeakDb: -12,
+      activityPlateauDb: -30,
     }),
   );
   const snapshot = JSON.stringify(input);
@@ -128,6 +132,16 @@ test("scene blend derives continuous conservative delivery evidence without deco
     `blend peak evidence must remain a conservative limiter-bounded upper envelope, got ${String(blended.samplePeakDb)}`,
   );
   assert.ok(
+    blended.activityPeakDb !== null &&
+      blended.activityPeakDb !== undefined &&
+      blended.activityPlateauDb !== null &&
+      blended.activityPlateauDb !== undefined &&
+      Math.abs(
+        (blended.activityPeakDb - blended.activityPlateauDb) - 18,
+      ) < 1e-9,
+    "the conservative blend envelope must preserve level-invariant crest prominence",
+  );
+  assert.ok(
     Math.abs(
       (nearby.nonzeroQuietBedDb as number) -
         (blended.nonzeroQuietBedDb as number),
@@ -142,6 +156,30 @@ test("scene blend derives continuous conservative delivery evidence without deco
       outdoorGain: 0.055,
     }),
     null,
+  );
+});
+
+test("scene blend preserves activity crest prominence when its peak envelope reaches the limiter ceiling", () => {
+  const blended = resolveBlendDeliverySafetyEvidence({
+    inputSafetyEvidence: safetyEvidence({
+      nonzeroQuietBedDb: -72,
+      nearSpeechFloorDb: -68,
+      samplePeakDb: -1,
+      activityPeakDb: -1,
+      activityPlateauDb: -19,
+    }),
+    indoorGain: 0.2,
+    outdoorGain: 0.1,
+    limiterCeilingDb: -2,
+  });
+
+  assert.ok(blended);
+  assert.equal(blended.activityPeakDb, -2);
+  assert.ok(
+    blended.activityPlateauDb !== null &&
+      blended.activityPlateauDb !== undefined &&
+      Math.abs((blended.activityPeakDb - blended.activityPlateauDb) - 18) < 1e-9,
+    `limiter-bounded blend evidence must retain the source crest, got ${String(blended.activityPeakDb)} / ${String(blended.activityPlateauDb)}`,
   );
 });
 
@@ -266,6 +304,12 @@ test("delivery safety evidence finds a persistent nonzero bed even when the spee
   );
   assert.ok(measured.nearSpeechFloorConfidence > 0.3);
   assert.ok(Math.abs((measured.samplePeakDb ?? -120) - -4) < 0.01);
+  assert.ok(
+    measured.activityPeakDb !== null &&
+      measured.activityPeakDb !== undefined &&
+      measured.activityPeakDb < -27,
+    `speech-localized expressive crest evidence should use robust frame peaks, got ${String(measured.activityPeakDb)}`,
+  );
   assert.deepEqual(fixture.samples, beforeSamples, "measurement must not mutate decoded samples");
   assert.deepEqual(fixture.activityMask, beforeMask, "measurement must not mutate the shared speech mask");
 });
@@ -312,6 +356,8 @@ test("exact digital silence is exempt from nonzero-bed evidence", () => {
     nearSpeechFloorDb: null,
     nearSpeechFloorConfidence: 0,
     samplePeakDb: null,
+    activityPeakDb: null,
+    activityPlateauDb: null,
   });
 });
 
@@ -331,6 +377,74 @@ test("delivery safety evidence measures the exact decoded peak beyond a shorter 
     measured.samplePeakDb,
     0,
     "limiter headroom must use the whole decoded buffer, not only mask-covered frames",
+  );
+  assert.ok(
+    measured.activityPeakDb !== null &&
+      measured.activityPeakDb !== undefined &&
+      measured.activityPeakDb < -59.9,
+    `speech-localized crest evidence must exclude the later non-speech impulse, got ${String(measured.activityPeakDb)}`,
+  );
+});
+
+test("delivery safety evidence uses a robust speech-frame peak for expressive crest", () => {
+  const sampleRate = 10_000;
+  const frameMs = 10;
+  const frameCount = 200;
+  const samplesPerFrame = (sampleRate * frameMs) / 1_000;
+  const samples = new Float32Array(frameCount * samplesPerFrame);
+  const activityMask = new Array<boolean>(frameCount).fill(true);
+
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    fillAlternatingFrame(samples, frame, samplesPerFrame, -42);
+    samples[frame * samplesPerFrame] = dbToAmplitude(-24);
+  }
+  samples[80 * samplesPerFrame] = dbToAmplitude(-4);
+
+  const measured = measurePlannerDeliverySafetyEvidence(
+    samples,
+    sampleRate,
+    activityMask,
+    frameMs,
+  );
+
+  assert.ok(Math.abs((measured.samplePeakDb ?? -120) - -4) < 0.01);
+  assert.ok(
+    measured.activityPeakDb !== null &&
+      measured.activityPeakDb !== undefined &&
+      measured.activityPeakDb < -20 &&
+      measured.activityPeakDb > -28,
+    `speech crest evidence should ignore a single-frame click, got ${String(measured.activityPeakDb)}`,
+  );
+});
+
+test("speech-localized crest evidence ignores a single in-speech click", () => {
+  const sampleRate = 1_000;
+  const frameMs = 10;
+  const frameCount = 100;
+  const samplesPerFrame = (sampleRate * frameMs) / 1_000;
+  const samples = new Float32Array(frameCount * samplesPerFrame);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    fillAlternatingFrame(samples, frame, samplesPerFrame, -24);
+  }
+  samples[17 * samplesPerFrame] = dbToAmplitude(-1);
+
+  const measured = measurePlannerDeliverySafetyEvidence(
+    samples,
+    sampleRate,
+    new Array<boolean>(frameCount).fill(true),
+    frameMs,
+  );
+
+  assert.ok(
+    Math.abs((measured.samplePeakDb ?? -120) - -1) < 0.01,
+    "whole-buffer peak evidence must still retain the real limiter peak",
+  );
+  assert.ok(
+    measured.activityPeakDb !== null &&
+      measured.activityPeakDb !== undefined &&
+      measured.activityPeakDb < -22 &&
+      measured.activityPeakDb > -26,
+    `speech-localized crest evidence should use robust frame-peak evidence, got ${String(measured.activityPeakDb)}`,
   );
 });
 
@@ -420,6 +534,148 @@ test("clean low-floor evidence preserves requested makeup while peak evidence li
   assert.ok(
     Math.abs(peakLimited - 2) < 1e-9,
     `static gain may drive the -2 dB limiter by at most 1.5 dB, got ${peakLimited}`,
+  );
+});
+
+test("only speech-localized expressive crest prominence continuously reduces delivery limiter drive", () => {
+  const cleanRendered = safetyEvidence({
+    nonzeroQuietBedDb: -81,
+    nearSpeechFloorDb: -75,
+    samplePeakDb: -3.0,
+  });
+  const ordinarySource = safetyEvidence({
+    nonzeroQuietBedDb: -82,
+    nearSpeechFloorDb: -76,
+    samplePeakDb: -3.25,
+    activityPeakDb: -3.25,
+    activityPlateauDb: -6.5,
+  });
+  const quietExpressiveSource = safetyEvidence({
+    nonzeroQuietBedDb: -82,
+    nearSpeechFloorDb: -76,
+    samplePeakDb: -20,
+    activityPeakDb: -20,
+    activityPlateauDb: -46,
+  });
+  const hotExpressiveSource = safetyEvidence({
+    nonzeroQuietBedDb: -82,
+    nearSpeechFloorDb: -76,
+    samplePeakDb: -3.25,
+    activityPeakDb: -3.25,
+    activityPlateauDb: -29.25,
+  });
+  const hotNonSpeechPeakSource = safetyEvidence({
+    nonzeroQuietBedDb: -82,
+    nearSpeechFloorDb: -76,
+    samplePeakDb: -3.25,
+    activityPeakDb: -20,
+    activityPlateauDb: -46,
+  });
+  const hotterExpressiveSource = {
+    ...quietExpressiveSource,
+    samplePeakDb: -19.99,
+    activityPeakDb: -19.99,
+    activityPlateauDb: -45.99,
+  };
+
+  const ordinaryGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 8,
+    sourceSafetyEvidence: ordinarySource,
+    renderedSafetyEvidence: cleanRendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const expressiveGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 8,
+    sourceSafetyEvidence: quietExpressiveSource,
+    renderedSafetyEvidence: cleanRendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const hotExpressiveGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 8,
+    sourceSafetyEvidence: hotExpressiveSource,
+    renderedSafetyEvidence: cleanRendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const nonSpeechPeakGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 8,
+    sourceSafetyEvidence: hotNonSpeechPeakSource,
+    renderedSafetyEvidence: cleanRendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+  const nearbyExpressiveGain = resolveSafePositiveDeliveryGainDb({
+    requestedGainDb: 8,
+    sourceSafetyEvidence: hotterExpressiveSource,
+    renderedSafetyEvidence: cleanRendered,
+    limiterCeilingDb: -2,
+    allowedLimiterDriveDb: 1.5,
+  });
+
+  assert.ok(
+    ordinaryGain > expressiveGain,
+    `ordinary hot speech can spend more limiter drive than a quiet expressive crest (${ordinaryGain} vs ${expressiveGain})`,
+  );
+  assert.ok(
+    Math.abs(hotExpressiveGain - expressiveGain) < 1e-9,
+    `equal crest prominence must receive equal protection regardless of recording level (${hotExpressiveGain} vs ${expressiveGain})`,
+  );
+  assert.equal(
+    nonSpeechPeakGain,
+    ordinaryGain,
+    "an inactive click or bed spike must fail open to the established limiter-drive allowance",
+  );
+  assert.ok(
+    expressiveGain >= 1.2 && expressiveGain <= 1.35,
+    `expressive crest prominence should keep positive makeup but avoid the full 1.5 dB drive, got ${expressiveGain}`,
+  );
+  assert.ok(
+    Math.abs(nearbyExpressiveGain - expressiveGain) < 0.02,
+    `0.01 dB source-crest changes must remain continuous: ${expressiveGain} -> ${nearbyExpressiveGain}`,
+  );
+});
+
+test("delivery crest protection starts above the measured plain-dialogue corpus center", () => {
+  const rendered = safetyEvidence({
+    nonzeroQuietBedDb: -81,
+    nearSpeechFloorDb: -75,
+    samplePeakDb: -3,
+  });
+  const withoutCrestEvidence = safetyEvidence({
+    nonzeroQuietBedDb: -82,
+    nearSpeechFloorDb: -76,
+    samplePeakDb: -20,
+  });
+  const corpusMedianDialogue = safetyEvidence({
+    ...withoutCrestEvidence,
+    activityPeakDb: -20,
+    activityPlateauDb: -39.4,
+  });
+  const upperTailExpression = safetyEvidence({
+    ...withoutCrestEvidence,
+    activityPeakDb: -20,
+    activityPlateauDb: -45,
+  });
+  const gainFor = (sourceSafetyEvidence: PlannerDeliverySafetyEvidence) =>
+    resolveSafePositiveDeliveryGainDb({
+      requestedGainDb: 8,
+      sourceSafetyEvidence,
+      renderedSafetyEvidence: rendered,
+      limiterCeilingDb: -2,
+      allowedLimiterDriveDb: 1.5,
+    });
+
+  const ordinaryGain = gainFor(withoutCrestEvidence);
+  assert.equal(
+    gainFor(corpusMedianDialogue),
+    ordinaryGain,
+    "the measured 19.4 dB corpus median must not be treated as an expressive crest",
+  );
+  assert.ok(
+    gainFor(upperTailExpression) < ordinaryGain - 1,
+    "a 25 dB upper-tail crest should retain strong limiter protection",
   );
 });
 

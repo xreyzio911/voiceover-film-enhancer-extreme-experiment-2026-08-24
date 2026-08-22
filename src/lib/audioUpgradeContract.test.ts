@@ -394,9 +394,9 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "the memory-bounded long-form limitation must remain explicit and observable",
   );
   assertMarkersInOrder(batchAlignmentBlock, [
-    "const speechLevelDb = await measureBatchSpeechLevelDbFromBlob(",
+    "const speechEvidence = await measureBatchSpeechLevelDbFromBlob(",
     "target.entry.blob",
-    "values.push(speechLevelDb)",
+    "values.push(speechEvidence)",
     "planBatchSpeechAlignment(groupMeasurements)",
   ]);
   assert.doesNotMatch(
@@ -416,7 +416,9 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "renderedSafetyEvidence:",
     "recycleBeforeFullBlobCopy(target.entry, \"render\")",
     "`volume=${authorizedOffsetDb.toFixed(2)}dB",
-    "const afterSpeechLevelDb = await measureBatchSpeechLevelDbFromVirtualWav(",
+    "const afterSpeechEvidence = await measureBatchSpeechLevelDbFromVirtualWav(",
+    "const afterAlignmentLevelDb = afterSpeechEvidence",
+    "resolveBatchSpeechAlignmentLevelDb(afterSpeechEvidence)",
     "const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName)",
   ]);
   assertMarkersInOrder(batchSpeechEvidenceBlock, [
@@ -424,8 +426,22 @@ test("planner delivery uses the existing speech mask and the selected pre-polish
     "measureFinalPolishEvidenceFromVirtualWav(",
     "window.startSec",
     "window.durationSec",
-    "percentile(speechLevelsDb, 50)",
+    "speechBodyPlateauDb: evidence?.speechBodyPlateauDb ?? null",
+    "summarizeBatchSpeechLevelEvidence(speechWindows)",
   ]);
+  assertMarkersInOrder(processFilesBlock, [
+    "const voiceStabilitySession =",
+    "createVoiceStabilityObservabilitySourceSession({",
+    "source: sourceDecodedForReview",
+    "const voiceStability = voiceStabilitySession.compare(",
+    "renderedDecodedForReview",
+    "voiceStability: artifact.voiceStability",
+  ]);
+  assert.equal(
+    processFilesBlock.match(/voiceStabilitySession\.compare\(/g)?.length,
+    2,
+    "candidate and post-polish snapshots must reuse one prepared per-job source session",
+  );
   assert.doesNotMatch(
     batchSpeechEvidenceBlock,
     /toFloatSamples\(rawBytes\)[\s\S]*?durationSec\)/,

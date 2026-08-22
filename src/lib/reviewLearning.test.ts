@@ -74,6 +74,15 @@ const sourceQc = toReviewMetricSnapshot({
   noiseContrastDb: 28,
 });
 
+test("review metrics retain speech-selected K-weighted energy for audition matching", () => {
+  const snapshot = toReviewMetricSnapshot({
+    inputI: -23.1,
+    speechKWeightedEnergyDb: -25.4,
+  });
+
+  assert.equal(snapshot?.speechKWeightedEnergyDb, -25.4);
+});
+
 const buildManifest = (bundleId: string): ReviewBundleManifest => {
   const winnerQc = toReviewMetricSnapshot({
     inputTP: -2.1,
@@ -155,6 +164,7 @@ const buildManifest = (bundleId: string): ReviewBundleManifest => {
         sourceComparison: {
           alignment: winnerAlignment,
           qcDelta: buildReviewMetricDelta(sourceQc, winnerQc),
+          voiceStability: null,
         },
         selectionReason: "better score",
       },
@@ -169,6 +179,7 @@ const buildManifest = (bundleId: string): ReviewBundleManifest => {
         sourceComparison: {
           alignment: challengerAlignment,
           qcDelta: buildReviewMetricDelta(sourceQc, challengerQc),
+          voiceStability: null,
         },
         selectionReason: null,
       },
@@ -1089,4 +1100,49 @@ test("autoReviewBundle fails when rendered cold-open dip is severe and newly wor
   assert.equal(auto.finalVerdict, "fail");
   assert.ok(auto.issueTags.includes("cold_open_dip"));
   assert.match(coldOpenCheck?.detail ?? "", /3\.1 dB/);
+});
+
+test("advisory voice-stability evidence cannot change ranking or automated review decisions", () => {
+  const baselineManifest = buildManifest("bundle-advisory-stability-baseline");
+  const advisoryManifest = buildManifest("bundle-advisory-stability-baseline");
+  const advisorySnapshot = {
+    schemaVersion: 1 as const,
+    advisoryOnly: true as const,
+    measurementStatus: "unavailable" as const,
+    report: null,
+    notes: ["Advisory evidence intentionally unavailable in this fixture."],
+  };
+  for (const candidate of advisoryManifest.candidates) {
+    candidate.sourceComparison.voiceStability = advisorySnapshot;
+  }
+
+  assert.deepEqual(
+    autoReviewBundle(advisoryManifest),
+    autoReviewBundle(baselineManifest),
+    "voice-stability telemetry must remain outside auto-review and corrective control paths",
+  );
+});
+
+test("legacy schema-v1 manifests may omit voice-stability evidence without changing review decisions", () => {
+  const baselineManifest = buildManifest("bundle-legacy-advisory-stability");
+  const legacyManifest: ReviewBundleManifest = {
+    ...baselineManifest,
+    candidates: baselineManifest.candidates.map((candidate) => ({
+      ...candidate,
+      sourceComparison: {
+        alignment: candidate.sourceComparison.alignment,
+        qcDelta: candidate.sourceComparison.qcDelta,
+      },
+    })),
+  };
+
+  assert.equal(
+    "voiceStability" in legacyManifest.candidates[0].sourceComparison,
+    false,
+  );
+  assert.deepEqual(
+    autoReviewBundle(legacyManifest),
+    autoReviewBundle(baselineManifest),
+    "missing schema-v1 advisory telemetry must remain compatible and decision-neutral",
+  );
 });

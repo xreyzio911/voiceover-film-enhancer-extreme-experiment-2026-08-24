@@ -34,6 +34,7 @@ import {
   type ReviewVerdict,
 } from "../lib/reviewLearning";
 import { triggerBrowserDownload } from "../lib/downloadBlob";
+import ReviewAuditionPanel from "./ReviewAuditionPanel";
 import styles from "./QcReportLab.module.css";
 
 const QC_STREAMING_WAV_THRESHOLD_BYTES = 64 * 1024 * 1024;
@@ -830,11 +831,11 @@ export default function QcReportLab() {
             aria-pressed={mode === "review"}
             onClick={() => setMode("review")}
           >
-            Review Mode
+            Review
           </button>
         </div>
         <p className={styles.footerNote}>
-          Analyze mode checks raw WAVs directly. Review mode scores optimizer bundles locally and exports JSONL labels for offline training.
+          Analyze checks WAVs. Review labels exported bundles and saves JSONL for training.
         </p>
       </div>
 
@@ -851,13 +852,13 @@ export default function QcReportLab() {
                 onDragLeave={() => setDragActive(false)}
                 onDrop={onDrop}
               >
-                <div className={styles.dropTitle}>Drop WAV files for QC analysis</div>
+                <div className={styles.dropTitle}>Drop WAV files</div>
                 <div className={styles.dropHint}>
-                  Analyze + QC report runs locally in this browser. No file is uploaded anywhere.
+                  QC runs in this browser. Files stay on this machine.
                 </div>
                 <div className={styles.controls}>
                   <label className={styles.button}>
-                    Select Files
+                    Select files
                     <input
                       type="file"
                       accept=".wav"
@@ -870,7 +871,7 @@ export default function QcReportLab() {
                     />
                   </label>
                   <button className={styles.buttonSecondary} onClick={runAnalysis} disabled={loading || files.length === 0}>
-                    {loading ? "Analyzing..." : "Run Analyze + QC"}
+                    {loading ? "Analyzing..." : "Run QC"}
                   </button>
                   <button className={styles.buttonGhost} onClick={downloadReportJson} disabled={reports.length === 0}>
                     Download JSON
@@ -906,14 +907,14 @@ export default function QcReportLab() {
                 <span>{comparisons.filter((pair) => pair.deltaRisk > 0.05).length} regressed pair(s)</span>
               </div>
               <div className={styles.badges}>
-                <span className={styles.badge}>Instability risk</span>
-                <span className={styles.badge}>Onset / sag / end-fade risks</span>
-                <span className={styles.badge}>Noise lift risk</span>
-                <span className={styles.badge}>Click + echo risks</span>
-                <span className={styles.badge}>Compression risk</span>
+                <span className={styles.badge}>Stability</span>
+                <span className={styles.badge}>Edges</span>
+                <span className={styles.badge}>Noise lift</span>
+                <span className={styles.badge}>Clicks + echo</span>
+                <span className={styles.badge}>Compression</span>
               </div>
               <p className={styles.footerNote}>
-                Use this page as a local diagnostics lab before final production runs.
+                Run local checks before final export.
               </p>
             </div>
           </div>
@@ -1154,7 +1155,7 @@ export default function QcReportLab() {
 
           {hasWarnings && (
             <div className={styles.warningBanner} role="alert">
-              QC warnings found. Review flagged files before production export.
+              QC warnings found. Review flagged files before export.
             </div>
           )}
         </>
@@ -1165,7 +1166,7 @@ export default function QcReportLab() {
               <div className={styles.dropzone}>
                 <div className={styles.dropTitle}>Import review bundle ZIPs</div>
                 <div className={styles.dropHint}>
-                  These bundles come from the optimizer export. Review stays local in this browser and exports JSONL labels for offline training.
+                  Review stays in this browser and exports JSONL labels for training.
                 </div>
                 <div className={styles.controls}>
                   <label className={styles.button}>
@@ -1203,7 +1204,7 @@ export default function QcReportLab() {
                     onClick={trainReviewModelInBrowser}
                     disabled={completedReviewRecords.length === 0 || reviewTrainingBusy}
                   >
-                    {reviewTrainingBusy ? "Training..." : "Train + Apply"}
+                    {reviewTrainingBusy ? "Training..." : "Train and apply"}
                   </button>
                   <button
                     type="button"
@@ -1221,7 +1222,7 @@ export default function QcReportLab() {
             </div>
 
             <div className={styles.card}>
-              <h3>Review Summary</h3>
+              <h3>Review summary</h3>
               <div className={styles.summaryRow}>
                 <span>{reviewSummary.total} bundle(s)</span>
                 <span>{reviewSummary.completed} labeled / {reviewSummary.pending} pending</span>
@@ -1242,17 +1243,17 @@ export default function QcReportLab() {
                 ))}
               </div>
               <p className={styles.footerNote}>
-                Required labels are final verdict plus issue tags. A/B winner, confidence, and notes are optional but improve the trainer signal.
-                Auto-review all performs a detailed technical pass first. Train + Apply writes `review-weights.json` into this browser&apos;s local storage so the optimizer can use it immediately.
+                Required labels: verdict and issue tags. A/B winner, confidence, and notes improve training.
+                Auto-review all runs a technical pass first. Train and apply saves `review-weights.json` in this browser.
               </p>
             </div>
           </div>
 
           <div className={styles.card}>
-            <h3>Bundle Review Queue</h3>
+            <h3>Review queue</h3>
             {reviewBundles.length === 0 ? (
               <div className={styles.emptyState}>
-                Import a review bundle ZIP from the optimizer to start labeling source, winner, and challenger candidates.
+                Import a review bundle ZIP to compare and label its audio candidates.
               </div>
             ) : (
               <div className={styles.reportList}>
@@ -1309,40 +1310,13 @@ export default function QcReportLab() {
                         </div>
                       </div>
 
-                      <div className={styles.reviewAudioGrid}>
-                        <div className={styles.audioCard}>
-                          <div className={styles.sectionTitle}>Source</div>
-                          <audio
-                            controls
-                            preload="metadata"
-                            src={bundle.sourceUrl}
-                            className={styles.audioPlayer}
-                            aria-label={`Source audio for ${bundle.manifest.source.fileName}`}
-                          />
-                        </div>
-                        <div className={styles.audioCard}>
-                          <div className={styles.sectionTitle}>Winner</div>
-                          <audio
-                            controls
-                            preload="metadata"
-                            src={bundle.winnerUrl}
-                            className={styles.audioPlayer}
-                            aria-label={`Winner audio for ${bundle.manifest.source.fileName}`}
-                          />
-                        </div>
-                        {bundle.challengerUrl && challenger && (
-                          <div className={styles.audioCard}>
-                            <div className={styles.sectionTitle}>Challenger</div>
-                            <audio
-                              controls
-                              preload="metadata"
-                              src={bundle.challengerUrl}
-                              className={styles.audioPlayer}
-                              aria-label={`Challenger audio for ${bundle.manifest.source.fileName}`}
-                            />
-                          </div>
-                        )}
-                      </div>
+                      <ReviewAuditionPanel
+                        key={bundle.manifest.bundleId}
+                        manifest={bundle.manifest}
+                        sourceUrl={bundle.sourceUrl}
+                        winnerUrl={bundle.winnerUrl}
+                        challengerUrl={bundle.challengerUrl}
+                      />
 
                       <div className={styles.reviewCandidateGrid}>
                         {bundle.manifest.candidates.map((candidate) => (

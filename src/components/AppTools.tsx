@@ -8,8 +8,8 @@ import styles from "./AppTools.module.css";
 type ToolId = "vo-leveler" | "audio-splitter";
 
 const TOOLS: { id: ToolId; label: string; description: string }[] = [
-  { id: "vo-leveler", label: "VO Optimizer", description: "Level, review, and export dialogue" },
-  { id: "audio-splitter", label: "Audio Splitter", description: "Separate dialogue from a mixed track" },
+  { id: "vo-leveler", label: "Voiceover", description: "Level and export WAV files" },
+  { id: "audio-splitter", label: "Splitter", description: "Separate dialogue and background" },
 ];
 
 export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: boolean }) {
@@ -39,12 +39,12 @@ export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: b
   return (
     <div className={styles.layout}>
       <aside className={styles.sidebar}>
-        <nav aria-label="Production tools" className={styles.navigation}>
+        <nav aria-label="Audio tools" className={styles.navigation}>
           <div className={styles.navigationHeader}>
             <span>Workspace</span>
             <span>{TOOLS.length} tools</span>
           </div>
-          <div className={styles.tabs} role="tablist" aria-label="Production workspaces" aria-orientation="vertical">
+          <div className={styles.tabs} role="tablist" aria-label="Audio workspaces" aria-orientation="vertical">
             {TOOLS.map((tool, index) => (
               <button
                 key={tool.id}
@@ -64,7 +64,7 @@ export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: b
             ))}
           </div>
           <p className={styles.navigationNote}>
-            Switching tools keeps your current files and progress in place.
+            Switching tools keeps your files and progress.
           </p>
         </nav>
       </aside>
@@ -78,7 +78,7 @@ export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: b
           className={styles.toolPanel}
           hidden={activeTool !== "vo-leveler"}
         >
-          <h2 className={styles.visuallyHiddenHeading}>VO Optimizer</h2>
+          <h2 className={styles.visuallyHiddenHeading}>Voiceover</h2>
           <VoLeveler aiAutoPilotEnabled={aiAutoPilotEnabled} />
         </div>
         <div
@@ -89,7 +89,7 @@ export default function AppTools({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: b
           className={styles.toolPanel}
           hidden={activeTool !== "audio-splitter"}
         >
-          <h2 className={styles.visuallyHiddenHeading}>Audio Splitter</h2>
+          <h2 className={styles.visuallyHiddenHeading}>Splitter</h2>
           <AudioTrackSplitter />
         </div>
       </div>

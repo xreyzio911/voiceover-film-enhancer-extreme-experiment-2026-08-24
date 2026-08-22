@@ -1,5 +1,17 @@
 # Lessons
 
+## 2026-08-22 - Optional Veto Evidence Must Fail Safe
+
+- What went wrong: The bed-release stage could shorten a 500 ms release to 240 ms when optional speech-body and fricative envelopes were absent, even though those same envelopes were the only evidence allowed to protect a missed trailing sound.
+- Rule to prevent it: For intelligibility-tier cleanup, missing optional protection evidence must reduce or suppress the cleanup authority; it must never authorize more processing than complete evidence would.
+- How to verify next time: Run identical planner input with complete, partial, and absent veto evidence and assert that removing evidence cannot increase release acceleration or lower gain on trailing material.
+
+## 2026-08-22 - Global Maxima Are Not Stable Expressive-Crest Evidence
+
+- What went wrong: A single global activity-sample maximum grew more likely with file length and could let one mouth click define the expressive policy for an entire recording.
+- Rule to prevent it: Base file-level expressive authority on a documented high percentile of speech-owned per-frame peaks, paired with a source-relative plateau, while retaining a separate whole-buffer peak for clipping and limiter safety.
+- How to verify next time: Test repeated-duration invariance, isolated-click resistance, absolute-level invariance, and genuine repeated expressive peaks before tuning any crest ramp against real recordings.
+
 ## 2026-08-05 - Delivered Byte Identity Outranks Path Discovery
 
 - What went wrong: Default discovery paired older nearby results, and the original render manifest still pointed to pre-protected Seth/Simone outputs; both produced plausible but stale release metrics.
