@@ -56,9 +56,9 @@ test("the experiment build is unmistakable in the browser tab and primary app co
   const page = readProjectFile("src/app/page.tsx");
   const tools = readProjectFile("src/components/AppTools.tsx");
 
-  assert.match(layout, /title:\s*["']Shorts Projektt \| Voiceover Experiment["']/);
-  assert.match(page, />Voiceover Experiment<\/h1>/);
-  assert.match(page, />Experiment<\/div>/);
+  assert.match(layout, /title:\s*["']Shorts Projektt \| Extreme Experiment["']/);
+  assert.match(page, />Extreme Experiment<\/h1>/);
+  assert.match(page, />Extreme Experiment<\/div>/);
   assert.match(tools, /label:\s*["']Voiceover["']/);
   assert.doesNotMatch(page, /Level, review, and export consistent voiceover from one controlled workspace/);
 });

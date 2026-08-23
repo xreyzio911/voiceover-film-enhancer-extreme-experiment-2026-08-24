@@ -31,6 +31,74 @@ const dbToLin = (db: number) => Math.pow(10, db / 20);
 const gainDbAtFrame = (curve: Float32Array, frame: number) => 20 * Math.log10(curve[frame] + 1e-9);
 
 describe("realized gain-motion telemetry", () => {
+  it("uses ML speech protection only to preserve weak body tails after an existing run", () => {
+    const frameDb = new Array<number>(80).fill(-80);
+    const speechBodyFrameDb = new Array<number>(80).fill(-80);
+    for (let frame = 10; frame < 34; frame += 1) {
+      frameDb[frame] = -34;
+      speechBodyFrameDb[frame] = -34;
+    }
+    for (let frame = 34; frame < 42; frame += 1) {
+      frameDb[frame] = -56;
+      speechBodyFrameDb[frame] = -56;
+    }
+
+    const basePlan = planGainCurve({
+      frameDb,
+      speechBodyFrameDb,
+      speechRuns: [{ startFrame: 10, endFrame: 34 }],
+      noiseFloorDb: -70,
+      speechThresholdDb: -50,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+    });
+    const protectedPlan = planGainCurve({
+      frameDb,
+      speechBodyFrameDb,
+      protectedSpeechFrameMask: frameDb.map((_, frame) => frame >= 34 && frame < 42),
+      speechRuns: [{ startFrame: 10, endFrame: 34 }],
+      noiseFloorDb: -70,
+      speechThresholdDb: -50,
+      pauseNoiseRisk: 0.1,
+      frameMs: FRAME_MS,
+    });
+
+    assert.ok(
+      gainDbAtFrame(protectedPlan.gainCurve, 38) > gainDbAtFrame(basePlan.gainCurve, 38) + 1,
+      "ML protection should keep the weak tail closer to speech gain",
+    );
+    assert.equal(protectedPlan.mlProtectedTailRunCount, 1);
+    assert.equal(protectedPlan.mlProtectedTailFrameCount, 8);
+    assert.equal(protectedPlan.gainDbAuthority, "gainPlanner");
+  });
+
+  it("ignores malformed ML protection evidence and returns the legacy gain curve", () => {
+    const frameDb = new Array<number>(40).fill(-80);
+    for (let frame = 8; frame < 24; frame += 1) frameDb[frame] = -34;
+
+    const basePlan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 8, endFrame: 24 }],
+      noiseFloorDb: -80,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+    });
+    const malformedPlan = planGainCurve({
+      frameDb,
+      protectedSpeechFrameMask: [true, true],
+      speechRuns: [{ startFrame: 8, endFrame: 24 }],
+      noiseFloorDb: -80,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+    });
+
+    assert.deepEqual(Array.from(malformedPlan.gainCurve), Array.from(basePlan.gainCurve));
+    assert.equal(malformedPlan.mlProtectedTailRunCount, 0);
+    assert.equal(malformedPlan.gainDbAuthority, "gainPlanner");
+  });
+
   it("reports in-domain first differences without counting class boundaries", () => {
     const stage = measureGainMotionStage(
       "painted",
