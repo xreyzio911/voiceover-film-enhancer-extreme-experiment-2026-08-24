@@ -1057,7 +1057,7 @@ test("explicit pairs may use separate exact source and result roots without wide
 
     const [pair] = await resolveExplicitCorpusPairs(
       root,
-      [`${source}|${result}|dual-root-pair`],
+      [`source.wav|${result}|dual-root-pair`],
       resultRoot,
       sourceRoot,
     );
