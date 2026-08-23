@@ -1019,7 +1019,7 @@ test("explicit pairs may read source and result WAVs from one exact external sou
         externalRoot,
         externalRoot,
       ),
-      /external-source-root.*external-result-root|external-result-root.*external-source-root/i,
+      /external.*root.*overlap/i,
     );
     await assert.rejects(
       () => resolveExplicitCorpusPairs(root, [], null, externalRoot),

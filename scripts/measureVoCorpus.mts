@@ -353,13 +353,16 @@ const resolveExplicitWav = async (
   }
   const absolutePath = path.resolve(repoRoot, requestedPath);
   const isLexicallyInsideRepo = isPathInside(repoRoot, absolutePath);
-  const allowedExternalRoot = externalSourceRoot
-    ?? (role === "result" ? externalResultRoot : null);
-  const externalBoundaryName = externalSourceRoot !== null
+  const allowedExternalRoot = role === "source"
+    ? externalSourceRoot
+    : externalResultRoot ?? externalSourceRoot;
+  const externalBoundaryName = role === "source" && externalSourceRoot !== null
     ? "the external source root"
     : role === "result" && externalResultRoot !== null
       ? "the external result root"
-      : null;
+      : role === "result" && externalSourceRoot !== null
+        ? "the external source root"
+        : null;
   const isLexicallyInsideExternalRoot = allowedExternalRoot !== null
     && isPathInside(allowedExternalRoot.absolutePath, absolutePath);
   if (!isLexicallyInsideRepo && !isLexicallyInsideExternalRoot) {
@@ -404,9 +407,6 @@ export const resolveExplicitCorpusPairs = async (
   if (pairSpecs.length > MAX_EXPLICIT_PAIRS) {
     throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
   }
-  if (externalResultRootPath !== null && externalSourceRootPath !== null) {
-    throw new Error("--external-source-root cannot be combined with --external-result-root.");
-  }
   if (externalSourceRootPath !== null && pairSpecs.length === 0) {
     throw new Error("--external-source-root requires at least one explicit pair.");
   }
@@ -433,6 +433,16 @@ export const resolveExplicitCorpusPairs = async (
     )
   ) {
     throw new Error("--external-source-root must not overlap the repository.");
+  }
+  if (
+    externalSourceRoot !== null
+    && externalResultRoot !== null
+    && (
+      isPathInside(externalSourceRoot.realPath, externalResultRoot.realPath)
+      || isPathInside(externalResultRoot.realPath, externalSourceRoot.realPath)
+    )
+  ) {
+    throw new Error("External source and result roots must not overlap.");
   }
   const seenIds = new Set<string>();
   const pairs: CorpusPair[] = [];
@@ -852,9 +862,6 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
   }
   if (externalSourceRoot !== null && pairsJson === null && pairSpecs.length === 0) {
     throw new Error("--external-source-root requires --pairs-json or at least one --pair.");
-  }
-  if (externalSourceRoot !== null && externalResultRoot !== null) {
-    throw new Error("--external-source-root cannot be combined with --external-result-root.");
   }
   return {
     externalResultRoot,
