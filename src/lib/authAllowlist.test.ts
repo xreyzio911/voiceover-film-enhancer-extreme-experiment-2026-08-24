@@ -43,3 +43,12 @@ test("localhost bypass runs before next-auth middleware initialization", () => {
     "localhost bypass must return before next-auth middleware can require provider secrets",
   );
 });
+
+test("next-auth middleware uses the same AUTH_SECRET as the route config", () => {
+  const proxySource = readFileSync(new URL("../proxy.ts", import.meta.url), "utf8");
+  assert.match(
+    proxySource,
+    /withAuth\([\s\S]*\{\s*secret:\s*process\.env\.AUTH_SECRET,/,
+    "middleware must not require a separate NEXTAUTH_SECRET in production",
+  );
+});
