@@ -178,6 +178,14 @@ import {
   type RoomCleanupRisk,
 } from "../lib/roomCleanupPolicy";
 import { resolveAdaptiveVoicingPolicy } from "../lib/adaptiveVoicingPolicy";
+import {
+  analyzeSourceWithExtremeWorker,
+  type ExtremeSourceReport,
+} from "../lib/extremeMlClient";
+import {
+  analyzeExtremeSourcesBounded,
+  buildPlannerMlProtection,
+} from "../lib/extremeMlVoPolicy";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -329,6 +337,10 @@ const IMPORTANT_LOG_PATTERN = /error|failed|invalid|aborted|out of bounds/i;
 const GAIN_PLANNER_ANALYSIS_SAMPLE_RATE = 16000;
 const GAIN_PLANNER_FRAME_MS = 10;
 const PLANNER_K_WEIGHTING = true;
+// The isolated worker runs alongside browser analysis. Rendering takes one
+// short bounded snapshot grace, then ignores late evidence and continues on
+// the exact browser-only path.
+const EXTREME_ML_SNAPSHOT_GRACE_MS = 1500;
 // Mixed-formant speech fixtures with -4/0/+4 dB high-frequency tilt measured
 // +0.15/-0.04/-0.44 dB raw body shift after the raw/K split, so no absolute
 // target compensation is needed to stay within the +/-0.5 dB pre-K baseline.
@@ -915,6 +927,9 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
     SourceFirstAudioReviewPlan["selectedVariant"] | null
   >(null);
   const sourceFirstPlansByBaseRef = useRef<Map<string, SourceFirstAudioReviewPlan>>(new Map());
+  const extremeSourceReportsByInputNameRef = useRef<ReadonlyMap<string, ExtremeSourceReport>>(
+    new Map(),
+  );
   const failureDismissButtonRef = useRef<HTMLButtonElement | null>(null);
   const runBatchButtonRef = useRef<HTMLButtonElement | null>(null);
   const advancedDisclosureRef = useRef<HTMLDivElement | null>(null);
@@ -958,6 +973,7 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
   const [floorGuard, setFloorGuard] = useState(true);
   const [cinematicColor, setCinematicColor] = useState(true);
   const [gainPlannerEnabled, setGainPlannerEnabled] = useState(true);
+  const [extremeMlEnabled, setExtremeMlEnabled] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const loudnessConfig = useMemo(() => LOUDNESS_PRESETS[loudnessTarget], [loudnessTarget]);
@@ -2139,8 +2155,24 @@ const summarizeFailureReason = (error: unknown) => {
       );
 
       const mask = buildSpeechMask(frameDb, noiseFloorDb, { frameMs: GAIN_PLANNER_FRAME_MS });
+      const mlProtection = buildPlannerMlProtection({
+        report: extremeSourceReportsByInputNameRef.current.get(inputName) ?? null,
+        energySpeechMask: mask,
+        plannerFrameMs: GAIN_PLANNER_FRAME_MS,
+        rangeStartSec: range?.startSec ?? 0,
+      });
       const speechRuns: PlannerSpeechRun[] = speechRunsFromMask(mask);
       if (speechRuns.length === 0) return null;
+
+      if (mlProtection.addedFrameCount > 0) {
+        appendLog(
+          `[ExtremeML] ${sanitizeBase(inputName)}: ${mlProtection.addedFrameCount} attached weak speech frame${
+            mlProtection.addedFrameCount === 1 ? "" : "s"
+          } protected; ${mlProtection.isolatedMlFrameCount} isolated frame${
+            mlProtection.isolatedMlFrameCount === 1 ? "" : "s"
+          } ignored. Energy speech and gainPlanner remain authoritative.`,
+        );
+      }
 
       const plan = planGainCurve({
         frameDb,
@@ -2149,6 +2181,7 @@ const summarizeFailureReason = (error: unknown) => {
         loudnessFrameDb,
         speechBodyFrameDb,
         speechRuns,
+        protectedSpeechFrameMask: mlProtection.protectedSpeechFrameMask ?? undefined,
         noiseFloorDb,
         speechThresholdDb,
         pauseNoiseRisk,
@@ -7994,6 +8027,7 @@ const summarizeFailureReason = (error: unknown) => {
     aiAdaptiveDirectivesOverrideRef.current = null;
     sourceFirstCandidateVariantRef.current = null;
     sourceFirstPlansByBaseRef.current = new Map();
+    extremeSourceReportsByInputNameRef.current = new Map();
     setLoading(true);
     setOutputs([]);
     setReviewBundles([]);
@@ -8006,9 +8040,40 @@ const summarizeFailureReason = (error: unknown) => {
     const consonantReferencesByOutputKey = new Map<string, RenderedConsonantReference>();
     const nextReviewBundles: PendingReviewBundleEntry[] = [];
     let finalConsonantPassStarted = false;
+    let acceptingExtremeMlEvidence = false;
+    let extremeMlAnalysisPromise: Promise<void> | null = null;
     try {
       let ffmpeg = await ensureFfmpeg();
       const jobs = buildJobs(files);
+      if (extremeMlEnabled) {
+        acceptingExtremeMlEvidence = true;
+        const batchId = globalThis.crypto?.randomUUID?.() ?? `batch-${Date.now().toString(36)}`;
+        appendLog(
+          `[ExtremeML] Opt-in source analysis started for ${jobs.length} file(s), with at most two direct uploads at once. Evidence is advisory and cannot block delivery.`,
+        );
+        extremeMlAnalysisPromise = analyzeExtremeSourcesBounded({
+          jobs: jobs.map((job, index) => ({
+            key: job.inputName,
+            source: job.file,
+            contentType: "audio/wav",
+            idempotencyKey: `${batchId}-${index + 1}`,
+          })),
+          analyze: analyzeSourceWithExtremeWorker,
+          onOutcome: ({ key, outcome }) => {
+            if (!acceptingExtremeMlEvidence) return;
+            if (outcome.status === "succeeded") {
+              extremeSourceReportsByInputNameRef.current = new Map([
+                ...extremeSourceReportsByInputNameRef.current,
+                [key, outcome.report],
+              ]);
+              return;
+            }
+            appendLog(
+              `[ExtremeML] ${sanitizeBase(key)}: evidence unavailable; browser processing remains unchanged.`,
+            );
+          },
+        }).catch(() => undefined);
+      }
       const reviewBundleFinalOutputBlocker = (() => {
         if (loudnessConfig !== null) return "loudness-target deliverables are rendered after the per-file review point";
         if (jobs.length > 1) return "batch alignment can adjust mix-ready bytes after all files render";
@@ -8133,6 +8198,24 @@ const summarizeFailureReason = (error: unknown) => {
             appendLog("[AIReview] Source-first review unavailable; continuing with current deterministic controls.");
           }
         }
+      }
+
+      if (extremeMlEnabled) {
+        if (
+          extremeMlAnalysisPromise &&
+          extremeSourceReportsByInputNameRef.current.size < jobs.length
+        ) {
+          await Promise.race([
+            extremeMlAnalysisPromise,
+            new Promise<void>((resolve) =>
+              window.setTimeout(resolve, EXTREME_ML_SNAPSHOT_GRACE_MS),
+            ),
+          ]);
+        }
+        acceptingExtremeMlEvidence = false;
+        appendLog(
+          `[ExtremeML] Render snapshot accepted ${extremeSourceReportsByInputNameRef.current.size}/${jobs.length} advisory report(s). Unavailable or late reports use the exact browser path.`,
+        );
       }
 
       let hadErrors = false;
@@ -9883,10 +9966,12 @@ const summarizeFailureReason = (error: unknown) => {
         setStatus("Failed");
       }
     } finally {
+      acceptingExtremeMlEvidence = false;
       processingControlsOverrideRef.current = null;
       aiAdaptiveDirectivesOverrideRef.current = null;
       sourceFirstCandidateVariantRef.current = null;
       sourceFirstPlansByBaseRef.current = new Map();
+      extremeSourceReportsByInputNameRef.current = new Map();
       setLoading(false);
     }
   };
@@ -9970,6 +10055,7 @@ const summarizeFailureReason = (error: unknown) => {
       floorGuard,
       sceneBlend,
       gainPlannerEnabled,
+      extremeMlSpeechProtection: extremeMlEnabled ? "opt-in-advisory" : "off",
       reviewReranker: "paused-temporary-single-render",
     },
     files: manifestOutputs.map((output) => ({
@@ -10203,7 +10289,9 @@ const summarizeFailureReason = (error: unknown) => {
           >
             <div className={styles.dropTitle}>Drop WAV files or choose a folder</div>
             <div className={styles.dropHint}>
-              Processing runs in this browser. Files stay on this machine.
+              {extremeMlEnabled
+                ? "Processing and final audio rendering stay in this browser. Source WAVs are uploaded directly to the isolated Extreme worker for optional speech evidence."
+                : "Processing runs in this browser. Files stay on this machine."}
             </div>
             <div className={styles.dropHint}>New drops are added to the current queue.</div>
             <div className={styles.controls}>
@@ -10329,6 +10417,23 @@ const summarizeFailureReason = (error: unknown) => {
               type="checkbox"
               checked={gainPlannerEnabled}
               onChange={(event) => setGainPlannerEnabled(event.target.checked)}
+            />
+          </label>
+          <label className={styles.toggleRow}>
+            <div>
+              <strong>Extreme ML speech protection (optional)</strong>
+              <div className={styles.label}>
+                Uploads each source WAV directly to the isolated Extreme worker for advisory speech-tail
+                evidence. It can only protect short, source-attached weak speech; energy detection and
+                gainPlanner still make every leveling decision. If the worker is unavailable or late, the
+                browser pipeline runs unchanged.
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={extremeMlEnabled}
+              disabled={loading}
+              onChange={(event) => setExtremeMlEnabled(event.target.checked)}
             />
           </label>
           <label className={styles.toggleRow}>
