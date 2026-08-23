@@ -37,7 +37,7 @@ const validReport = (): unknown => ({
     {
       id: "silero-vad",
       version: "6.2.1",
-      revision: "b".repeat(40),
+      revision: "pypi:6.2.1",
       sha256: "c".repeat(64),
     },
   ],

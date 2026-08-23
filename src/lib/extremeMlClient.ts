@@ -57,6 +57,9 @@ const isFiniteNumber = (value: unknown): value is number =>
 const isHex = (value: string, length: number) =>
   value.length === length && /^[0-9a-f]+$/.test(value);
 
+const isPinnedRevision = (value: string) =>
+  /^pypi:[0-9]+(?:\.[0-9A-Za-z]+){1,3}$/.test(value) || isHex(value, 40);
+
 export const normalizeExtremeWorkerBaseUrl = (value: string | null | undefined) => {
   if (!value) return null;
   try {
@@ -184,7 +187,7 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
       typeof candidate.sha256 !== "string" ||
       !candidate.id ||
       !candidate.version ||
-      !isHex(candidate.revision, 40) ||
+      !isPinnedRevision(candidate.revision) ||
       !isHex(candidate.sha256, 64)
     ) {
       return null;
