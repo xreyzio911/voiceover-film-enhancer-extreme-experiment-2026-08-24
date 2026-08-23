@@ -12,6 +12,13 @@ then the SQLite row and fixed per-job artifacts are purged. The worker accepts a
 four active jobs per authenticated owner by default; a full lane returns HTTP 429 and
 the browser continues through the unchanged local path.
 
+Non-terminal work has a separate two-hour stale TTL by default. Upload progress,
+state changes, and lease heartbeats refresh job activity. Stale uploading, queued, or
+unleased/expired-lease running jobs become `failed`; stale cancellation requests become
+`cancelled`. Both expose the bounded `terminalCode: stale_job_expired`, release the
+owner's active-job lane, and retry exact fixed-file cleanup after restart. A running or
+cancel-requested job with an unexpired lease is never expired by this maintenance pass.
+
 ## App integration
 
 The job executor should create one process-wide runtime and persist its returned JSON:
@@ -88,16 +95,24 @@ Configure these values in the isolated Render service:
 All three are `sync: false`; no secret is stored in Git. Do not reuse values from the
 current experiment or another Render service.
 
-Non-secret defaults in the Blueprint:
+Non-secret runtime defaults (the deployment may override them explicitly):
 
 - `EXTREME_STORAGE_ROOT=/var/data`
 - `EXTREME_ML_MODEL_DIR=/opt/extreme/models`
 - `EXTREME_ML_METRICS=dnsmos,dnsmos_p808,sigmos`
 - `EXTREME_ML_MAX_ANALYSIS_SECONDS=2160`
 - `EXTREME_ML_RETENTION_SECONDS=86400`
+- `EXTREME_ML_STALE_JOB_SECONDS=7200`
 - `EXTREME_ML_MAINTENANCE_INTERVAL_SECONDS=300`
 - `EXTREME_ML_MAX_ACTIVE_JOBS_PER_OWNER=4`
+- `EXTREME_ML_READINESS_TIMEOUT_SECONDS=0.25` (capped at one second per
+  SQLite connection attempt)
 
 The service exposes `/health/live` for the container probe and `/health/ready` for
-Render. Readiness must describe API/storage readiness; model failure remains degraded
+Render. Manifest/production mode requires the separately configured ticket secret
+and refuses readiness when it is missing or identical to the internal secret;
+deriving it from the internal secret is limited to explicit local/test app
+configuration. Readiness performs bounded write-and-rollback probes for both job and
+ticket-replay SQLite databases plus an exact create/sync/remove probe in the persistent
+storage root. Probe files and rows are not retained. Model failure remains degraded
 advisory telemetry and is not a delivery gate.

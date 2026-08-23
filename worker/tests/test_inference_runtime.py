@@ -265,6 +265,141 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(report["telemetry"]["audioMutation"], False)
         self.assertEqual(report["telemetry"]["excludedModels"], ["nisqa", "deepfilternet3"])
 
+    def test_long_metric_scoring_uses_bounded_distributed_windows_and_finite_lower_median(self) -> None:
+        import numpy as np
+
+        _, RuntimeConfig, _, _, _, _ = self._model_symbols()
+        AdvisoryInferenceRuntime, _ = self._inference_symbols()
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_empty_metrics"])
+        sample_rate = 48_000
+        source_samples = 1_158 * sample_rate
+        window_samples = 10 * sample_rate
+        window_results = (
+            {"sig": math.nan, "bak": math.inf, "ovrl": 4.7},
+            {"sig": 4.8, "bak": 4.5, "ovrl": 4.6},
+            {"sig": 4.7, "bak": 4.4, "ovrl": 4.5},
+            {"sig": 4.6, "bak": 4.3, "ovrl": 4.4},
+            {"sig": 4.5, "bak": 4.2, "ovrl": 4.3},
+            {"sig": 4.4, "bak": 4.1, "ovrl": 4.2},
+            {"sig": 0.2, "bak": 0.1, "ovrl": 0.3},
+        )
+
+        def run_once():
+            class LazyLongAudio:
+                dtype = np.dtype(np.float32)
+
+                def __init__(self) -> None:
+                    self.slices: list[tuple[int, int]] = []
+                    self.full_array_requests = 0
+
+                def __len__(self) -> int:
+                    return source_samples
+
+                def __array__(self, *_args, **_kwargs):
+                    self.full_array_requests += 1
+                    raise AssertionError("long source must be sliced before array conversion")
+
+                def __getitem__(self, key):
+                    if not isinstance(key, slice) or key.step not in (None, 1):
+                        raise AssertionError("metric windows must use contiguous slices")
+                    start = 0 if key.start is None else key.start
+                    stop = len(self) if key.stop is None else key.stop
+                    if stop - start > window_samples:
+                        raise AssertionError("metric window exceeded the ten-second cap")
+                    self.slices.append((start, stop))
+                    return np.zeros(stop - start, dtype=np.float32)
+
+            class RecordingMetrics:
+                def __init__(self) -> None:
+                    self.sample_counts: list[int] = []
+                    self.byte_counts: list[int] = []
+
+                def score(self, metric_id: str, audio, sample_rate: int):
+                    self.assertions(metric_id, sample_rate, audio)
+                    call_index = len(self.sample_counts)
+                    self.sample_counts.append(len(audio))
+                    self.byte_counts.append(audio.nbytes)
+                    return window_results[call_index]
+
+                @staticmethod
+                def assertions(metric_id: str, sample_rate: int, audio) -> None:
+                    if metric_id != "dnsmos" or sample_rate != 48_000:
+                        raise AssertionError("unexpected metric request")
+                    if len(audio) > 480_000 or audio.nbytes > 2 * 1024 * 1024:
+                        raise AssertionError("metric backend received an unbounded array")
+
+            source = LazyLongAudio()
+            backend = RecordingMetrics()
+            runtime = AdvisoryInferenceRuntime(
+                RuntimeConfig(
+                    model_dir=Path("."),
+                    metric_ids=(),
+                    artifacts=(),
+                    max_analysis_seconds=1,
+                )
+            )
+            runtime._metrics = backend
+            metrics = module._empty_metrics(("dnsmos",))
+            components: dict[str, dict[str, object]] = {}
+            runtime._score_metric("dnsmos", metrics, components, source, sample_rate)
+            return source, backend, metrics, components
+
+        first = run_once()
+        second = run_once()
+
+        max_start = source_samples - window_samples
+        expected_starts = [(window_index * max_start) // 6 for window_index in range(7)]
+        self.assertEqual(first[0].full_array_requests, 0)
+        self.assertEqual(
+            first[0].slices,
+            [(start, start + window_samples) for start in expected_starts],
+        )
+        self.assertEqual(first[1].sample_counts, [window_samples] * 7)
+        self.assertEqual(first[1].byte_counts, [window_samples * 4] * 7)
+        self.assertEqual(first[2], second[2])
+        self.assertEqual(first[0].slices, second[0].slices)
+        self.assertEqual(first[2]["dnsmos.sig"]["value"], 4.5)
+        self.assertEqual(first[2]["dnsmos.bak"]["value"], 4.2)
+        self.assertEqual(first[2]["dnsmos.ovrl"]["value"], 4.4)
+        self.assertEqual(first[3]["dnsmos"]["status"], "available")
+        self.assertEqual(first[3]["dnsmos"]["code"], "ok-partial-windows")
+
+    def test_short_metric_scoring_preserves_one_call_behavior(self) -> None:
+        import numpy as np
+
+        _, RuntimeConfig, _, _, _, _ = self._model_symbols()
+        AdvisoryInferenceRuntime, _ = self._inference_symbols()
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_empty_metrics"])
+        source = np.linspace(-0.25, 0.25, 100, dtype=np.float32)
+
+        class RecordingMetrics:
+            def __init__(self) -> None:
+                self.inputs: list[object] = []
+
+            def score(self, metric_id: str, audio, sample_rate: int):
+                self.inputs.append(audio)
+                return 3.75
+
+        backend = RecordingMetrics()
+        runtime = AdvisoryInferenceRuntime(
+            RuntimeConfig(
+                model_dir=Path("."),
+                metric_ids=(),
+                artifacts=(),
+                max_analysis_seconds=1,
+            )
+        )
+        runtime._metrics = backend
+        metrics = module._empty_metrics(("utmos",))
+        components: dict[str, dict[str, object]] = {}
+
+        runtime._score_metric("utmos", metrics, components, source, 16_000)
+
+        self.assertEqual(len(backend.inputs), 1)
+        self.assertIs(backend.inputs[0], source)
+        self.assertEqual(metrics["utmos"]["value"], 3.75)
+        self.assertEqual(components["utmos"], {"status": "available", "code": "ok"})
+
     def test_analysis_never_rewrites_the_source_file(self) -> None:
         _, RuntimeConfig, _, _, _, _ = self._model_symbols()
         AdvisoryInferenceRuntime, _ = self._inference_symbols()

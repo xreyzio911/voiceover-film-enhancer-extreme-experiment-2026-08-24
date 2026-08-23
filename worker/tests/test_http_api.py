@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -180,6 +184,25 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(replay.status_code, 401)
 
+    def test_ticket_replay_storage_failure_returns_generic_unavailable_response(self) -> None:
+        metadata = self._metadata(idempotencyKey="replay-storage-failure")
+        ticket = self._ticket(metadata=metadata)
+        authority = self.app.state.admission_authority
+        self.assertIsNotNone(authority)
+        with patch.object(
+            authority.replay_store,
+            "consume",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            response = self.client.post(
+                "/v1/jobs",
+                headers={"Authorization": f"Bearer {ticket}"},
+                json=metadata,
+            )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json(), {"error": "ticket authority unavailable"})
+        self.assertNotIn("locked", response.text)
+
     def test_per_owner_active_job_limit_fails_softly_and_recovers_after_cancel(self) -> None:
         app = self.create_app(
             {
@@ -220,6 +243,122 @@ class WorkerHttpApiContractTests(unittest.TestCase):
             self.assertEqual(cancelled.status_code, 200, cancelled.text)
             recovered = create(second_metadata)
             self.assertEqual(recovered.status_code, 200, recovered.text)
+
+    def test_stale_partial_upload_releases_owner_lane_and_survives_restart(self) -> None:
+        storage_root = self.storage_root / "stale-owner-limit"
+        config = {
+            "storage_root": storage_root,
+            "allowed_origins": [self.ORIGIN],
+            "internal_secret": self.INTERNAL_SECRET,
+            "ticket_secret": self.TICKET_SECRET,
+            "max_active_jobs_per_owner": 1,
+            "stale_job_seconds": 7_200,
+            "clock": self.clock,
+            "analyzer": FakeAnalyzer(),
+        }
+        owner_hash = "f" * 64
+
+        def create(client: TestClient, metadata: dict[str, object]):
+            ticket = client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={"ownerHash": owner_hash, **metadata},
+            )
+            self.assertEqual(ticket.status_code, 200, ticket.text)
+            return client.post(
+                "/v1/jobs",
+                headers={"Authorization": f"Bearer {ticket.json()['ticket']}"},
+                json=metadata,
+            )
+
+        first_metadata = self._metadata(idempotencyKey="stale-owner-limit-1")
+        second_metadata = self._metadata(idempotencyKey="stale-owner-limit-2")
+        with TestClient(self.create_app(config)) as client:
+            first = create(client, first_metadata)
+            self.assertEqual(first.status_code, 200, first.text)
+            first_payload = first.json()
+            partial = client.patch(
+                f"/v1/jobs/{first_payload['jobId']}/input",
+                headers={
+                    "Authorization": f"Bearer {first_payload['accessToken']}",
+                    "Content-Type": "application/offset+octet-stream",
+                    "Upload-Offset": "0",
+                },
+                content=self.wav[:512],
+            )
+            self.assertEqual(partial.status_code, 204, partial.text)
+            part_path = storage_root / "jobs" / first_payload["jobId"] / "source.upload.part"
+            self.assertTrue(part_path.is_file())
+            self.assertEqual(create(client, second_metadata).status_code, 429)
+
+            self.clock.advance(7_201)
+            recovered = create(client, second_metadata)
+            self.assertEqual(recovered.status_code, 200, recovered.text)
+            self.assertFalse(part_path.exists())
+            stale_status = client.get(
+                f"/v1/jobs/{first_payload['jobId']}",
+                headers={"Authorization": f"Bearer {first_payload['accessToken']}"},
+            )
+            self.assertEqual(stale_status.status_code, 200, stale_status.text)
+            self.assertEqual(stale_status.json()["state"], "failed")
+            self.assertEqual(stale_status.json()["terminalCode"], "stale_job_expired")
+
+        with TestClient(self.create_app(config)) as restarted:
+            restored = restarted.get(
+                f"/v1/jobs/{first_payload['jobId']}",
+                headers={"Authorization": f"Bearer {first_payload['accessToken']}"},
+            )
+            self.assertEqual(restored.status_code, 200, restored.text)
+            self.assertEqual(restored.json()["terminalCode"], "stale_job_expired")
+
+    def test_stale_artifact_cleanup_retries_after_transition_restart(self) -> None:
+        storage_root = self.storage_root / "stale-cleanup-restart"
+        config = {
+            "storage_root": storage_root,
+            "internal_secret": self.INTERNAL_SECRET,
+            "ticket_secret": self.TICKET_SECRET,
+            "stale_job_seconds": 7_200,
+            "clock": self.clock,
+            "analyzer": FakeAnalyzer(),
+        }
+        metadata = self._metadata(idempotencyKey="stale-cleanup-restart")
+        with TestClient(self.create_app(config)) as client:
+            ticket = client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={"ownerHash": "9" * 64, **metadata},
+            )
+            job = client.post(
+                "/v1/jobs",
+                headers={"Authorization": f"Bearer {ticket.json()['ticket']}"},
+                json=metadata,
+            ).json()
+            partial = client.patch(
+                f"/v1/jobs/{job['jobId']}/input",
+                headers={
+                    "Authorization": f"Bearer {job['accessToken']}",
+                    "Content-Type": "application/offset+octet-stream",
+                    "Upload-Offset": "0",
+                },
+                content=self.wav[:512],
+            )
+            self.assertEqual(partial.status_code, 204, partial.text)
+            part_path = storage_root / "jobs" / job["jobId"] / "source.upload.part"
+            self.assertTrue(part_path.is_file())
+            self.clock.advance(7_201)
+            self.assertEqual(
+                client.app.state.job_store.expire_stale_jobs(stale_after_seconds=7_200),
+                (job["jobId"],),
+            )
+            self.assertTrue(part_path.is_file())
+
+        restarted_app = self.create_app(config)
+        expire_stale_jobs, = require_symbols(self, "extreme_worker.app", "_expire_stale_jobs")
+        self.assertEqual(
+            expire_stale_jobs(restarted_app, stale_job_seconds=7_200),
+            (),
+        )
+        self.assertFalse(part_path.exists())
 
     def test_full_resumable_upload_status_and_advisory_report_flow(self) -> None:
         job = self._job()
@@ -431,6 +570,52 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.headers["Upload-Offset"], "0")
 
+    def test_upload_terminalized_during_append_returns_controlled_conflict(self) -> None:
+        UploadIntegrityError, = require_symbols(
+            self,
+            "extreme_worker.uploads",
+            "UploadIntegrityError",
+        )
+        JobState, = require_symbols(self, "extreme_worker.job_store", "JobState")
+        metadata = self._metadata(idempotencyKey="upload-cleanup-race")
+        job = self._job(ticket=self._ticket(metadata=metadata), metadata=metadata)
+        first = self.client.patch(
+            f"/v1/jobs/{job['jobId']}/input",
+            headers={
+                "Authorization": f"Bearer {job['accessToken']}",
+                "Content-Type": "application/offset+octet-stream",
+                "Upload-Offset": "0",
+            },
+            content=self.wav[:512],
+        )
+        self.assertEqual(first.status_code, 204, first.text)
+
+        def expire_during_append(*args, **kwargs):
+            self.app.state.job_store.transition(
+                job["jobId"],
+                JobState.UPLOADING,
+                JobState.FAILED,
+            )
+            self.app.state.upload_manager.remove_artifacts(job["jobId"])
+            raise UploadIntegrityError("upload expired")
+
+        with patch.object(
+            self.app.state.upload_manager,
+            "append",
+            side_effect=expire_during_append,
+        ):
+            response = self.client.patch(
+                f"/v1/jobs/{job['jobId']}/input",
+                headers={
+                    "Authorization": f"Bearer {job['accessToken']}",
+                    "Content-Type": "application/offset+octet-stream",
+                    "Upload-Offset": "512",
+                },
+                content=self.wav[512:1024],
+            )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json(), {"error": "job is not accepting upload bytes"})
+
     def test_cancel_is_owner_scoped_idempotent_and_removes_partial_audio(self) -> None:
         job = self._job()
         upload = self.client.patch(
@@ -559,6 +744,168 @@ class WorkerHttpApiContractTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {job['accessToken']}"},
         )
         self.assertEqual(status.status_code, 404)
+
+    def test_stale_maintenance_cleans_exact_artifacts_but_preserves_active_lease(self) -> None:
+        expire_stale_jobs, = require_symbols(self, "extreme_worker.app", "_expire_stale_jobs")
+        JobState, = require_symbols(self, "extreme_worker.job_store", "JobState")
+        store = self.app.state.job_store
+
+        active = store.create_job(
+            owner_token_hash="active-owner",
+            idempotency_key="active-lease-artifacts",
+            request_fingerprint="1" * 64,
+        )
+        store.transition(active.job_id, JobState.UPLOADING, JobState.QUEUED)
+        store.lease_next(worker_id="worker-active", lease_seconds=10_000)
+
+        stale_by_state: dict[str, str] = {}
+        for index, state_name in enumerate(("uploading", "queued", "running", "cancel_requested")):
+            job = store.create_job(
+                owner_token_hash=f"owner-{state_name}",
+                idempotency_key=f"stale-artifact-{state_name}",
+                request_fingerprint=str(index + 2) * 64,
+            )
+            if state_name != "uploading":
+                store.transition(job.job_id, JobState.UPLOADING, JobState.QUEUED)
+            if state_name in {"running", "cancel_requested"}:
+                store.transition(job.job_id, JobState.QUEUED, JobState.RUNNING)
+            if state_name == "cancel_requested":
+                store.request_cancel(job.job_id)
+            stale_by_state[state_name] = job.job_id
+
+        all_job_ids = [active.job_id, *stale_by_state.values()]
+        for job_id in all_job_ids:
+            directory = self.app.state.upload_root / job_id
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "source.upload.part").write_bytes(b"partial")
+            (directory / "source.wav").write_bytes(b"source")
+            (directory / "report.json").write_text("{}", encoding="utf-8")
+        unexpected = self.app.state.upload_root / stale_by_state["uploading"] / "keep.me"
+        unexpected.write_text("preserve", encoding="utf-8")
+
+        self.clock.advance(7_201)
+        expired = expire_stale_jobs(self.app, stale_job_seconds=7_200)
+
+        self.assertEqual(set(expired), set(stale_by_state.values()))
+        for state_name, job_id in stale_by_state.items():
+            with self.subTest(state=state_name):
+                directory = self.app.state.upload_root / job_id
+                self.assertFalse((directory / "source.upload.part").exists())
+                self.assertFalse((directory / "source.wav").exists())
+                self.assertFalse((directory / "report.json").exists())
+        self.assertTrue(unexpected.is_file())
+        active_directory = self.app.state.upload_root / active.job_id
+        self.assertTrue((active_directory / "source.wav").is_file())
+        self.assertEqual(store.get_job(active.job_id).state.value, "running")
+
+    def test_readiness_probes_writable_storage_and_sqlite_without_probe_residue(self) -> None:
+        first = self.client.get("/health/ready")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertTrue((self.storage_root / "jobs.sqlite3").is_file())
+        self.assertTrue((self.storage_root / "tickets.sqlite3").is_file())
+        first_snapshot = {
+            path.relative_to(self.storage_root).as_posix()
+            for path in self.storage_root.rglob("*")
+        }
+
+        second = self.client.get("/health/ready")
+        self.assertEqual(second.status_code, 200, second.text)
+        second_snapshot = {
+            path.relative_to(self.storage_root).as_posix()
+            for path in self.storage_root.rglob("*")
+        }
+        self.assertEqual(second_snapshot, first_snapshot)
+        self.assertFalse(any("readiness" in path or ".ready-" in path for path in second_snapshot))
+        with closing(sqlite3.connect(self.storage_root / "jobs.sqlite3")) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        self.assertNotIn("readiness_probe", tables)
+
+    def test_readiness_fails_closed_on_storage_or_sqlite_probe_failure(self) -> None:
+        module = __import__("extreme_worker.app", fromlist=["_probe_writable_storage"])
+        with patch.object(module, "_probe_writable_storage", side_effect=OSError("denied")):
+            storage_failure = self.client.get("/health/ready")
+        self.assertEqual(storage_failure.status_code, 503)
+        self.assertEqual(storage_failure.json(), {"status": "not_ready"})
+        self.assertNotIn("denied", storage_failure.text)
+
+        blocked_root = self.storage_root / "blocked-sqlite"
+        blocked_root.mkdir(parents=True)
+        (blocked_root / "jobs.sqlite3").mkdir()
+        app = self.create_app(
+            {
+                "storage_root": blocked_root,
+                "internal_secret": self.INTERNAL_SECRET,
+                "ticket_secret": self.TICKET_SECRET,
+                "analyzer": FakeAnalyzer(),
+            }
+        )
+        with TestClient(app) as client:
+            sqlite_failure = client.get("/health/ready")
+        self.assertEqual(sqlite_failure.status_code, 503)
+        self.assertEqual(sqlite_failure.json(), {"status": "not_ready"})
+
+    def test_manifest_mode_requires_separate_ticket_secret_but_local_config_is_scoped_compatible(self) -> None:
+        with self.assertRaises(ValueError):
+            self.create_app(
+                {
+                    "runtime_mode": "",
+                    "storage_root": self.storage_root / "blank-runtime-mode",
+                    "internal_secret": self.INTERNAL_SECRET,
+                    "ticket_secret": self.TICKET_SECRET,
+                    "analyzer": FakeAnalyzer(),
+                }
+            )
+
+        manifest_root = self.storage_root / "manifest-mode"
+        manifest_env = {
+            "EXTREME_ML_STORAGE_ROOT": str(manifest_root),
+            "EXTREME_ML_INTERNAL_SECRET": self.INTERNAL_SECRET,
+            "EXTREME_ML_INLINE_ANALYSIS": "true",
+        }
+        with patch.dict(os.environ, manifest_env, clear=True):
+            manifest_app = self.create_app()
+        with TestClient(manifest_app) as client:
+            not_ready = client.get("/health/ready")
+            unavailable = client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={"ownerHash": "a" * 64, **self._metadata()},
+            )
+        self.assertEqual(not_ready.status_code, 503)
+        self.assertEqual(unavailable.status_code, 503)
+
+        same_secret_app = self.create_app(
+            {
+                "runtime_mode": "production",
+                "storage_root": self.storage_root / "same-production-secret",
+                "internal_secret": self.INTERNAL_SECRET,
+                "ticket_secret": self.INTERNAL_SECRET,
+                "analyzer": FakeAnalyzer(),
+            }
+        )
+        with TestClient(same_secret_app) as client:
+            same_secret_ready = client.get("/health/ready")
+            same_secret_ticket = client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={"ownerHash": "a" * 64, **self._metadata()},
+            )
+        self.assertEqual(same_secret_ready.status_code, 503)
+        self.assertEqual(same_secret_ticket.status_code, 503)
+
+        local_app = self.create_app(
+            {
+                "storage_root": self.storage_root / "local-compatible",
+                "internal_secret": self.INTERNAL_SECRET,
+                "analyzer": FakeAnalyzer(),
+            }
+        )
+        with TestClient(local_app) as client:
+            local_ready = client.get("/health/ready")
+        self.assertEqual(local_ready.status_code, 200, local_ready.text)
 
     def test_chunk_limit_is_enforced_without_advancing_offset(self) -> None:
         job = self._job()

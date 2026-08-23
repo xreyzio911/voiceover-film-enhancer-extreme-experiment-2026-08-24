@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -26,7 +27,9 @@ from .job_store import (
     IdempotencyConflict,
     JobNotFound,
     JobState,
+    JobStoreError,
     SQLiteJobStore,
+    TerminalCode,
 )
 from .origin_policy import OriginPolicy, build_cors_headers
 from .paths import JobPaths, PathViolation, validate_job_id
@@ -74,6 +77,17 @@ class _ShortLivedJobStore:
 
         return invoke
 
+    def probe_writable(self, *, timeout_seconds: float) -> None:
+        store = SQLiteJobStore(
+            self.path,
+            clock=self.clock,
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            store.probe_writable()
+        finally:
+            store.close()
+
     def close(self) -> None:
         """Compatibility no-op; each facade operation closes its own connection."""
 
@@ -85,12 +99,14 @@ class _EmbeddedProcessor:
         poll_seconds: float,
         lease_seconds: float,
         retention_seconds: float,
+        stale_job_seconds: float,
         maintenance_interval_seconds: float,
     ) -> None:
         self.app = app
         self.poll_seconds = poll_seconds
         self.lease_seconds = lease_seconds
         self.retention_seconds = retention_seconds
+        self.stale_job_seconds = stale_job_seconds
         self.maintenance_interval_seconds = maintenance_interval_seconds
         self.worker_id = f"embedded-{secrets.token_urlsafe(8)}"
         self.stop_event = threading.Event()
@@ -114,6 +130,10 @@ class _EmbeddedProcessor:
             try:
                 now = float(self.app.state.clock())
                 if now >= self.next_maintenance_at:
+                    _expire_stale_jobs(
+                        self.app,
+                        stale_job_seconds=self.stale_job_seconds,
+                    )
                     _purge_expired_jobs(self.app, retention_seconds=self.retention_seconds)
                     self.next_maintenance_at = now + self.maintenance_interval_seconds
                 self.app.state.job_store.requeue_expired_leases()
@@ -235,6 +255,45 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _probe_writable_storage(storage_root: Path) -> None:
+    """Write, sync, and remove one exact probe file in the persistent root."""
+    storage_root.mkdir(parents=True, exist_ok=True)
+    probe = storage_root / f".ready-{secrets.token_hex(12)}.tmp"
+    try:
+        with probe.open("xb") as handle:
+            handle.write(b"ready")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _probe_readiness(app: FastAPI) -> bool:
+    if (
+        not app.state.internal_secret
+        or app.state.ticket_secret is None
+        or (
+            app.state.runtime_mode in {"manifest", "production"}
+            and not app.state.ticket_secret_explicit
+        )
+    ):
+        return False
+    try:
+        _probe_writable_storage(app.state.storage_root)
+        app.state.job_store.probe_writable(
+            timeout_seconds=app.state.readiness_timeout_seconds,
+        )
+        replay_store = SQLiteReplayStore(
+            app.state.storage_root / "tickets.sqlite3",
+            timeout_seconds=app.state.readiness_timeout_seconds,
+        )
+        replay_store.probe_writable()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        _LOGGER.warning("readiness_probe_failed exception_type=%s", type(exc).__name__)
+        return False
+    return True
+
+
 def _admission_authority(app: FastAPI) -> AdmissionTicketAuthority | None:
     if app.state.ticket_secret is None:
         return None
@@ -307,13 +366,25 @@ def _status_payload(app: FastAPI, job_id: str) -> dict[str, Any]:
         size_bytes = upload.expected_size
     except (JobNotFound, UploadIntegrityError):
         pass
-    return {
+    payload = {
         "jobId": job.job_id,
         "state": job.state.value,
         "attempts": job.attempts,
         "uploadOffset": upload_offset,
         "sizeBytes": size_bytes,
     }
+    if job.terminal_code is not None:
+        payload["terminalCode"] = job.terminal_code.value
+    return payload
+
+
+def _upload_offset_if_accepting(app: FastAPI, job_id: str) -> int | None:
+    try:
+        if app.state.job_store.get_job(job_id).state != JobState.UPLOADING:
+            return None
+        return app.state.upload_manager.status(job_id).offset
+    except (JobNotFound, UploadIntegrityError):
+        return None
 
 
 def _job_for_token(request: Request, job_id: str):
@@ -350,28 +421,7 @@ def _transition_if_current(store: SQLiteJobStore, job_id: str, source: JobState,
 
 
 def _remove_job_artifacts(app: FastAPI, job_id: str, *, keep_report: bool = False) -> None:
-    """Remove only the fixed, containment-checked files owned by one validated job."""
-    paths = JobPaths(app.state.upload_root).for_job(job_id)
-    targets = [paths.upload_part, paths.source_wav]
-    if not keep_report:
-        targets.append(paths.report_json)
-    for target in targets:
-        try:
-            target.unlink(missing_ok=True)
-        except OSError as exc:
-            _LOGGER.warning(
-                "job_artifact_cleanup_failed artifact=%s exception_type=%s",
-                target.name,
-                type(exc).__name__,
-            )
-    try:
-        paths.directory.rmdir()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        # A report intentionally keeps the directory alive. Unexpected files are
-        # never recursively deleted by maintenance.
-        pass
+    app.state.upload_manager.remove_artifacts(job_id, keep_report=keep_report)
 
 
 def _acknowledge_cancel(app: FastAPI, job_id: str) -> bool:
@@ -396,6 +446,18 @@ def _purge_expired_jobs(app: FastAPI, *, retention_seconds: float) -> tuple[str,
     for job_id in purged:
         _remove_job_artifacts(app, job_id)
     return purged
+
+
+def _expire_stale_jobs(app: FastAPI, *, stale_job_seconds: float) -> tuple[str, ...]:
+    expired = app.state.job_store.expire_stale_jobs(
+        stale_after_seconds=stale_job_seconds,
+    )
+    cleanup_candidates = app.state.job_store.list_terminal_jobs_by_code(
+        terminal_code=TerminalCode.STALE_JOB_EXPIRED,
+    )
+    for job_id in cleanup_candidates:
+        _remove_job_artifacts(app, job_id)
+    return expired
 
 
 def _run_analysis(app: FastAPI, job_id: str) -> None:
@@ -465,6 +527,19 @@ def _run_analysis(app: FastAPI, job_id: str) -> None:
 def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     settings = dict(config or {})
     explicit_config = config is not None
+    if "runtime_mode" in settings:
+        configured_runtime_mode = settings["runtime_mode"]
+    elif "runtimeMode" in settings:
+        configured_runtime_mode = settings["runtimeMode"]
+    else:
+        configured_runtime_mode = os.environ.get("EXTREME_ML_RUNTIME_MODE")
+    runtime_mode = (
+        str(configured_runtime_mode).strip().lower()
+        if configured_runtime_mode is not None
+        else ("local" if explicit_config else "manifest")
+    )
+    if runtime_mode not in {"local", "test", "manifest", "production"}:
+        raise ValueError("runtime mode must be local, test, manifest, or production")
     storage_root = Path(
         settings.get("storage_root")
         or settings.get("storageRoot")
@@ -493,10 +568,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         or os.environ.get("EXTREME_ML_TICKET_SECRET")
         or os.environ.get("EXTREME_TICKET_SECRET", "")
     )
-    ticket_secret = (
-        explicit_ticket_secret.encode("utf-8")
-        if explicit_ticket_secret
-        else (
+    ticket_secret = explicit_ticket_secret.encode("utf-8") if explicit_ticket_secret else None
+    if ticket_secret is None and runtime_mode in {"local", "test"}:
+        ticket_secret = (
             hmac.new(
                 internal_secret.encode("utf-8"),
                 b"extreme-ml-admission-ticket-v1",
@@ -505,9 +579,15 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             if internal_secret
             else None
         )
-    )
     if ticket_secret is not None and len(ticket_secret) < 32:
         raise ValueError("ticket secret must contain at least 32 bytes")
+    if (
+        runtime_mode in {"manifest", "production"}
+        and explicit_ticket_secret
+        and internal_secret
+        and hmac.compare_digest(explicit_ticket_secret, internal_secret)
+    ):
+        ticket_secret = None
     max_audio_bytes = _positive_int(
         settings.get(
             "max_audio_bytes",
@@ -569,6 +649,13 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         settings.get("retention_seconds", os.environ.get("EXTREME_ML_RETENTION_SECONDS")),
         86_400.0,
     )
+    stale_job_seconds = _positive_float(
+        settings.get(
+            "stale_job_seconds",
+            os.environ.get("EXTREME_ML_STALE_JOB_SECONDS"),
+        ),
+        7_200.0,
+    )
     maintenance_interval_seconds = _positive_float(
         settings.get(
             "maintenance_interval_seconds",
@@ -582,6 +669,16 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             os.environ.get("EXTREME_ML_MAX_ACTIVE_JOBS_PER_OWNER"),
         ),
         4,
+    )
+    readiness_timeout_seconds = min(
+        1.0,
+        _positive_float(
+            settings.get(
+                "readiness_timeout_seconds",
+                os.environ.get("EXTREME_ML_READINESS_TIMEOUT_SECONDS"),
+            ),
+            0.25,
+        ),
     )
     inline_analysis = explicit_config
     if "inline_analysis" in settings:
@@ -603,6 +700,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app = FastAPI(title="Extreme audio analysis worker", version="1.0.0", lifespan=lifespan)
     app.state.storage_root = storage_root
     app.state.allowed_origins = allowed_origins
+    app.state.runtime_mode = runtime_mode
     app.state.internal_secret = internal_secret
     app.state.ticket_secret = ticket_secret
     app.state.ticket_secret_explicit = bool(explicit_ticket_secret)
@@ -615,8 +713,10 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.worker_poll_seconds = worker_poll_seconds
     app.state.lease_seconds = lease_seconds
     app.state.retention_seconds = retention_seconds
+    app.state.stale_job_seconds = stale_job_seconds
     app.state.maintenance_interval_seconds = maintenance_interval_seconds
     app.state.max_active_jobs_per_owner = max_active_jobs_per_owner
+    app.state.readiness_timeout_seconds = readiness_timeout_seconds
     app.state.job_store = _ShortLivedJobStore(storage_root / "jobs.sqlite3", clock=clock)
     app.state.upload_root = storage_root / "jobs"
     app.state.upload_manager = UploadManager(root=app.state.upload_root, store=app.state.job_store)
@@ -634,6 +734,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         worker_poll_seconds,
         lease_seconds,
         retention_seconds,
+        stale_job_seconds,
         maintenance_interval_seconds,
     )
     app.state.rate_limiter = RateLimiter(
@@ -678,7 +779,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.get("/health/ready")
     async def ready():
-        if not internal_secret or ticket_secret is None:
+        if not _probe_readiness(app):
             return JSONResponse({"status": "not_ready"}, status_code=503)
         return {"status": "ready"}
 
@@ -749,6 +850,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             )
         except (TicketValidationError, TicketReplayError):
             return _json(401, {"error": "unauthorized"}, request)
+        except (sqlite3.Error, OSError):
+            _LOGGER.error("ticket_replay_storage_failed")
+            return _json(503, {"error": "ticket authority unavailable"}, request)
 
         access_token = app.state.token_hasher.issue()
         request_fingerprint = _fingerprint(
@@ -761,6 +865,10 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             }
         )
         try:
+            _expire_stale_jobs(
+                app,
+                stale_job_seconds=stale_job_seconds,
+            )
             job, created = app.state.job_store.create_or_rotate_api_job(
                 owner_identity_hash=claims.scope.owner_hash,
                 access_token_hash=app.state.token_hasher.hash(access_token),
@@ -794,6 +902,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 request,
                 {"Retry-After": "5"},
             )
+        except (JobStoreError, sqlite3.Error, OSError):
+            _LOGGER.error("job_admission_storage_failed")
+            return _json(503, {"error": "analysis storage unavailable"}, request)
         except (ValueError, UploadIntegrityError):
             return _json(400, {"error": "invalid upload"}, request)
 
@@ -848,7 +959,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         try:
             chunk = await _bounded_body(request, max_chunk_bytes)
         except OverflowError:
-            current = app.state.upload_manager.status(job_id).offset
+            current = _upload_offset_if_accepting(app, job_id)
+            if current is None:
+                return _json(409, {"error": "job is not accepting upload bytes"}, request)
             return _empty(413, request, {"Upload-Offset": str(current)})
         except TypeError:
             return _json(400, {"error": "invalid Content-Length"}, request)
@@ -857,7 +970,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         except UploadOffsetConflict as exc:
             return _empty(409, request, {"Upload-Offset": str(exc.expected_offset)})
         except (UploadIntegrityError, UploadStateError, ValueError):
-            current = app.state.upload_manager.status(job_id).offset
+            current = _upload_offset_if_accepting(app, job_id)
+            if current is None:
+                return _json(409, {"error": "job is not accepting upload bytes"}, request)
             return _empty(413, request, {"Upload-Offset": str(current)})
         return _empty(204, request, {"Upload-Offset": str(next_offset)})
 

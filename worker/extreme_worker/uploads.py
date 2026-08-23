@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import threading
@@ -9,6 +10,9 @@ from pathlib import Path
 
 from .job_store import ConcurrentUpdate, SQLiteJobStore
 from .paths import JobPaths
+
+
+_LOGGER = logging.getLogger("extreme_worker")
 
 
 class UploadOffsetConflict(RuntimeError):
@@ -131,6 +135,31 @@ class UploadManager:
                     os.replace(paths.source_wav, paths.upload_part)
                 raise
             return paths.source_wav
+
+    def remove_artifacts(self, job_id: str, *, keep_report: bool = False) -> None:
+        """Delete only one validated job's fixed artifacts under its upload lock."""
+        with self._lock_for(job_id):
+            paths = self.paths.for_job(job_id)
+            targets = [paths.upload_part, paths.source_wav]
+            if not keep_report:
+                targets.append(paths.report_json)
+            for target in targets:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as exc:
+                    _LOGGER.warning(
+                        "job_artifact_cleanup_failed artifact=%s exception_type=%s",
+                        target.name,
+                        type(exc).__name__,
+                    )
+            try:
+                paths.directory.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Reports or unexpected files keep the directory alive. Cleanup
+                # never recursively removes content it does not explicitly own.
+                pass
 
     @staticmethod
     def _truncate(path: Path, offset: int) -> None:

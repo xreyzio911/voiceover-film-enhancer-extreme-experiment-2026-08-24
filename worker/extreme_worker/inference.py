@@ -22,6 +22,10 @@ _METRIC_OUTPUTS: dict[str, tuple[str, ...]] = {
     "utmos": ("value",),
 }
 _PCM_DECODE_CHUNK_FRAMES = 65_536
+_METRIC_WINDOW_SECONDS = 10.0
+_METRIC_WINDOW_COUNT_CAP = 7
+_METRIC_WINDOW_BYTE_CAP = 2 * 1024 * 1024
+_METRIC_SAMPLE_BYTES = 4
 
 
 class VadBackend(Protocol):
@@ -248,6 +252,52 @@ def _valid_metric_value(value: object) -> float | None:
         return None
     rendered = float(value)
     return rendered if math.isfinite(rendered) and 0.0 <= rendered <= 5.0 else None
+
+
+def _metric_window_plan(audio: Any, sample_rate: int) -> tuple[int, tuple[int, ...]]:
+    if sample_rate <= 0:
+        raise ValueError("invalid-metric-sample-rate")
+    sample_count = len(audio)
+    if sample_count < 0:
+        raise ValueError("invalid-metric-sample-count")
+    duration_sample_cap = max(1, math.floor(sample_rate * _METRIC_WINDOW_SECONDS))
+    memory_sample_cap = _METRIC_WINDOW_BYTE_CAP // _METRIC_SAMPLE_BYTES
+    window_samples = min(duration_sample_cap, memory_sample_cap)
+    if sample_count <= window_samples:
+        return window_samples, (0,)
+
+    max_start = sample_count - window_samples
+    source_window_count = (sample_count + window_samples - 1) // window_samples
+    desired_window_count = max(3, source_window_count)
+    window_count = min(_METRIC_WINDOW_COUNT_CAP, desired_window_count, max_start + 1)
+    starts = tuple(
+        (window_index * max_start) // (window_count - 1)
+        for window_index in range(window_count)
+    )
+    return window_samples, starts
+
+
+def _bounded_metric_window(
+    audio: Any,
+    *,
+    start: int,
+    window_samples: int,
+    use_full_source: bool,
+) -> Any:
+    import numpy as np
+
+    candidate = audio if use_full_source else audio[start : start + window_samples]
+    window = np.asarray(candidate, dtype=np.float32)
+    if window.ndim != 1:
+        window = window.reshape(-1)
+    if window.size > window_samples or window.nbytes > _METRIC_WINDOW_BYTE_CAP:
+        raise ValueError("metric-window-memory-limit")
+    return window
+
+
+def _lower_median(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[(len(ordered) - 1) // 2]
 
 
 def _vad_frames(probabilities: tuple[float, ...] | list[float], duration_ms: float) -> list[dict[str, object]]:
@@ -482,26 +532,55 @@ class AdvisoryInferenceRuntime:
         sample_rate: int,
     ) -> None:
         assert self._metrics is not None
+        output_ids = _METRIC_OUTPUTS[metric_id]
+        valid_values: dict[str, list[float]] = {output_id: [] for output_id in output_ids}
         try:
-            result = self._metrics.score(metric_id, audio, sample_rate)
-            output_ids = _METRIC_OUTPUTS[metric_id]
-            values = result if isinstance(result, Mapping) else {"value": result}
-            available_count = 0
-            for output_id in output_ids:
-                key = metric_id if output_id == "value" else f"{metric_id}.{output_id}"
-                value = _valid_metric_value(values.get(output_id))
-                metrics[key] = {
-                    "value": value,
-                    "available": value is not None,
-                    "higherIsBetter": True,
-                }
-                available_count += int(value is not None)
-            if available_count == len(output_ids):
-                components[metric_id] = {"status": "available", "code": "ok"}
-            else:
-                components[metric_id] = {"status": "unavailable", "code": "invalid-metric-output"}
+            window_samples, starts = _metric_window_plan(audio, sample_rate)
         except Exception:
             components[metric_id] = {"status": "unavailable", "code": "metric-inference-error"}
+            return
+
+        successful_windows = 0
+        for start in starts:
+            try:
+                window = _bounded_metric_window(
+                    audio,
+                    start=start,
+                    window_samples=window_samples,
+                    use_full_source=len(starts) == 1,
+                )
+                result = self._metrics.score(metric_id, window, sample_rate)
+                values = result if isinstance(result, Mapping) else {"value": result}
+                successful_windows += 1
+                for output_id in output_ids:
+                    value = _valid_metric_value(values.get(output_id))
+                    if value is not None:
+                        valid_values[output_id].append(value)
+            except Exception:
+                continue
+
+        required_windows = max(1, (len(starts) + 1) // 2)
+        available_count = 0
+        used_partial_windows = successful_windows < len(starts)
+        for output_id in output_ids:
+            key = metric_id if output_id == "value" else f"{metric_id}.{output_id}"
+            values = valid_values[output_id]
+            used_partial_windows = used_partial_windows or len(values) < len(starts)
+            value = _lower_median(values) if len(values) >= required_windows else None
+            metrics[key] = {
+                "value": value,
+                "available": value is not None,
+                "higherIsBetter": True,
+            }
+            available_count += int(value is not None)
+
+        if available_count == len(output_ids):
+            code = "ok-partial-windows" if used_partial_windows else "ok"
+            components[metric_id] = {"status": "available", "code": code}
+        elif successful_windows == 0:
+            components[metric_id] = {"status": "unavailable", "code": "metric-inference-error"}
+        else:
+            components[metric_id] = {"status": "unavailable", "code": "invalid-metric-output"}
 
 
 _runtime_lock = threading.Lock()

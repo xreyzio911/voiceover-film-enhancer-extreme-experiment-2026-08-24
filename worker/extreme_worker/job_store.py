@@ -45,6 +45,10 @@ class JobState(str, Enum):
     CANCELLED = "cancelled"
 
 
+class TerminalCode(str, Enum):
+    STALE_JOB_EXPIRED = "stale_job_expired"
+
+
 TERMINAL_STATES = frozenset({JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED})
 ALLOWED_TRANSITIONS = {
     JobState.UPLOADING: frozenset({JobState.QUEUED, JobState.FAILED, JobState.CANCELLED}),
@@ -70,6 +74,7 @@ class JobRecord:
     lease_expires_at: float | None
     attempts: int
     owner_identity_hash: str | None = None
+    terminal_code: TerminalCode | None = None
 
 
 @dataclass(frozen=True)
@@ -86,7 +91,15 @@ class UploadRecord:
 class SQLiteJobStore:
     """Single-instance durable queue with SQLite compare-and-swap semantics."""
 
-    def __init__(self, path: str | Path, *, clock: Callable[[], float] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        clock: Callable[[], float] | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("SQLite timeout must be positive")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock or time.time
@@ -94,15 +107,20 @@ class SQLiteJobStore:
         self._closed = False
         self._connection = sqlite3.connect(
             self.path,
-            timeout=5.0,
+            timeout=timeout_seconds,
             isolation_level=None,
             check_same_thread=False,
         )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._initialize()
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            self._connection.execute(f"PRAGMA busy_timeout={max(1, round(timeout_seconds * 1000))}")
+            self._initialize()
+        except Exception:
+            self._connection.close()
+            self._closed = True
+            raise
 
     def _initialize(self) -> None:
         self._connection.executescript(
@@ -119,6 +137,7 @@ class SQLiteJobStore:
                 lease_expires_at REAL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 owner_identity_hash TEXT,
+                terminal_code TEXT,
                 UNIQUE(owner_token_hash, idempotency_key)
             );
             CREATE INDEX IF NOT EXISTS jobs_queue_idx
@@ -137,6 +156,7 @@ class SQLiteJobStore:
             """
         )
         self._ensure_column("jobs", "owner_identity_hash", "TEXT")
+        self._ensure_column("jobs", "terminal_code", "TEXT")
         self._ensure_column("uploads", "actual_sha256", "TEXT")
         self._connection.execute(
             """
@@ -166,6 +186,9 @@ class SQLiteJobStore:
             owner_identity_hash=(
                 None if row["owner_identity_hash"] is None else str(row["owner_identity_hash"])
             ),
+            terminal_code=(
+                None if row["terminal_code"] is None else TerminalCode(str(row["terminal_code"]))
+            ),
         )
 
     def _row_to_upload(self, row: sqlite3.Row) -> UploadRecord:
@@ -193,6 +216,19 @@ class SQLiteJobStore:
             if not self._closed:
                 self._connection.close()
                 self._closed = True
+
+    def probe_writable(self) -> None:
+        """Acquire and roll back a main-database write without persistent probe rows."""
+        with self._lock:
+            try:
+                self._begin_immediate()
+                self._connection.execute(
+                    "CREATE TABLE readiness_probe(probe_id INTEGER PRIMARY KEY)"
+                )
+                self._connection.execute("INSERT INTO readiness_probe(probe_id) VALUES (1)")
+            finally:
+                if self._connection.in_transaction:
+                    self._rollback()
 
     def create_job(
         self,
@@ -465,6 +501,108 @@ class SQLiteJobStore:
         target = JobState.CANCEL_REQUESTED if record.state == JobState.RUNNING else JobState.CANCELLED
         return self.transition(job_id, record.state, target)
 
+    def expire_stale_jobs(self, *, stale_after_seconds: float) -> tuple[str, ...]:
+        """Atomically terminalize stale work while preserving current active leases."""
+        if stale_after_seconds <= 0:
+            raise ValueError("stale job TTL must be positive")
+        now = float(self._clock())
+        cutoff = now - stale_after_seconds
+        nonterminal_values = tuple(
+            state.value
+            for state in (
+                JobState.UPLOADING,
+                JobState.QUEUED,
+                JobState.RUNNING,
+                JobState.CANCEL_REQUESTED,
+            )
+        )
+        placeholders = ",".join("?" for _ in nonterminal_values)
+        with self._lock:
+            self._begin_immediate()
+            try:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT jobs.job_id, jobs.state
+                    FROM jobs
+                    LEFT JOIN uploads ON uploads.job_id = jobs.job_id
+                    WHERE jobs.state IN ({placeholders})
+                      AND (
+                        (
+                          jobs.state = ?
+                          AND MAX(jobs.updated_at, COALESCE(uploads.updated_at, jobs.updated_at)) <= ?
+                        )
+                        OR (jobs.state <> ? AND jobs.updated_at <= ?)
+                      )
+                      AND (
+                        jobs.state NOT IN (?, ?)
+                        OR jobs.lease_expires_at IS NULL
+                        OR jobs.lease_expires_at <= ?
+                      )
+                    ORDER BY jobs.created_at, jobs.job_id
+                    """,
+                    (
+                        *nonterminal_values,
+                        JobState.UPLOADING.value,
+                        cutoff,
+                        JobState.UPLOADING.value,
+                        cutoff,
+                        JobState.RUNNING.value,
+                        JobState.CANCEL_REQUESTED.value,
+                        now,
+                    ),
+                ).fetchall()
+                expired_ids: list[str] = []
+                for row in rows:
+                    job_id = str(row["job_id"])
+                    current = JobState(str(row["state"]))
+                    target = (
+                        JobState.CANCELLED
+                        if current == JobState.CANCEL_REQUESTED
+                        else JobState.FAILED
+                    )
+                    updated = self._connection.execute(
+                        """
+                        UPDATE jobs
+                        SET state=?, updated_at=?, lease_owner=NULL, lease_expires_at=NULL,
+                            terminal_code=?
+                        WHERE job_id=? AND state=?
+                        """,
+                        (
+                            target.value,
+                            now,
+                            TerminalCode.STALE_JOB_EXPIRED.value,
+                            job_id,
+                            current.value,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise ConcurrentUpdate("stale job changed concurrently")
+                    expired_ids.append(job_id)
+                self._commit()
+                return tuple(expired_ids)
+            except Exception:
+                self._rollback()
+                raise
+
+    def list_terminal_jobs_by_code(
+        self,
+        *,
+        terminal_code: TerminalCode,
+    ) -> tuple[str, ...]:
+        code = TerminalCode(terminal_code)
+        terminal_values = tuple(state.value for state in TERMINAL_STATES)
+        placeholders = ",".join("?" for _ in terminal_values)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT job_id FROM jobs
+                WHERE terminal_code=? AND state IN ({placeholders})
+                ORDER BY created_at, job_id
+                """,
+                (code.value, *terminal_values),
+            ).fetchall()
+        return tuple(str(row["job_id"]) for row in rows)
+
     def purge_terminal_before(self, *, cutoff_timestamp: float) -> tuple[str, ...]:
         terminal_values = tuple(state.value for state in TERMINAL_STATES)
         placeholders = ",".join("?" for _ in terminal_values)
@@ -528,15 +666,31 @@ class SQLiteJobStore:
     def advance_upload(self, job_id: str, *, expected_offset: int, new_offset: int) -> UploadRecord:
         now = float(self._clock())
         with self._lock:
-            updated = self._connection.execute(
-                """
-                UPDATE uploads SET offset=?, updated_at=?
-                WHERE job_id=? AND offset=? AND complete=0
-                """,
-                (new_offset, now, job_id, expected_offset),
-            )
-            if updated.rowcount != 1:
-                raise ConcurrentUpdate("upload offset changed concurrently")
+            self._begin_immediate()
+            try:
+                updated = self._connection.execute(
+                    """
+                    UPDATE uploads SET offset=?, updated_at=?
+                    WHERE job_id=? AND offset=? AND complete=0
+                      AND EXISTS (
+                        SELECT 1 FROM jobs
+                        WHERE jobs.job_id=uploads.job_id AND jobs.state=?
+                      )
+                    """,
+                    (new_offset, now, job_id, expected_offset, JobState.UPLOADING.value),
+                )
+                if updated.rowcount != 1:
+                    raise ConcurrentUpdate("upload offset changed concurrently")
+                refreshed = self._connection.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND state=?",
+                    (now, job_id, JobState.UPLOADING.value),
+                )
+                if refreshed.rowcount != 1:
+                    raise ConcurrentUpdate("job is no longer accepting upload progress")
+                self._commit()
+            except Exception:
+                self._rollback()
+                raise
         return self.get_upload(job_id)
 
     def mark_upload_complete(

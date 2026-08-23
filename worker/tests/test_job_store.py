@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from contract_support import MutableClock, require_symbols
@@ -230,6 +232,112 @@ class SQLiteJobStoreContractTests(unittest.TestCase):
         for job_id in active_ids:
             with self.subTest(job_id=job_id):
                 self.assertEqual(self.store.get_job(job_id).job_id, job_id)
+
+    def test_stale_nonterminal_expiry_is_state_safe_idempotent_and_restart_durable(self) -> None:
+        active = self._create(key="active-lease")
+        self.store.transition(active.job_id, self.JobState.UPLOADING, self.JobState.QUEUED)
+        self.store.lease_next(worker_id="worker-active", lease_seconds=10_000)
+
+        uploading = self._create(key="stale-uploading")
+        queued = self._create(key="stale-queued")
+        self.store.transition(queued.job_id, self.JobState.UPLOADING, self.JobState.QUEUED)
+        running = self._create(key="stale-running")
+        self.store.transition(running.job_id, self.JobState.UPLOADING, self.JobState.QUEUED)
+        self.store.transition(running.job_id, self.JobState.QUEUED, self.JobState.RUNNING)
+        cancelling = self._create(key="stale-cancelling")
+        self.store.transition(cancelling.job_id, self.JobState.UPLOADING, self.JobState.QUEUED)
+        self.store.transition(cancelling.job_id, self.JobState.QUEUED, self.JobState.RUNNING)
+        self.store.request_cancel(cancelling.job_id)
+
+        self.clock.advance(7_201)
+        expired = self.store.expire_stale_jobs(stale_after_seconds=7_200)
+
+        self.assertEqual(
+            set(expired),
+            {uploading.job_id, queued.job_id, running.job_id, cancelling.job_id},
+        )
+        for job_id in (uploading.job_id, queued.job_id, running.job_id):
+            with self.subTest(job_id=job_id):
+                record = self.store.get_job(job_id)
+                self.assertEqual(record.state, self.JobState.FAILED)
+                self.assertEqual(record.terminal_code, "stale_job_expired")
+                self.assertIsNone(record.lease_owner)
+                self.assertIsNone(record.lease_expires_at)
+        cancelled = self.store.get_job(cancelling.job_id)
+        self.assertEqual(cancelled.state, self.JobState.CANCELLED)
+        self.assertEqual(cancelled.terminal_code, "stale_job_expired")
+
+        preserved = self.store.get_job(active.job_id)
+        self.assertEqual(preserved.state, self.JobState.RUNNING)
+        self.assertEqual(preserved.lease_owner, "worker-active")
+        self.assertIsNone(preserved.terminal_code)
+        self.assertEqual(self.store.expire_stale_jobs(stale_after_seconds=7_200), ())
+
+        self.store.close()
+        self.store = self.Store(self.db_path, clock=self.clock)
+        restored = self.store.get_job(uploading.job_id)
+        self.assertEqual(restored.state, self.JobState.FAILED)
+        self.assertEqual(restored.terminal_code, "stale_job_expired")
+
+    def test_upload_progress_refreshes_stale_job_activity(self) -> None:
+        job = self._create(key="active-upload")
+        self.store.create_upload(job.job_id, expected_size=2, expected_sha256="a" * 64)
+        self.clock.advance(7_199)
+        self.store.advance_upload(job.job_id, expected_offset=0, new_offset=1)
+        self.clock.advance(2)
+
+        self.assertEqual(self.store.expire_stale_jobs(stale_after_seconds=7_200), ())
+        self.assertEqual(self.store.get_job(job.job_id).state, self.JobState.UPLOADING)
+
+        self.clock.advance(7_201)
+        self.assertEqual(self.store.expire_stale_jobs(stale_after_seconds=7_200), (job.job_id,))
+        self.assertEqual(self.store.get_job(job.job_id).terminal_code, "stale_job_expired")
+
+    def test_legacy_database_migrates_terminal_code_without_losing_jobs(self) -> None:
+        self.store.close()
+        legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT PRIMARY KEY,
+                    owner_token_hash TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    lease_owner TEXT,
+                    lease_expires_at REAL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    owner_identity_hash TEXT
+                );
+                CREATE TABLE uploads (
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+                    expected_size INTEGER NOT NULL,
+                    expected_sha256 TEXT NOT NULL,
+                    offset INTEGER NOT NULL DEFAULT 0,
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    actual_sha256 TEXT,
+                    updated_at REAL NOT NULL
+                );
+                INSERT INTO jobs(
+                    job_id, owner_token_hash, idempotency_key, request_fingerprint,
+                    state, created_at, updated_at, attempts, owner_identity_hash
+                ) VALUES (
+                    'job_legacy', 'owner', 'legacy-key', 'legacy-fingerprint',
+                    'uploading', 0, 0, 0, NULL
+                );
+                """
+            )
+
+        self.store = self.Store(legacy_path, clock=self.clock)
+        restored = self.store.get_job("job_legacy")
+        self.assertEqual(restored.state, self.JobState.UPLOADING)
+        self.assertIsNone(restored.terminal_code)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(jobs)")}
+        self.assertIn("terminal_code", columns)
 
 
 if __name__ == "__main__":

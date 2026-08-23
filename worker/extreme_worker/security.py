@@ -76,10 +76,13 @@ class ReplayStore(Protocol):
 class SQLiteReplayStore:
     """Durable one-time nonce consumption for restart-safe ticket replay defense."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, timeout_seconds: float = 5.0) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("SQLite timeout must be positive")
         self.path = Path(path)
+        self.timeout_seconds = timeout_seconds
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.path)) as connection, connection:
+        with closing(sqlite3.connect(self.path, timeout=timeout_seconds)) as connection, connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS consumed_ticket_nonces(
@@ -92,13 +95,29 @@ class SQLiteReplayStore:
     def consume(self, nonce: str) -> None:
         digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
         try:
-            with closing(sqlite3.connect(self.path, timeout=5.0)) as connection, connection:
+            with closing(sqlite3.connect(self.path, timeout=self.timeout_seconds)) as connection, connection:
                 connection.execute(
                     "INSERT INTO consumed_ticket_nonces(nonce_sha256, consumed_at) VALUES (?, ?)",
                     (digest, time.time()),
                 )
         except sqlite3.IntegrityError as exc:
             raise TicketReplayError("Ticket was already consumed.") from exc
+
+    def probe_writable(self) -> None:
+        """Roll back a bounded write so readiness never consumes a real nonce."""
+        digest = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        with closing(
+            sqlite3.connect(self.path, timeout=self.timeout_seconds)
+        ) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT INTO consumed_ticket_nonces(nonce_sha256, consumed_at) VALUES (?, ?)",
+                    (digest, time.time()),
+                )
+            finally:
+                if connection.in_transaction:
+                    connection.rollback()
 
 
 def _b64(data: bytes) -> str:
