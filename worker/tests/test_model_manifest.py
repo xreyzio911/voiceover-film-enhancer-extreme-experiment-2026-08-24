@@ -57,12 +57,16 @@ class ModelManifestContractTests(unittest.TestCase):
 
     def test_default_set_is_analysis_only(self) -> None:
         manifest, defaults, _ = self._manifest_contract()
-        self.assertGreater(len(defaults), 0)
+        self.assertEqual(set(defaults), {"silero_vad_v6", "dnsmos_sig_bak_ovrl", "dnsmos_p808", "sigmos"})
         for model_id in defaults:
             with self.subTest(model_id=model_id):
                 artifact = manifest[model_id]
                 self.assertTrue(artifact.enabled_by_default)
                 self.assertEqual(artifact.role, "analysis")
+        self.assertFalse(manifest["utmos"].enabled_by_default)
+        self.assertEqual(manifest["utmos"].role, "analysis_optional")
+        self.assertFalse(manifest["speakeronnx_resnet34"].enabled_by_default)
+        self.assertEqual(manifest["speakeronnx_resnet34"].role, "analysis_deferred")
 
     def test_deepfilternet_is_present_but_disabled_by_default(self) -> None:
         manifest, defaults, _ = self._manifest_contract()

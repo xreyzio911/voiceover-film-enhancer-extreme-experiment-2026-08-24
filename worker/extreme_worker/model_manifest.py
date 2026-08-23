@@ -95,12 +95,12 @@ MODEL_MANIFEST: Mapping[str, ModelArtifact] = MappingProxyType(
             **SPEECHONNXMETRICS_WHEEL,
         ),
         "sigmos": _artifact("sigmos", "sigmos", role="analysis", enabled=True, **SPEECHONNXMETRICS_WHEEL),
-        "utmos": _artifact("utmos", "utmos", role="analysis", enabled=True, **SPEECHONNXMETRICS_WHEEL),
+        "utmos": _artifact("utmos", "utmos", role="analysis_optional", enabled=False, **SPEECHONNXMETRICS_WHEEL),
         "speakeronnx_resnet34": _artifact(
             "speakeronnx_resnet34",
             "speakeronnx",
-            role="analysis",
-            enabled=True,
+            role="analysis_deferred",
+            enabled=False,
             **SPEAKERONNX_WHEEL,
         ),
         "deepfilternet3": _artifact(
