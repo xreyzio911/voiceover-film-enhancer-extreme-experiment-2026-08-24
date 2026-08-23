@@ -59,5 +59,6 @@ def build_cors_headers(request_origin: str | None, allowed_origins: list[str] | 
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Headers": "Authorization, Content-Type, Upload-Offset",
         "Access-Control-Allow-Methods": "GET, HEAD, POST, PATCH, DELETE, OPTIONS",
+        "Access-Control-Expose-Headers": "Upload-Offset",
         "Vary": "Origin",
     }

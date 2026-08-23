@@ -43,7 +43,16 @@ export type ExtremeAnalysisOutcome =
   | Readonly<{ status: "succeeded"; report: ExtremeSourceReport }>
   | Readonly<{ status: "unavailable"; reason: string }>;
 
-type AnalyzeSourceInput = Readonly<{
+export type ExtremeRenderedReport = Readonly<{
+  analysisRole: "rendered-deliverable";
+  report: ExtremeSourceReport;
+}>;
+
+export type ExtremeRenderedAnalysisOutcome =
+  | Readonly<{ status: "succeeded"; renderedReport: ExtremeRenderedReport }>
+  | Readonly<{ status: "unavailable"; reason: string }>;
+
+type AnalyzeAudioInput = Readonly<{
   source: Blob;
   contentType: string;
   idempotencyKey: string;
@@ -261,7 +270,7 @@ const postJson = async (fetchImpl: typeof fetch, url: string, body: unknown, hea
 
 const unavailable = (reason: string): ExtremeAnalysisOutcome => Object.freeze({ status: "unavailable", reason });
 
-export const analyzeSourceWithExtremeWorker = async ({
+const analyzeAudioWithExtremeWorker = async ({
   source,
   contentType,
   idempotencyKey,
@@ -269,14 +278,14 @@ export const analyzeSourceWithExtremeWorker = async ({
   sleep = (milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
   chunkBytes = DEFAULT_CHUNK_BYTES,
   maxPolls = DEFAULT_MAX_POLLS,
-}: AnalyzeSourceInput): Promise<ExtremeAnalysisOutcome> => {
+}: AnalyzeAudioInput, scope: "source_analysis" | "render_analysis"): Promise<ExtremeAnalysisOutcome> => {
   let cancelWorkerJob: (() => Promise<void>) | null = null;
   try {
     const ticketResponse = await postJson(fetchImpl, "/api/extreme-ml/ticket", {
       sizeBytes: source.size,
       contentType,
       idempotencyKey,
-      scope: "source_analysis",
+      scope,
     });
     if (!ticketResponse.ok) return unavailable("ticket-unavailable");
     const ticket = (await ticketResponse.json()) as {
@@ -293,7 +302,7 @@ export const analyzeSourceWithExtremeWorker = async ({
     const jobResponse = await postJson(
       fetchImpl,
       `${workerBaseUrl}/v1/jobs`,
-      { idempotencyKey, sizeBytes: source.size, contentType, scope: "source_analysis" },
+      { idempotencyKey, sizeBytes: source.size, contentType, scope },
       { Authorization: `Bearer ${ticket.ticket}` },
     );
     if (!jobResponse.ok) return unavailable("worker-job-unavailable");
@@ -376,4 +385,23 @@ export const analyzeSourceWithExtremeWorker = async ({
     await cancelWorkerJob?.();
     return unavailable("worker-unavailable");
   }
+};
+
+export const analyzeSourceWithExtremeWorker = (
+  input: AnalyzeAudioInput,
+): Promise<ExtremeAnalysisOutcome> =>
+  analyzeAudioWithExtremeWorker(input, "source_analysis");
+
+export const analyzeRenderedWithExtremeWorker = async (
+  input: AnalyzeAudioInput,
+): Promise<ExtremeRenderedAnalysisOutcome> => {
+  const outcome = await analyzeAudioWithExtremeWorker(input, "render_analysis");
+  if (outcome.status === "unavailable") return outcome;
+  return Object.freeze({
+    status: "succeeded",
+    renderedReport: Object.freeze({
+      analysisRole: "rendered-deliverable",
+      report: outcome.report,
+    }),
+  });
 };

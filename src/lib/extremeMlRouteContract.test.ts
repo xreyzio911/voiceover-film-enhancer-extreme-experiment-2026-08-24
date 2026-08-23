@@ -18,6 +18,8 @@ test("Extreme ML ticket route authenticates metadata-only direct-to-Render uploa
   assert.match(source, /internal\/v1\/tickets/);
   assert.match(source, /sizeBytes/);
   assert.match(source, /idempotencyKey/);
+  assert.match(source, /source_analysis/);
+  assert.match(source, /render_analysis/);
   assert.doesNotMatch(source, /formData\s*\(/);
   assert.doesNotMatch(source, /arrayBuffer\s*\(/);
   assert.doesNotMatch(source, /request\.body/);

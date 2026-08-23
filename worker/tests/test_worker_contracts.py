@@ -111,6 +111,7 @@ class WorkerContractTests(unittest.TestCase):
 
         self.assertEqual(allowed["Access-Control-Allow-Origin"], "https://extreme.example")
         self.assertEqual(allowed["Access-Control-Allow-Credentials"], "true")
+        self.assertEqual(allowed["Access-Control-Expose-Headers"], "Upload-Offset")
         self.assertNotIn("Access-Control-Allow-Origin", denied)
 
     def test_report_schema_is_advisory_and_bounded(self) -> None:

@@ -635,6 +635,7 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(allowed.headers["Access-Control-Allow-Origin"], self.ORIGIN)
         self.assertEqual(allowed.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertEqual(allowed.headers["Access-Control-Expose-Headers"], "Upload-Offset")
         denied = self.client.get("/health", headers={"Origin": "https://evil.example"})
         self.assertEqual(denied.status_code, 403)
         self.assertNotIn("Access-Control-Allow-Origin", denied.headers)

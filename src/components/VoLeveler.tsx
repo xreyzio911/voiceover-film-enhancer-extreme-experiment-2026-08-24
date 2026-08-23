@@ -179,12 +179,16 @@ import {
 } from "../lib/roomCleanupPolicy";
 import { resolveAdaptiveVoicingPolicy } from "../lib/adaptiveVoicingPolicy";
 import {
+  analyzeRenderedWithExtremeWorker,
   analyzeSourceWithExtremeWorker,
   type ExtremeSourceReport,
 } from "../lib/extremeMlClient";
 import {
+  analyzeExtremeRenderedOutputsBounded,
   analyzeExtremeSourcesBounded,
   buildPlannerMlProtection,
+  compareExtremeQualityMetrics,
+  getExtremeMlSnapshotGraceMs,
 } from "../lib/extremeMlVoPolicy";
 import styles from "./VoLeveler.module.css";
 
@@ -337,10 +341,6 @@ const IMPORTANT_LOG_PATTERN = /error|failed|invalid|aborted|out of bounds/i;
 const GAIN_PLANNER_ANALYSIS_SAMPLE_RATE = 16000;
 const GAIN_PLANNER_FRAME_MS = 10;
 const PLANNER_K_WEIGHTING = true;
-// The isolated worker runs alongside browser analysis. Rendering takes one
-// short bounded snapshot grace, then ignores late evidence and continues on
-// the exact browser-only path.
-const EXTREME_ML_SNAPSHOT_GRACE_MS = 1500;
 // Mixed-formant speech fixtures with -4/0/+4 dB high-frequency tilt measured
 // +0.15/-0.04/-0.44 dB raw body shift after the raw/K split, so no absolute
 // target compensation is needed to stay within the +/-0.5 dB pre-K baseline.
@@ -930,6 +930,7 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
   const extremeSourceReportsByInputNameRef = useRef<ReadonlyMap<string, ExtremeSourceReport>>(
     new Map(),
   );
+  const activeExtremeMlPostRenderBatchRef = useRef<string | null>(null);
   const failureDismissButtonRef = useRef<HTMLButtonElement | null>(null);
   const runBatchButtonRef = useRef<HTMLButtonElement | null>(null);
   const advancedDisclosureRef = useRef<HTMLDivElement | null>(null);
@@ -8028,6 +8029,7 @@ const summarizeFailureReason = (error: unknown) => {
     sourceFirstCandidateVariantRef.current = null;
     sourceFirstPlansByBaseRef.current = new Map();
     extremeSourceReportsByInputNameRef.current = new Map();
+    activeExtremeMlPostRenderBatchRef.current = null;
     setLoading(true);
     setOutputs([]);
     setReviewBundles([]);
@@ -8042,12 +8044,14 @@ const summarizeFailureReason = (error: unknown) => {
     let finalConsonantPassStarted = false;
     let acceptingExtremeMlEvidence = false;
     let extremeMlAnalysisPromise: Promise<void> | null = null;
+    let extremeMlBatchId: string | null = null;
     try {
       let ffmpeg = await ensureFfmpeg();
       const jobs = buildJobs(files);
       if (extremeMlEnabled) {
         acceptingExtremeMlEvidence = true;
         const batchId = globalThis.crypto?.randomUUID?.() ?? `batch-${Date.now().toString(36)}`;
+        extremeMlBatchId = batchId;
         appendLog(
           `[ExtremeML] Opt-in source analysis started for ${jobs.length} file(s), with at most two direct uploads at once. Evidence is advisory and cannot block delivery.`,
         );
@@ -8056,7 +8060,7 @@ const summarizeFailureReason = (error: unknown) => {
             key: job.inputName,
             source: job.file,
             contentType: "audio/wav",
-            idempotencyKey: `${batchId}-${index + 1}`,
+            idempotencyKey: `source:${batchId}:${index + 1}`,
           })),
           analyze: analyzeSourceWithExtremeWorker,
           onOutcome: ({ key, outcome }) => {
@@ -8234,7 +8238,10 @@ const summarizeFailureReason = (error: unknown) => {
           await Promise.race([
             extremeMlAnalysisPromise,
             new Promise<void>((resolve) =>
-              window.setTimeout(resolve, EXTREME_ML_SNAPSHOT_GRACE_MS),
+              window.setTimeout(
+                resolve,
+                getExtremeMlSnapshotGraceMs(jobs.map((job) => job.file.size)),
+              ),
             ),
           ]);
         }
@@ -9956,6 +9963,92 @@ const summarizeFailureReason = (error: unknown) => {
         );
       }
       setStatus(hadErrors ? "Done with warnings" : "Done");
+
+      // Outputs are already final and downloadable here. Post-render analysis
+      // runs afterward as a separate advisory lane: it cannot change bytes,
+      // status, selection, gain, or whether a download is available.
+      if (extremeMlEnabled && extremeMlBatchId) {
+        const postRenderBatchId = extremeMlBatchId;
+        const expectedKind: OutputEntry["kind"] = loudnessConfig ? "loudness" : "mixready";
+        const comparisonContext = new Map<
+          string,
+          Readonly<{ sourceReport: ExtremeSourceReport; outputName: string }>
+        >();
+        const postRenderJobs = jobs.flatMap((job, index) => {
+          const sourceReport = extremeSourceReportsByInputNameRef.current.get(job.inputName);
+          const output = finalOutputEntries.find(
+            (entry) =>
+              entry.sourceBase === job.base &&
+              entry.variant === "clean" &&
+              entry.kind === expectedKind &&
+              (entry.partTotal === undefined || entry.partTotal <= 1),
+          );
+          if (!sourceReport || !output) return [];
+          const key = `${job.inputName}:${output.name}`;
+          comparisonContext.set(key, Object.freeze({ sourceReport, outputName: output.name }));
+          return [Object.freeze({
+            key,
+            source: output.blob,
+            contentType: "audio/wav",
+            idempotencyKey: `render:${postRenderBatchId}:${index + 1}`,
+          })];
+        });
+
+        if (postRenderJobs.length > 0) {
+          activeExtremeMlPostRenderBatchRef.current = postRenderBatchId;
+          appendLog(
+            `[ExtremeML] Post-render quality comparison started for ${postRenderJobs.length} final clean deliverable(s). Downloads remain ready and no audio can be changed.`,
+          );
+          window.setTimeout(() => {
+            if (activeExtremeMlPostRenderBatchRef.current !== postRenderBatchId) return;
+            void analyzeExtremeRenderedOutputsBounded({
+              jobs: postRenderJobs,
+              analyze: analyzeRenderedWithExtremeWorker,
+              onOutcome: ({ key, outcome }) => {
+                if (activeExtremeMlPostRenderBatchRef.current !== postRenderBatchId) return;
+                const context = comparisonContext.get(key);
+                if (!context) return;
+                if (outcome.status === "unavailable") {
+                  appendLog(
+                    `[ExtremeML] ${sanitizeBase(context.outputName)} post-render quality analysis unavailable; the deliverable remains ready and unchanged.`,
+                  );
+                  return;
+                }
+                const deltas = compareExtremeQualityMetrics(
+                  context.sourceReport,
+                  outcome.renderedReport,
+                );
+                if (deltas.length === 0) {
+                  appendLog(
+                    `[ExtremeML] ${sanitizeBase(context.outputName)} has no paired source/render quality metrics available. The deliverable remains ready and unchanged.`,
+                  );
+                  return;
+                }
+                appendLog(
+                  `[ExtremeML] ${sanitizeBase(context.outputName)} rendered-vs-source advisory quality: ${deltas
+                    .map(
+                      ({ key: metricKey, sourceValue, renderedValue, delta }) =>
+                        `${metricKey} ${sourceValue.toFixed(2)} -> ${renderedValue.toFixed(2)} (${formatSigned(delta, 2)})`,
+                    )
+                    .join(", ")}. Measurements do not select, reject, or modify audio.`,
+                );
+              },
+            })
+              .catch(() => {
+                if (activeExtremeMlPostRenderBatchRef.current === postRenderBatchId) {
+                  appendLog(
+                    "[ExtremeML] Post-render quality comparison unavailable; all deliverables remain ready and unchanged.",
+                  );
+                }
+              })
+              .finally(() => {
+                if (activeExtremeMlPostRenderBatchRef.current === postRenderBatchId) {
+                  activeExtremeMlPostRenderBatchRef.current = null;
+                }
+              });
+          }, 0);
+        }
+      }
     } catch (err) {
       const failureDetail = err instanceof Error ? err.message : String(err);
       appendLog(`Error: ${failureDetail}`);
@@ -10316,7 +10409,7 @@ const summarizeFailureReason = (error: unknown) => {
             <div className={styles.dropTitle}>Drop WAV files or choose a folder</div>
             <div className={styles.dropHint}>
               {extremeMlEnabled
-                ? "Processing and final audio rendering stay in this browser. Source WAVs are uploaded directly to the isolated Extreme worker for optional speech evidence."
+                ? "Processing and final audio rendering stay in this browser. Source and rendered WAVs are uploaded directly to the isolated Extreme worker for optional speech and source-relative quality evidence."
                 : "Processing runs in this browser. Files stay on this machine."}
             </div>
             <div className={styles.dropHint}>New drops are added to the current queue.</div>
@@ -10449,10 +10542,10 @@ const summarizeFailureReason = (error: unknown) => {
             <div>
               <strong>Extreme ML speech protection (optional)</strong>
               <div className={styles.label}>
-                Uploads each source WAV directly to the isolated Extreme worker for advisory speech-tail
-                evidence. It can only protect short, source-attached weak speech; energy detection and
-                gainPlanner still make every leveling decision. If the worker is unavailable or late, the
-                browser pipeline runs unchanged.
+                Source and one final clean rendered WAV are uploaded directly to the isolated Extreme worker
+                for advisory speech-tail evidence and source-relative quality measurement. It can only protect
+                short, source-attached weak speech; energy detection and gainPlanner still make every leveling
+                decision. If the worker is unavailable or late, the browser pipeline runs unchanged.
               </div>
             </div>
             <input
@@ -10634,6 +10727,7 @@ const summarizeFailureReason = (error: unknown) => {
                 setFiles([]);
                 setOutputs([]);
                 setReviewBundles([]);
+                activeExtremeMlPostRenderBatchRef.current = null;
                 setZipProgress(0);
                 setReviewZipProgress(0);
                 setLogs([]);

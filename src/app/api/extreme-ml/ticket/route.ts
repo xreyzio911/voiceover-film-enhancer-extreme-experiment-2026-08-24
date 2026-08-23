@@ -9,6 +9,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type TicketErrorCode = "auth" | "bad_request" | "config" | "rate_limit" | "worker";
+type AnalysisScope = "source_analysis" | "render_analysis";
 
 const MAX_METADATA_BYTES = 8 * 1024;
 const DEFAULT_MAX_AUDIO_BYTES = 1024 * 1024 * 1024;
@@ -31,6 +32,9 @@ const isEnabled = () => ["1", "true", "on", "yes"].includes(
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isAnalysisScope = (value: unknown): value is AnalysisScope =>
+  value === "source_analysis" || value === "render_analysis";
 
 const readIdentity = async (request: NextRequest) => {
   const host = request.headers.get("x-forwarded-host") ?? request.headers.get("host");
@@ -71,13 +75,13 @@ const normalizeTicketRequest = (value: unknown) => {
     || idempotencyKey.length < 1
     || idempotencyKey.length > 128
     || !/^[A-Za-z0-9._:@+-]+$/.test(idempotencyKey)
-    || scope !== "source_analysis"
+    || !isAnalysisScope(scope)
   ) return null;
   return Object.freeze({
     sizeBytes: sizeBytes as number,
     contentType,
     idempotencyKey,
-    scope: "source_analysis" as const,
+    scope,
   });
 };
 

@@ -72,6 +72,47 @@ class ExtremeWorkerApiTests(unittest.TestCase):
         response = self.client.post("/internal/v1/tickets", json={})
         self.assertEqual(response.status_code, 401)
 
+    def test_render_analysis_scope_is_preserved_by_ticket_and_job_admission(self) -> None:
+        wav = minimal_wav()
+        digest = hashlib.sha256(wav).hexdigest()
+        metadata = {
+            "ownerHash": "a" * 64,
+            "sizeBytes": len(wav),
+            "contentType": "audio/wav",
+            "idempotencyKey": "render-1",
+            "scope": "render_analysis",
+            "sha256": digest,
+        }
+        ticket_response = self.client.post(
+            "/internal/v1/tickets",
+            headers={"Authorization": f"Bearer {self.internal_secret}"},
+            json=metadata,
+        )
+        self.assertEqual(ticket_response.status_code, 200, ticket_response.text)
+        job_response = self.client.post(
+            "/v1/jobs",
+            headers={"Authorization": f"Bearer {ticket_response.json()['ticket']}"},
+            json={key: value for key, value in metadata.items() if key != "ownerHash"},
+        )
+        self.assertEqual(job_response.status_code, 200, job_response.text)
+        self.assertEqual(job_response.json()["scope"], "render_analysis")
+
+    def test_unknown_analysis_scope_is_rejected(self) -> None:
+        wav = minimal_wav()
+        response = self.client.post(
+            "/internal/v1/tickets",
+            headers={"Authorization": f"Bearer {self.internal_secret}"},
+            json={
+                "ownerHash": "a" * 64,
+                "sizeBytes": len(wav),
+                "contentType": "audio/wav",
+                "idempotencyKey": "unknown-scope",
+                "scope": "output_analysis",
+                "sha256": hashlib.sha256(wav).hexdigest(),
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
     def test_direct_upload_job_lifecycle_returns_advisory_report(self) -> None:
         wav = minimal_wav()
         digest = hashlib.sha256(wav).hexdigest()

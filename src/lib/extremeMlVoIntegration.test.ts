@@ -2,11 +2,21 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import type { ExtremeAnalysisOutcome, ExtremeSourceReport } from "./extremeMlClient.ts";
+import type {
+  ExtremeAnalysisOutcome,
+  ExtremeRenderedAnalysisOutcome,
+  ExtremeRenderedReport,
+  ExtremeSourceReport,
+} from "./extremeMlClient.ts";
 import {
+  EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
+  EXTREME_ML_MIN_SNAPSHOT_GRACE_MS,
   EXTREME_ML_MAX_CONCURRENT_ANALYSES,
+  analyzeExtremeRenderedOutputsBounded,
   analyzeExtremeSourcesBounded,
   buildPlannerMlProtection,
+  compareExtremeQualityMetrics,
+  getExtremeMlSnapshotGraceMs,
   resolvePlannerVadFrames,
 } from "./extremeMlVoPolicy.ts";
 
@@ -173,6 +183,101 @@ test("a thrown worker request becomes unavailable and does not stop later source
   assert.equal(JSON.stringify(outcomes).includes("secret-token-must-not-escape"), false);
 });
 
+test("rendered-deliverable analysis has its own bounded fail-open lane", async () => {
+  const jobs = Array.from({ length: 5 }, (_, index) => ({
+    key: `render-${index}`,
+    source: new Blob([String(index)], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: `render:batch:${index}`,
+  }));
+  let active = 0;
+  let maximumActive = 0;
+  const outcomes: ExtremeRenderedAnalysisOutcome[] = [];
+
+  await analyzeExtremeRenderedOutputsBounded({
+    jobs,
+    analyze: async ({ idempotencyKey }): Promise<ExtremeRenderedAnalysisOutcome> => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      if (idempotencyKey.endsWith(":0")) throw new Error("private-worker-detail");
+      return {
+        status: "succeeded",
+        renderedReport: {
+          analysisRole: "rendered-deliverable",
+          report: makeReport([0.1]),
+        },
+      };
+    },
+    onOutcome: ({ outcome }) => outcomes.push(outcome),
+  });
+
+  assert.equal(outcomes.length, jobs.length);
+  assert.ok(maximumActive <= EXTREME_ML_MAX_CONCURRENT_ANALYSES);
+  assert.equal(
+    outcomes.some(
+      (outcome) => outcome.status === "unavailable" && outcome.reason === "worker-unavailable",
+    ),
+    true,
+  );
+  assert.equal(JSON.stringify(outcomes).includes("private-worker-detail"), false);
+});
+
+test("ML snapshot grace scales for real WAV uploads but remains a bounded fail-open wait", () => {
+  assert.equal(getExtremeMlSnapshotGraceMs([]), EXTREME_ML_MIN_SNAPSHOT_GRACE_MS);
+  assert.equal(getExtremeMlSnapshotGraceMs([1 * 1024 * 1024]), 5_125);
+  assert.equal(
+    getExtremeMlSnapshotGraceMs([161_332_990]),
+    24_233,
+  );
+  assert.equal(
+    getExtremeMlSnapshotGraceMs([Number.NaN, -1, 10 * 1024 * 1024 * 1024]),
+    EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
+  );
+});
+
+test("render/source quality comparison exposes only finite paired advisory deltas", () => {
+  const source = makeReport([0.1], {
+    metrics: {
+      "dnsmos.ovrl": { value: 3.5, available: true, higherIsBetter: true },
+      "sigmos.disc": { value: 4.1, available: true, higherIsBetter: true },
+      unavailable: { value: null, available: false, higherIsBetter: true },
+    },
+  });
+  const rendered = makeReport([0.1], {
+    metrics: {
+      "dnsmos.ovrl": { value: 3.8, available: true, higherIsBetter: true },
+      "sigmos.disc": { value: 3.9, available: true, higherIsBetter: true },
+      unavailable: { value: 9, available: true, higherIsBetter: true },
+    },
+  });
+
+  assert.deepEqual(compareExtremeQualityMetrics(source, {
+    analysisRole: "rendered-deliverable",
+    report: rendered,
+  }), [
+    { key: "dnsmos.ovrl", sourceValue: 3.5, renderedValue: 3.8, delta: 0.3, higherIsBetter: true },
+    { key: "sigmos.disc", sourceValue: 4.1, renderedValue: 3.9, delta: -0.2, higherIsBetter: true },
+  ]);
+});
+
+test("a rendered report wrapper cannot become gain-planner source evidence", () => {
+  const rendered: ExtremeRenderedReport = {
+    analysisRole: "rendered-deliverable",
+    report: makeReport([0.95, 0.9, 0.92]),
+  };
+  const protection = buildPlannerMlProtection({
+    report: rendered as unknown as ExtremeSourceReport,
+    energySpeechMask: [true, true, false],
+    plannerFrameMs: 10,
+    rangeStartSec: 0,
+  });
+
+  assert.equal(protection.reason, "legacy-fallback");
+  assert.equal(protection.protectedSpeechFrameMask, null);
+});
+
 test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authoritative", async () => {
   const source = await readFile(new URL("../components/VoLeveler.tsx", import.meta.url), "utf8");
 
@@ -181,7 +286,8 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
     /const \[extremeMlEnabled, setExtremeMlEnabled\] = useState\(false\)/,
   );
   assert.match(source, /<strong>Extreme ML speech protection \(optional\)<\/strong>/);
-  assert.match(source, /source WAVs? (?:are |will be )?uploaded directly to (?:the )?isolated Extreme worker/i);
+  assert.match(source, /source and rendered WAVs? (?:are |will be )?uploaded directly to (?:the )?isolated Extreme worker/i);
+  assert.match(source, /analyzeRenderedWithExtremeWorker/);
   assert.match(source, /If (?:the )?worker (?:is )?unavailable or late[\s\S]{0,120}browser pipeline/i);
   assert.match(source, /const mask = buildSpeechMask\(/);
   assert.match(source, /speechRunsFromMask\(mask\)/);
@@ -190,6 +296,18 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
   assert.match(
     source,
     /acceptingExtremeMlEvidence = false;[\s\S]{0,500}let hadErrors = false/,
+  );
+  assert.match(source, /getExtremeMlSnapshotGraceMs\(jobs\.map\(\(job\) => job\.file\.size\)\)/);
+  const exposeOutputsIndex = source.indexOf("setOutputs([...finalOutputEntries])");
+  const postRenderAnalysisIndex = source.indexOf(
+    "analyzeExtremeRenderedOutputsBounded",
+    exposeOutputsIndex,
+  );
+  assert.ok(exposeOutputsIndex >= 0);
+  assert.ok(postRenderAnalysisIndex > exposeOutputsIndex);
+  assert.doesNotMatch(
+    source.slice(exposeOutputsIndex, postRenderAnalysisIndex + 80),
+    /await\s+analyzeExtremeRenderedOutputsBounded/,
   );
   assert.doesNotMatch(source, /mlProtection\.(?:gainDb|eq|compressor|limiter|selectedCandidate)/i);
 });

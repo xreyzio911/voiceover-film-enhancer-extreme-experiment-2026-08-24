@@ -1,9 +1,51 @@
-import type { ExtremeAnalysisOutcome, ExtremeSourceReport } from "./extremeMlClient.ts";
+import type {
+  ExtremeAnalysisOutcome,
+  ExtremeRenderedAnalysisOutcome,
+  ExtremeRenderedReport,
+  ExtremeSourceReport,
+} from "./extremeMlClient.ts";
 import { buildMlSpeechProtectionMask, type MlVadFrame } from "./mlSpeechProtection.ts";
 
 export const EXTREME_ML_MAX_CONCURRENT_ANALYSES = 2;
+export const EXTREME_ML_MIN_SNAPSHOT_GRACE_MS = 1_500;
+export const EXTREME_ML_MAX_SNAPSHOT_GRACE_MS = 30_000;
+
+const EXTREME_ML_SNAPSHOT_BASE_MS = 5_000;
+const EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND = 8 * 1024 * 1024;
+
+/**
+ * Gives an explicitly enabled ML upload enough time to finish without turning
+ * it into a delivery gate. The largest source sets the estimate because two
+ * upload lanes run concurrently; malformed sizes are ignored and every wait
+ * remains capped at 30 seconds before the exact browser path resumes.
+ */
+export const getExtremeMlSnapshotGraceMs = (sourceSizesBytes: readonly number[]) => {
+  const largestSourceBytes = sourceSizesBytes.reduce(
+    (largest, sizeBytes) =>
+      Number.isFinite(sizeBytes) && sizeBytes >= 0
+        ? Math.max(largest, sizeBytes)
+        : largest,
+    -1,
+  );
+  if (largestSourceBytes < 0) return EXTREME_ML_MIN_SNAPSHOT_GRACE_MS;
+  const estimatedMs = Math.ceil(
+    EXTREME_ML_SNAPSHOT_BASE_MS +
+      (largestSourceBytes / EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND) * 1_000,
+  );
+  return Math.min(
+    EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
+    Math.max(EXTREME_ML_MIN_SNAPSHOT_GRACE_MS, estimatedMs),
+  );
+};
 
 export type ExtremeMlSourceJob = Readonly<{
+  key: string;
+  source: Blob;
+  contentType: string;
+  idempotencyKey: string;
+}>;
+
+export type ExtremeMlRenderedJob = Readonly<{
   key: string;
   source: Blob;
   contentType: string;
@@ -21,7 +63,21 @@ type ExtremeMlSourceOutcome = Readonly<{
   outcome: ExtremeAnalysisOutcome;
 }>;
 
+type AnalyzeExtremeRendered = (input: Readonly<{
+  source: Blob;
+  contentType: string;
+  idempotencyKey: string;
+}>) => Promise<ExtremeRenderedAnalysisOutcome>;
+
+type ExtremeMlRenderedOutcome = Readonly<{
+  key: string;
+  outcome: ExtremeRenderedAnalysisOutcome;
+}>;
+
 const unavailableOutcome = (): ExtremeAnalysisOutcome =>
+  Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
+
+const unavailableRenderedOutcome = (): ExtremeRenderedAnalysisOutcome =>
   Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
 
 /**
@@ -60,6 +116,97 @@ export const analyzeExtremeSourcesBounded = async ({
 
   await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
 };
+
+/**
+ * Keeps post-render measurement in its own bounded lane and result type. It is
+ * intentionally separate from source analysis so rendered VAD can never be
+ * inserted into the gain planner's source-evidence map.
+ */
+export const analyzeExtremeRenderedOutputsBounded = async ({
+  jobs,
+  analyze,
+  onOutcome,
+}: Readonly<{
+  jobs: readonly ExtremeMlRenderedJob[];
+  analyze: AnalyzeExtremeRendered;
+  onOutcome: (result: ExtremeMlRenderedOutcome) => void;
+}>): Promise<void> => {
+  const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
+
+  const runLane = async (index: number): Promise<void> => {
+    if (index >= jobs.length) return;
+    const job = jobs[index];
+    let outcome: ExtremeRenderedAnalysisOutcome;
+    try {
+      outcome = await analyze({
+        source: job.source,
+        contentType: job.contentType,
+        idempotencyKey: job.idempotencyKey,
+      });
+    } catch {
+      outcome = unavailableRenderedOutcome();
+    }
+    onOutcome(Object.freeze({ key: job.key, outcome }));
+    await runLane(index + laneCount);
+  };
+
+  await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
+};
+
+const EXTREME_QUALITY_METRIC_KEYS = Object.freeze([
+  "dnsmos.ovrl",
+  "dnsmos.sig",
+  "dnsmos.bak",
+  "dnsmos_p808",
+  "sigmos.ovrl",
+  "sigmos.sig",
+  "sigmos.disc",
+  "sigmos.col",
+  "sigmos.loud",
+  "sigmos.noise",
+  "sigmos.reverb",
+  "utmos",
+] as const);
+
+export type ExtremeQualityMetricDelta = Readonly<{
+  key: (typeof EXTREME_QUALITY_METRIC_KEYS)[number];
+  sourceValue: number;
+  renderedValue: number;
+  delta: number;
+  higherIsBetter: boolean;
+}>;
+
+/**
+ * Compares only known, finite, like-for-like advisory metrics. No delta is a
+ * quality gate and the function has no audio, selection, or gain authority.
+ */
+export const compareExtremeQualityMetrics = (
+  sourceReport: ExtremeSourceReport,
+  renderedReport: ExtremeRenderedReport,
+): readonly ExtremeQualityMetricDelta[] => Object.freeze(
+  EXTREME_QUALITY_METRIC_KEYS.flatMap((key) => {
+    const sourceMetric = sourceReport.metrics[key];
+    const renderedMetric = renderedReport.report.metrics[key];
+    if (
+      sourceMetric?.available !== true ||
+      renderedMetric?.available !== true ||
+      typeof sourceMetric.value !== "number" ||
+      typeof renderedMetric.value !== "number" ||
+      !Number.isFinite(sourceMetric.value) ||
+      !Number.isFinite(renderedMetric.value) ||
+      sourceMetric.higherIsBetter !== renderedMetric.higherIsBetter
+    ) {
+      return [];
+    }
+    return [Object.freeze({
+      key,
+      sourceValue: sourceMetric.value,
+      renderedValue: renderedMetric.value,
+      delta: Math.round((renderedMetric.value - sourceMetric.value) * 1_000_000) / 1_000_000,
+      higherIsBetter: sourceMetric.higherIsBetter,
+    })];
+  }),
+);
 
 const isAdvisoryReport = (report: ExtremeSourceReport | null): report is ExtremeSourceReport =>
   report !== null &&

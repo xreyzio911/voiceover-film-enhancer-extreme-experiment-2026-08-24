@@ -52,6 +52,7 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
 _AUDIO_TYPES = frozenset({"audio/wav", "audio/x-wav"})
 _UPLOAD_TYPES = frozenset({"audio/wav", "audio/x-wav", "application/offset+octet-stream"})
+_ANALYSIS_SCOPES = frozenset({"source_analysis", "render_analysis"})
 _LOGGER = logging.getLogger("extreme_worker")
 
 
@@ -273,7 +274,8 @@ def _normalize_metadata(payload: Any, *, max_audio_bytes: int, require_owner: bo
         or content_type not in _AUDIO_TYPES
         or not isinstance(idempotency_key, str)
         or not _IDEMPOTENCY_RE.fullmatch(idempotency_key)
-        or scope != "source_analysis"
+        or not isinstance(scope, str)
+        or scope not in _ANALYSIS_SCOPES
     ):
         return None
     if size_bytes > max_audio_bytes:
@@ -287,7 +289,7 @@ def _normalize_metadata(payload: Any, *, max_audio_bytes: int, require_owner: bo
         "sizeBytes": size_bytes,
         "contentType": content_type,
         "idempotencyKey": idempotency_key,
-        "scope": "source_analysis",
+        "scope": scope,
         "sha256": sha256,
     }
 
@@ -802,6 +804,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 "accessToken": access_token,
                 "uploadOffset": upload_offset,
                 "maxChunkBytes": max_chunk_bytes,
+                "scope": payload["scope"],
             },
             request,
         )

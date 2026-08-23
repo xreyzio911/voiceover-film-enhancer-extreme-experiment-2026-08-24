@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  analyzeRenderedWithExtremeWorker,
   analyzeSourceWithExtremeWorker,
   normalizeExtremeSourceReport,
   normalizeExtremeWorkerBaseUrl,
@@ -178,6 +179,54 @@ test("source analysis sends only metadata through Vercel and WAV bytes directly 
   assert.deepEqual(uploadCalls.map((call) => (call.init.body as Blob).size), [4, 4, 2]);
   assert.equal(uploadCalls.every((call) => call.url.startsWith("https://extreme-worker.onrender.com/")), true);
   assert.equal(uploadCalls.every((call) => new Headers(call.init.headers).get("Authorization") === "Bearer job_secret"), true);
+});
+
+test("render analysis keeps its distinct least-privilege scope through ticket and job admission", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const outcome = await analyzeRenderedWithExtremeWorker({
+    source: new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: "render-1",
+    fetchImpl: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/extreme-ml/ticket") {
+        return Response.json({
+          workerBaseUrl: "https://worker.example",
+          ticket: "ticket_opaque",
+          expiresAt: "2026-08-24T01:00:00.000Z",
+        });
+      }
+      if (url.endsWith("/v1/jobs")) {
+        return Response.json({
+          jobId: "render_job",
+          accessToken: "render_secret",
+          uploadOffset: 0,
+          maxChunkBytes: 16,
+        });
+      }
+      if (url.endsWith("/input") && init.method === "PATCH") {
+        return new Response(null, { status: 204, headers: { "Upload-Offset": "3" } });
+      }
+      if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
+      if (url.endsWith("/report")) return Response.json(validReport());
+      if (url.endsWith("/v1/jobs/render_job")) return Response.json({ state: "succeeded" });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    sleep: async () => undefined,
+  });
+
+  assert.equal(outcome.status, "succeeded");
+  if (outcome.status === "succeeded") {
+    assert.equal(outcome.renderedReport.analysisRole, "rendered-deliverable");
+    assert.equal(outcome.renderedReport.report.levelAuthority, "gainPlanner");
+    assert.equal(Object.isFrozen(outcome.renderedReport), true);
+  }
+  for (const call of calls) {
+    if (typeof call.init.body !== "string") continue;
+    if (call.url.endsWith("/input/complete")) continue;
+    assert.equal(JSON.parse(call.init.body as string).scope, "render_analysis");
+  }
 });
 
 test("worker failures and exhausted polling fail open without throwing", async () => {
