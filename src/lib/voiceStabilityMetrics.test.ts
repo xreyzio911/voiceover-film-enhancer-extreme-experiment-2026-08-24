@@ -787,8 +787,8 @@ test("measure CLI scopes an external source root to explicit pairs only", () => 
     ]),
     /external-source-root.*absolute/i,
   );
-  assert.throws(
-    () => parseMeasureVoCorpusArguments([
+  assert.deepEqual(
+    parseMeasureVoCorpusArguments([
       "--out",
       "tasks/render-evidence/current-goal/audition.json",
       "--pair",
@@ -798,7 +798,13 @@ test("measure CLI scopes an external source root to explicit pairs only", () => 
       "--external-result-root",
       "A:/CodexTaskEvidence/current-run",
     ]),
-    /external-source-root.*external-result-root|external-result-root.*external-source-root/i,
+    {
+      externalResultRoot: "A:/CodexTaskEvidence/current-run",
+      externalSourceRoot: "A:/CodexBackups/voiceover-extreme-baseline",
+      output: "tasks/render-evidence/current-goal/audition.json",
+      pairSpecs: ["clips/source.wav|clips/result.wav|ambiguous-roots"],
+      pairsJson: null,
+    },
   );
 });
 
@@ -1032,6 +1038,63 @@ test("explicit pairs may read source and result WAVs from one exact external sou
     await rm(root, { recursive: true, force: true });
     await rm(externalRoot, { recursive: true, force: true });
     await rm(siblingRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit pairs may use separate exact source and result roots without widening either role", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-dual-root-repo-"));
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-dual-root-source-"));
+  const resultRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-dual-root-result-"));
+  try {
+    const source = path.join(sourceRoot, "source.wav");
+    const result = path.join(resultRoot, "result.wav");
+    const wrongSource = path.join(resultRoot, "wrong-source.wav");
+    const wrongResult = path.join(sourceRoot, "wrong-result.wav");
+    await writeFile(source, new Uint8Array());
+    await writeFile(result, new Uint8Array());
+    await writeFile(wrongSource, new Uint8Array());
+    await writeFile(wrongResult, new Uint8Array());
+
+    const [pair] = await resolveExplicitCorpusPairs(
+      root,
+      [`${source}|${result}|dual-root-pair`],
+      resultRoot,
+      sourceRoot,
+    );
+    assert.equal(pair.source.path, path.resolve(source));
+    assert.equal(pair.result.path, path.resolve(result));
+
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${wrongSource}|${result}|wrong-source-root`],
+        resultRoot,
+        sourceRoot,
+      ),
+      /external source root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${source}|${wrongResult}|wrong-result-root`],
+        resultRoot,
+        sourceRoot,
+      ),
+      /external result root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${source}|${source}|overlapping-roots`],
+        sourceRoot,
+        sourceRoot,
+      ),
+      /external.*root.*overlap/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(sourceRoot, { recursive: true, force: true });
+    await rm(resultRoot, { recursive: true, force: true });
   }
 });
 
