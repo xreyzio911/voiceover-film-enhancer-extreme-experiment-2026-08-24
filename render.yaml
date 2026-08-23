@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: voiceover-extreme-ml-worker-2026-08-24
+    runtime: docker
+    plan: standard
+    region: singapore
+    rootDir: worker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: checksPass
+    healthCheckPath: /health/ready
+    maxShutdownDelaySeconds: 300
+    numInstances: 1
+    disk:
+      name: extreme-worker-data
+      mountPath: /var/data
+      sizeGB: 20
+    envVars:
+      - key: EXTREME_STORAGE_ROOT
+        value: /var/data
+      - key: EXTREME_ML_MODEL_DIR
+        value: /opt/extreme/models
+      - key: EXTREME_ML_METRICS
+        value: dnsmos,dnsmos_p808,sigmos
+      - key: EXTREME_ML_MAX_ANALYSIS_SECONDS
+        value: "2160"
+      - key: EXTREME_ALLOWED_ORIGINS
+        sync: false
+      - key: EXTREME_INTERNAL_SECRET
+        sync: false
+      - key: EXTREME_TICKET_SECRET
+        sync: false

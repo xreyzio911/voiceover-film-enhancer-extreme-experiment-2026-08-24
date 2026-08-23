@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.wav
+worker-state/
+tests/
+requirements-test.txt
+README.md
+RUNTIME.md

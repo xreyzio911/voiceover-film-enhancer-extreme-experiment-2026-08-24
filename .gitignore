@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+/.venv/
 /.venv-audio-splitter
 /.audio-separator-models
 /checkpoints

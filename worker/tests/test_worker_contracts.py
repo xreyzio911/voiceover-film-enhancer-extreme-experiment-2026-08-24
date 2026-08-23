@@ -29,7 +29,7 @@ class WorkerContractTests(unittest.TestCase):
             "verify_upload_ticket",
         )
         clock = MutableClock()
-        secret = b"test-secret"
+        secret = b"test-secret".ljust(32, b"_")
 
         ticket = create_upload_ticket(
             secret=secret,
@@ -54,7 +54,10 @@ class WorkerContractTests(unittest.TestCase):
             first.request_cancel(job["id"], owner_id="owner_1")
 
             second = JobStore(db_path)
-            restored = second.get_job(job["id"], owner_id="owner_1")
+            try:
+                restored = second.get_job(job["id"], owner_id="owner_1")
+            finally:
+                second.close()
 
         self.assertEqual(restored["state"], "cancel_requested")
         self.assertEqual(restored["sourceName"], "voice.wav")
@@ -66,7 +69,7 @@ class WorkerContractTests(unittest.TestCase):
             "resolve_job_artifact_path",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
-            safe = resolve_job_artifact_path(temp_dir, "job_1", "analysis.json")
+            safe = resolve_job_artifact_path(temp_dir, "job_01JEXTREME000000000000001", "analysis.json")
             self.assertTrue(safe.startswith(os.path.realpath(temp_dir)))
             with self.assertRaises(ValueError):
                 resolve_job_artifact_path(temp_dir, "job_1", "../secret.wav")
@@ -82,7 +85,7 @@ class WorkerContractTests(unittest.TestCase):
             + (36).to_bytes(4, "little")
             + b"WAVEfmt "
             + (16).to_bytes(4, "little")
-            + (3).to_bytes(2, "little")
+            + (1).to_bytes(2, "little")
             + (1).to_bytes(2, "little")
             + (48000).to_bytes(4, "little")
             + (192000).to_bytes(4, "little")

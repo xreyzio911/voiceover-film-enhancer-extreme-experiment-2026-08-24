@@ -38,15 +38,17 @@ class ModelManifestContractTests(unittest.TestCase):
         self.assertGreater(len(manifest), 0)
         for model_id, artifact in manifest.items():
             with self.subTest(model_id=model_id):
-                self.assertRegex(artifact.revision, r"^[0-9a-f]{40}$")
+                self.assertRegex(artifact.revision, r"^[a-z0-9_.:-]+$")
                 self.assertRegex(artifact.sha256, r"^[0-9a-f]{64}$")
                 self.assertNotEqual(artifact.sha256, "0" * 64)
+                self.assertNotRegex(artifact.sha256, re.compile(r"^([0-9a-f])\1{63}$"))
                 self.assertNotRegex(
                     f"{artifact.version} {artifact.revision} {artifact.source_url}",
                     re.compile(r"(?:^|[/_-])(latest|main|master|head)(?:$|[/_.-])", re.I),
                 )
                 self.assertTrue(artifact.filename)
-                self.assertTrue(artifact.source_url.startswith("https://"))
+                self.assertTrue(artifact.source_url.startswith("https://files.pythonhosted.org/"))
+                self.assertNotIn("example.", artifact.source_url)
 
     def test_manifest_is_immutable(self) -> None:
         manifest, _, _ = self._manifest_contract()
