@@ -60,6 +60,13 @@ class FakeAnalyzer:
                     "sha256": hashlib.sha256(b"fake-silero-vad").hexdigest(),
                 }
             ],
+            "telemetry": {
+                "runtimeStatus": "ready",
+                "reason": "ok",
+                "audioMutation": False,
+                "candidateSelected": False,
+                "gainDbChanged": False,
+            },
         }
 
 

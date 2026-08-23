@@ -1,8 +1,9 @@
 # Runtime dependencies are locked with hashes in requirements-production.txt.
 # Model graphs are separate checksum-pinned Docker build inputs.
-fastapi==0.116.1
+fastapi==0.141.1
 huggingface-hub==0.34.4
 numpy==2.2.6
 onnxruntime==1.22.1
 speechonnxmetrics @ https://files.pythonhosted.org/packages/46/b4/7721b25714363de1ad956c9437a4315d48ddec5bd77014627ad72c6ef578/speechonnxmetrics-0.0.1-py3-none-any.whl#sha256=50f1c88c4fd6bc9319e2194973c86f2204ad22a44ac725b0294cc9b87c6a45dc
+starlette==1.6.0
 uvicorn==0.35.0

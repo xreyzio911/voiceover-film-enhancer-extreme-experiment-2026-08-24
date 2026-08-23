@@ -6,9 +6,6 @@ import wave
 from pathlib import Path
 from typing import Callable
 
-from .model_runtime import DEFAULT_RUNTIME_ARTIFACTS, RuntimeConfig, model_set_id
-
-
 class LocalFallbackAnalyzer:
     """Dependency-free advisory fallback for explicitly configured local/test apps."""
 
@@ -18,43 +15,24 @@ class LocalFallbackAnalyzer:
             sample_rate = source.getframerate()
             channels = source.getnchannels()
             duration_ms = source.getnframes() * 1000.0 / sample_rate
-        frames = [
-            {
-                "startMs": index * 10,
-                "endMs": min(duration_ms, (index + 1) * 10),
-                "speechProbability": 0.0,
-            }
-            for index in range(max(1, math.ceil(duration_ms / 10.0)))
-            if index * 10 < duration_ms
-        ]
-        runtime_config = RuntimeConfig.from_env()
-        declared = [item for item in DEFAULT_RUNTIME_ARTIFACTS if item.bundled_by_default]
         return {
             "schemaVersion": 1,
             "advisoryOnly": True,
             "canBlockDelivery": False,
             "canChangeGainDb": False,
             "levelAuthority": "gainPlanner",
-            "modelSetId": model_set_id(runtime_config),
+            "modelSetId": "unavailable-local-fallback",
             "source": {
                 "sha256": source_sha256,
                 "durationMs": round(duration_ms, 3),
                 "sampleRate": sample_rate,
                 "channels": channels,
             },
-            "vad": {"frameMs": 10, "frames": frames},
+            "vad": {"frameMs": 10, "frames": []},
             "metrics": {
                 "dnsmos.ovrl": {"value": None, "available": False, "higherIsBetter": True}
             },
-            "models": [
-                {
-                    "id": item.id,
-                    "version": item.version,
-                    "revision": item.revision,
-                    "sha256": item.sha256,
-                }
-                for item in declared
-            ],
+            "models": [],
             "telemetry": {
                 "runtimeStatus": "degraded",
                 "reason": "local-placeholder",

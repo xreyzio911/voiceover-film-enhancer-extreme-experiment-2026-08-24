@@ -6,6 +6,12 @@ selects, normalizes, compresses, EQs, limits, or changes gain. The browser's
 late, invalid, or failing model produces `runtimeStatus: degraded` telemetry and empty
 or unavailable evidence; it does not block browser delivery.
 
+Uploaded source bytes are deleted immediately after success, failure, or acknowledged
+cancellation. Successful advisory reports remain available for 24 hours by default,
+then the SQLite row and fixed per-job artifacts are purged. The worker accepts at most
+four active jobs per authenticated owner by default; a full lane returns HTTP 429 and
+the browser continues through the unchanged local path.
+
 ## App integration
 
 The job executor should create one process-wide runtime and persist its returned JSON:
@@ -78,6 +84,9 @@ Non-secret defaults in the Blueprint:
 - `EXTREME_ML_MODEL_DIR=/opt/extreme/models`
 - `EXTREME_ML_METRICS=dnsmos,dnsmos_p808,sigmos`
 - `EXTREME_ML_MAX_ANALYSIS_SECONDS=2160`
+- `EXTREME_ML_RETENTION_SECONDS=86400`
+- `EXTREME_ML_MAINTENANCE_INTERVAL_SECONDS=300`
+- `EXTREME_ML_MAX_ACTIVE_JOBS_PER_OWNER=4`
 
 The service exposes `/health/live` for the container probe and `/health/ready` for
 Render. Readiness must describe API/storage readiness; model failure remains degraded

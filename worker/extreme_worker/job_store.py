@@ -31,6 +31,10 @@ class IdempotencyConflict(JobStoreError):
     pass
 
 
+class ActiveJobLimitExceeded(JobStoreError):
+    pass
+
+
 class JobState(str, Enum):
     UPLOADING = "uploading"
     QUEUED = "queued"
@@ -251,6 +255,7 @@ class SQLiteJobStore:
         access_token_hash: str,
         idempotency_key: str,
         request_fingerprint: str,
+        max_active_jobs_per_owner: int | None = None,
     ) -> tuple[JobRecord, bool]:
         """Create an API job or rotate its bearer hash on an idempotent retry."""
         if not all((owner_identity_hash, access_token_hash, idempotency_key, request_fingerprint)):
@@ -275,6 +280,21 @@ class SQLiteJobStore:
                     ).fetchone()
                     self._commit()
                     return self._row_to_job(row), False
+                if max_active_jobs_per_owner is not None:
+                    if max_active_jobs_per_owner <= 0:
+                        raise ValueError("active job limit must be positive")
+                    terminal_values = tuple(state.value for state in TERMINAL_STATES)
+                    active_count = int(
+                        self._connection.execute(
+                            """
+                            SELECT COUNT(*) FROM jobs
+                            WHERE owner_identity_hash=? AND state NOT IN (?, ?, ?)
+                            """,
+                            (owner_identity_hash, *terminal_values),
+                        ).fetchone()[0]
+                    )
+                    if active_count >= max_active_jobs_per_owner:
+                        raise ActiveJobLimitExceeded("owner has too many active jobs")
                 job_id = f"job_{secrets.token_urlsafe(18)}"
                 self._connection.execute(
                     """

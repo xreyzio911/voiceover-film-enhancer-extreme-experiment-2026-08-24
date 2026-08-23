@@ -8066,6 +8066,32 @@ const summarizeFailureReason = (error: unknown) => {
                 ...extremeSourceReportsByInputNameRef.current,
                 [key, outcome.report],
               ]);
+              if (outcome.report.telemetry.runtimeStatus === "degraded") {
+                appendLog(
+                  `[ExtremeML] ${sanitizeBase(key)}: model evidence degraded (${outcome.report.telemetry.reason}); browser processing remains unchanged where evidence is missing.`,
+                );
+              }
+              const sourceQualityMetrics: ReadonlyArray<
+                readonly [string, ExtremeSourceReport["metrics"][string] | undefined]
+              > = [
+                ["DNSMOS overall", outcome.report.metrics["dnsmos.ovrl"]],
+                ["DNSMOS speech", outcome.report.metrics["dnsmos.sig"]],
+                ["DNSMOS background", outcome.report.metrics["dnsmos.bak"]],
+                ["P.808", outcome.report.metrics.dnsmos_p808],
+                ["SIGMOS overall", outcome.report.metrics["sigmos.ovrl"]],
+              ];
+              const sourceQualityEvidence = sourceQualityMetrics.flatMap(([label, metric]) =>
+                metric?.available === true && typeof metric.value === "number"
+                  ? [`${label} ${metric.value.toFixed(2)}`]
+                  : [],
+              );
+              if (sourceQualityEvidence.length > 0) {
+                appendLog(
+                  `[ExtremeML] ${sanitizeBase(key)} source quality evidence: ${sourceQualityEvidence.join(
+                    ", ",
+                  )}. Advisory source measurements only; they do not select or reject audio.`,
+                );
+              }
               return;
             }
             appendLog(

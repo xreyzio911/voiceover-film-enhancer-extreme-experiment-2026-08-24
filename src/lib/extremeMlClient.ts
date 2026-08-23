@@ -30,6 +30,13 @@ export type ExtremeSourceReport = Readonly<{
     revision: string;
     sha256: string;
   }>[];
+  telemetry: Readonly<{
+    runtimeStatus: "ready" | "degraded";
+    reason: string;
+    audioMutation: false;
+    candidateSelected: false;
+    gainDbChanged: false;
+  }>;
 }>;
 
 export type ExtremeAnalysisOutcome =
@@ -100,6 +107,7 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
     vad?: { frameMs?: unknown; frames?: unknown };
     metrics?: unknown;
     models?: unknown;
+    telemetry?: unknown;
   };
   if (!report || typeof report !== "object") return null;
   if (
@@ -199,6 +207,25 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
       sha256: candidate.sha256,
     }));
   }
+  const telemetry = report.telemetry as {
+    runtimeStatus?: unknown;
+    reason?: unknown;
+    audioMutation?: unknown;
+    candidateSelected?: unknown;
+    gainDbChanged?: unknown;
+  };
+  if (
+    !telemetry ||
+    typeof telemetry !== "object" ||
+    (telemetry.runtimeStatus !== "ready" && telemetry.runtimeStatus !== "degraded") ||
+    typeof telemetry.reason !== "string" ||
+    !/^[A-Za-z0-9._-]{1,80}$/.test(telemetry.reason) ||
+    telemetry.audioMutation !== false ||
+    telemetry.candidateSelected !== false ||
+    telemetry.gainDbChanged !== false
+  ) {
+    return null;
+  }
   return Object.freeze({
     schemaVersion: 1,
     advisoryOnly: true,
@@ -215,6 +242,13 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
     vad: Object.freeze({ frameMs: vad.frameMs, frames: Object.freeze(frames) }),
     metrics: Object.freeze(metrics as Record<string, NonNullable<ReturnType<typeof freezeMetric>>>),
     models: Object.freeze(models),
+    telemetry: Object.freeze({
+      runtimeStatus: telemetry.runtimeStatus,
+      reason: telemetry.reason,
+      audioMutation: false,
+      candidateSelected: false,
+      gainDbChanged: false,
+    }),
   });
 };
 
@@ -236,6 +270,7 @@ export const analyzeSourceWithExtremeWorker = async ({
   chunkBytes = DEFAULT_CHUNK_BYTES,
   maxPolls = DEFAULT_MAX_POLLS,
 }: AnalyzeSourceInput): Promise<ExtremeAnalysisOutcome> => {
+  let cancelWorkerJob: (() => Promise<void>) | null = null;
   try {
     const ticketResponse = await postJson(fetchImpl, "/api/extreme-ml/ticket", {
       sizeBytes: source.size,
@@ -271,6 +306,20 @@ export const analyzeSourceWithExtremeWorker = async ({
     if (typeof job.jobId !== "string" || typeof job.accessToken !== "string") {
       return unavailable("worker-job-unavailable");
     }
+    cancelWorkerJob = async () => {
+      try {
+        await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId as string)}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${job.accessToken as string}` },
+        });
+      } catch {
+        // Cancellation is cleanup only. It must never become a delivery gate.
+      }
+    };
+    const unavailableAfterCleanup = async (reason: string) => {
+      await cancelWorkerJob?.();
+      return unavailable(reason);
+    };
     const effectiveChunkBytes = Math.max(
       1,
       Math.min(
@@ -290,10 +339,10 @@ export const analyzeSourceWithExtremeWorker = async ({
         },
         body: chunk,
       });
-      if (!uploadResponse.ok) return unavailable("upload-unavailable");
+      if (!uploadResponse.ok) return unavailableAfterCleanup("upload-unavailable");
       const nextOffset = Number(uploadResponse.headers.get("Upload-Offset"));
       if (!Number.isInteger(nextOffset) || nextOffset <= offset || nextOffset > source.size) {
-        return unavailable("upload-offset-invalid");
+        return unavailableAfterCleanup("upload-offset-invalid");
       }
       offset = nextOffset;
     }
@@ -303,27 +352,28 @@ export const analyzeSourceWithExtremeWorker = async ({
       {},
       { Authorization: `Bearer ${job.accessToken}` },
     );
-    if (!completeResponse.ok) return unavailable("upload-complete-unavailable");
+    if (!completeResponse.ok) return unavailableAfterCleanup("upload-complete-unavailable");
 
     for (let poll = 0; poll < maxPolls; poll += 1) {
       const statusResponse = await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId)}`, {
         headers: { Authorization: `Bearer ${job.accessToken}` },
       });
-      if (!statusResponse.ok) return unavailable("status-unavailable");
+      if (!statusResponse.ok) return unavailableAfterCleanup("status-unavailable");
       const status = (await statusResponse.json()) as { state?: unknown };
       if (status.state === "failed" || status.state === "cancelled") return unavailable("worker-failed");
       if (status.state === "succeeded") {
         const reportResponse = await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId)}/report`, {
           headers: { Authorization: `Bearer ${job.accessToken}` },
         });
-        if (!reportResponse.ok) return unavailable("report-unavailable");
+        if (!reportResponse.ok) return unavailableAfterCleanup("report-unavailable");
         const report = normalizeExtremeSourceReport(await reportResponse.json());
         return report ? Object.freeze({ status: "succeeded", report }) : unavailable("report-invalid");
       }
       await sleep(POLL_INTERVAL_MS);
     }
-    return unavailable("poll-timeout");
+    return unavailableAfterCleanup("poll-timeout");
   } catch {
+    await cancelWorkerJob?.();
     return unavailable("worker-unavailable");
   }
 };

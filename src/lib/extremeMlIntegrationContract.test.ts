@@ -12,6 +12,8 @@ test("Extreme worker VAD is wired as advisory gain-planner tail protection only"
   assert.match(source, /protectedSpeechFrameMask:\s*mlProtection\.protectedSpeechFrameMask \?\? undefined/);
   assert.match(source, /acceptingExtremeMlEvidence = false/);
   assert.match(source, /browser processing remains unchanged/);
+  assert.match(source, /runtimeStatus === "degraded"/);
+  assert.match(source, /source quality evidence/);
   assert.match(source, /ExtremeML.*advisory/i);
   assert.doesNotMatch(source, /throw new Error\([^)]*ExtremeML/i);
 });

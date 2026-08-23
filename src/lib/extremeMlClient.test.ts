@@ -41,6 +41,13 @@ const validReport = (): unknown => ({
       sha256: "c".repeat(64),
     },
   ],
+  telemetry: {
+    runtimeStatus: "ready",
+    reason: "ok",
+    audioMutation: false,
+    candidateSelected: false,
+    gainDbChanged: false,
+  },
 });
 
 test("worker URL accepts HTTPS and local development only", () => {
@@ -83,8 +90,31 @@ test("untrusted worker reports cannot gain authority, gate delivery, or smuggle 
   assert.equal(report.canBlockDelivery, false);
   assert.equal(report.canChangeGainDb, false);
   assert.equal(report.levelAuthority, "gainPlanner");
+  assert.equal(report.telemetry.runtimeStatus, "ready");
   assert.equal(Object.isFrozen(report), true);
   assert.equal(Object.isFrozen(report.vad.frames), true);
+});
+
+test("worker telemetry must prove advisory execution without audio mutation or hidden gain changes", () => {
+  const unsafe = validReport() as { telemetry: { gainDbChanged: boolean } };
+  unsafe.telemetry.gainDbChanged = true;
+  assert.equal(normalizeExtremeSourceReport(unsafe), null);
+
+  const degraded = validReport() as {
+    telemetry: {
+      runtimeStatus: string;
+      reason: string;
+      audioMutation: boolean;
+      candidateSelected: boolean;
+      gainDbChanged: boolean;
+    };
+  };
+  degraded.telemetry.runtimeStatus = "degraded";
+  degraded.telemetry.reason = "model-unavailable";
+  const normalized = normalizeExtremeSourceReport(degraded);
+  assert.ok(normalized);
+  assert.equal(normalized.telemetry.runtimeStatus, "degraded");
+  assert.equal(normalized.telemetry.reason, "model-unavailable");
 });
 
 test("source analysis sends only metadata through Vercel and WAV bytes directly to Render", async () => {
@@ -179,4 +209,38 @@ test("worker failures and exhausted polling fail open without throwing", async (
     },
   });
   assert.deepEqual(timedOut, { status: "unavailable", reason: "poll-timeout" });
+});
+
+test("poll timeout requests best-effort worker cancellation without changing fail-open delivery", async () => {
+  const source = new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" });
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const outcome = await analyzeSourceWithExtremeWorker({
+    source,
+    contentType: "audio/wav",
+    idempotencyKey: "cancel-on-timeout",
+    maxPolls: 1,
+    sleep: async () => undefined,
+    fetchImpl: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/extreme-ml/ticket") {
+        return Response.json({ workerBaseUrl: "https://worker.example", ticket: "ticket", expiresAt: "soon" });
+      }
+      if (url.endsWith("/v1/jobs")) {
+        return Response.json({ jobId: "job", accessToken: "secret", uploadOffset: 0, maxChunkBytes: 16 });
+      }
+      if (url.endsWith("/input")) {
+        return new Response(null, { status: 204, headers: { "Upload-Offset": "3" } });
+      }
+      if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
+      if (init.method === "DELETE") return Response.json({ state: "cancel_requested" }, { status: 202 });
+      return Response.json({ state: "running" });
+    },
+  });
+
+  assert.deepEqual(outcome, { status: "unavailable", reason: "poll-timeout" });
+  const cancellation = calls.find((call) => call.init.method === "DELETE");
+  assert.ok(cancellation);
+  assert.match(cancellation.url, /\/v1\/jobs\/job$/);
+  assert.equal(new Headers(cancellation.init.headers).get("Authorization"), "Bearer secret");
 });

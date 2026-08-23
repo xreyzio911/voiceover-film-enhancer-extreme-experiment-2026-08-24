@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -32,7 +33,26 @@ class FakeAnalyzer:
                 "dnsmos.ovrl": {"value": None, "available": False, "higherIsBetter": True},
             },
             "models": [],
+            "telemetry": {
+                "runtimeStatus": "ready",
+                "reason": "ok",
+                "audioMutation": False,
+                "candidateSelected": False,
+                "gainDbChanged": False,
+            },
         }
+
+
+class BlockingAnalyzer(FakeAnalyzer):
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def analyze_wav(self, path: Path, *, job_id: str, source_sha256: str) -> dict[str, object]:
+        self.started.set()
+        if not self.release.wait(timeout=5.0):
+            raise TimeoutError("test analyzer was not released")
+        return super().analyze_wav(path, job_id=job_id, source_sha256=source_sha256)
 
 
 class WorkerHttpApiContractTests(unittest.TestCase):
@@ -160,6 +180,47 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(replay.status_code, 401)
 
+    def test_per_owner_active_job_limit_fails_softly_and_recovers_after_cancel(self) -> None:
+        app = self.create_app(
+            {
+                "storage_root": self.storage_root / "owner-limit",
+                "allowed_origins": [self.ORIGIN],
+                "internal_secret": self.INTERNAL_SECRET,
+                "ticket_secret": self.TICKET_SECRET,
+                "max_active_jobs_per_owner": 1,
+                "analyzer": FakeAnalyzer(),
+            }
+        )
+        owner_hash = "e" * 64
+        first_metadata = self._metadata(idempotencyKey="owner-limit-1")
+        second_metadata = self._metadata(idempotencyKey="owner-limit-2")
+        with TestClient(app) as client:
+            def create(metadata: dict[str, object]):
+                ticket = client.post(
+                    "/internal/v1/tickets",
+                    headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                    json={"ownerHash": owner_hash, **metadata},
+                )
+                self.assertEqual(ticket.status_code, 200, ticket.text)
+                return client.post(
+                    "/v1/jobs",
+                    headers={"Authorization": f"Bearer {ticket.json()['ticket']}"},
+                    json=metadata,
+                )
+
+            first = create(first_metadata)
+            self.assertEqual(first.status_code, 200, first.text)
+            limited = create(second_metadata)
+            self.assertEqual(limited.status_code, 429, limited.text)
+            self.assertEqual(limited.headers.get("Retry-After"), "5")
+            cancelled = client.delete(
+                f"/v1/jobs/{first.json()['jobId']}",
+                headers={"Authorization": f"Bearer {first.json()['accessToken']}"},
+            )
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            recovered = create(second_metadata)
+            self.assertEqual(recovered.status_code, 200, recovered.text)
+
     def test_full_resumable_upload_status_and_advisory_report_flow(self) -> None:
         job = self._job()
         job_id = str(job["jobId"])
@@ -208,6 +269,22 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         self.assertFalse(report["canChangeGainDb"])
         self.assertEqual(report["levelAuthority"], "gainPlanner")
         self.assertEqual(report["source"]["sha256"], hashlib.sha256(self.wav).hexdigest())
+
+        retried = self.client.post(
+            "/v1/jobs",
+            headers={"Authorization": f"Bearer {self._ticket()}"},
+            json=self._metadata(),
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        retry_payload = retried.json()
+        self.assertEqual(retry_payload["jobId"], job_id)
+        self.assertNotEqual(retry_payload["accessToken"], access_token)
+        self.assertEqual(retry_payload["uploadOffset"], len(self.wav))
+        retained_report = self.client.get(
+            f"/v1/jobs/{job_id}/report",
+            headers={"Authorization": f"Bearer {retry_payload['accessToken']}"},
+        )
+        self.assertEqual(retained_report.status_code, 200, retained_report.text)
 
     def test_production_completion_returns_accepted_and_embedded_worker_finishes_report(self) -> None:
         app = self.create_app(
@@ -294,6 +371,135 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.headers["Upload-Offset"], "0")
+
+    def test_cancel_is_owner_scoped_idempotent_and_removes_partial_audio(self) -> None:
+        job = self._job()
+        upload = self.client.patch(
+            f"/v1/jobs/{job['jobId']}/input",
+            headers={
+                "Authorization": f"Bearer {job['accessToken']}",
+                "Content-Type": "application/offset+octet-stream",
+                "Upload-Offset": "0",
+            },
+            content=self.wav[:512],
+        )
+        self.assertEqual(upload.status_code, 204, upload.text)
+        job_dir = self.storage_root / "jobs" / str(job["jobId"])
+        self.assertTrue(job_dir.is_dir())
+
+        wrong_owner = self.client.delete(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        self.assertEqual(wrong_owner.status_code, 404)
+
+        cancelled = self.client.delete(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["state"], "cancelled")
+        self.assertFalse(job_dir.exists())
+
+        repeated = self.client.delete(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["state"], "cancelled")
+
+    def test_running_cancel_is_acknowledged_after_inference_without_publishing_report(self) -> None:
+        analyzer = BlockingAnalyzer()
+        app = self.create_app(
+            {
+                "storage_root": self.storage_root / "cancel-running",
+                "allowed_origins": [self.ORIGIN],
+                "internal_secret": self.INTERNAL_SECRET,
+                "ticket_secret": self.TICKET_SECRET,
+                "max_audio_bytes": 1_000_000,
+                "max_chunk_bytes": 1_024,
+                "max_duration_seconds": 30.0,
+                "analyzer": analyzer,
+                "inline_analysis": False,
+                "worker_poll_seconds": 0.01,
+                "lease_seconds": 5.0,
+            }
+        )
+        metadata = self._metadata(idempotencyKey="cancel-running-contract")
+        with TestClient(app) as client:
+            ticket = client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={"ownerHash": "d" * 64, **metadata},
+            ).json()["ticket"]
+            job = client.post(
+                "/v1/jobs",
+                headers={"Authorization": f"Bearer {ticket}"},
+                json=metadata,
+            ).json()
+            offset = 0
+            while offset < len(self.wav):
+                response = client.patch(
+                    f"/v1/jobs/{job['jobId']}/input",
+                    headers={
+                        "Authorization": f"Bearer {job['accessToken']}",
+                        "Content-Type": "application/offset+octet-stream",
+                        "Upload-Offset": str(offset),
+                    },
+                    content=self.wav[offset : offset + 1_024],
+                )
+                self.assertEqual(response.status_code, 204, response.text)
+                offset = int(response.headers["Upload-Offset"])
+            completed = client.post(
+                f"/v1/jobs/{job['jobId']}/input/complete",
+                headers={"Authorization": f"Bearer {job['accessToken']}"},
+                json={},
+            )
+            self.assertEqual(completed.status_code, 202, completed.text)
+            self.assertTrue(analyzer.started.wait(timeout=2.0))
+
+            cancelling = client.delete(
+                f"/v1/jobs/{job['jobId']}",
+                headers={"Authorization": f"Bearer {job['accessToken']}"},
+            )
+            self.assertEqual(cancelling.status_code, 202, cancelling.text)
+            self.assertEqual(cancelling.json()["state"], "cancel_requested")
+            analyzer.release.set()
+
+            final_state = None
+            for _ in range(200):
+                status = client.get(
+                    f"/v1/jobs/{job['jobId']}",
+                    headers={"Authorization": f"Bearer {job['accessToken']}"},
+                )
+                final_state = status.json().get("state")
+                if final_state == "cancelled":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(final_state, "cancelled")
+            report = client.get(
+                f"/v1/jobs/{job['jobId']}/report",
+                headers={"Authorization": f"Bearer {job['accessToken']}"},
+            )
+            self.assertEqual(report.status_code, 409)
+            self.assertFalse((app.state.upload_root / str(job["jobId"])).exists())
+
+    def test_retention_purges_terminal_database_rows_and_exact_job_artifacts(self) -> None:
+        job = self._job()
+        cancelled = self.client.delete(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.clock.advance(3_601)
+        purge_expired_jobs, = require_symbols(self, "extreme_worker.app", "_purge_expired_jobs")
+        purged = purge_expired_jobs(self.app, retention_seconds=3_600)
+        self.assertEqual(purged, (job["jobId"],))
+        status = self.client.get(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+        )
+        self.assertEqual(status.status_code, 404)
 
     def test_chunk_limit_is_enforced_without_advancing_offset(self) -> None:
         job = self._job()
@@ -389,6 +595,7 @@ class WorkerHttpApiContractTests(unittest.TestCase):
             f"/v1/jobs/{job['jobId']}", headers={"Authorization": f"Bearer {job['accessToken']}"}
         )
         self.assertEqual(status.json()["state"], "failed")
+        self.assertFalse((self.storage_root / "jobs" / str(job["jobId"])).exists())
         report = self.client.get(
             f"/v1/jobs/{job['jobId']}/report", headers={"Authorization": f"Bearer {job['accessToken']}"}
         )

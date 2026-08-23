@@ -24,6 +24,12 @@ services:
         value: dnsmos,dnsmos_p808,sigmos
       - key: EXTREME_ML_MAX_ANALYSIS_SECONDS
         value: "2160"
+      - key: EXTREME_ML_RETENTION_SECONDS
+        value: "86400"
+      - key: EXTREME_ML_MAINTENANCE_INTERVAL_SECONDS
+        value: "300"
+      - key: EXTREME_ML_MAX_ACTIVE_JOBS_PER_OWNER
+        value: "4"
       - key: EXTREME_ALLOWED_ORIGINS
         sync: false
       - key: EXTREME_INTERNAL_SECRET

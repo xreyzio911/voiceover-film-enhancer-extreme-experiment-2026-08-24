@@ -39,6 +39,13 @@ const makeReport = (
   },
   metrics: {},
   models: [{ id: "silero-vad", version: "6.2.1", revision: REVISION, sha256: SHA256 }],
+  telemetry: {
+    runtimeStatus: "ready",
+    reason: "ok",
+    audioMutation: false,
+    candidateSelected: false,
+    gainDbChanged: false,
+  },
   ...overrides,
 });
 

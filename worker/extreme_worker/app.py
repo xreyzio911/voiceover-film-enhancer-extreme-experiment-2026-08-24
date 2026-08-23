@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -20,6 +21,7 @@ from .api_support import LazyRuntimeAnalyzer, LocalFallbackAnalyzer, RateLimiter
 from .capabilities import build_capabilities
 from .model_runtime import sha256_file
 from .job_store import (
+    ActiveJobLimitExceeded,
     ConcurrentUpdate,
     IdempotencyConflict,
     JobNotFound,
@@ -50,6 +52,7 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
 _AUDIO_TYPES = frozenset({"audio/wav", "audio/x-wav"})
 _UPLOAD_TYPES = frozenset({"audio/wav", "audio/x-wav", "application/offset+octet-stream"})
+_LOGGER = logging.getLogger("extreme_worker")
 
 
 class _ShortLivedJobStore:
@@ -75,13 +78,23 @@ class _ShortLivedJobStore:
 
 
 class _EmbeddedProcessor:
-    def __init__(self, app: FastAPI, poll_seconds: float, lease_seconds: float) -> None:
+    def __init__(
+        self,
+        app: FastAPI,
+        poll_seconds: float,
+        lease_seconds: float,
+        retention_seconds: float,
+        maintenance_interval_seconds: float,
+    ) -> None:
         self.app = app
         self.poll_seconds = poll_seconds
         self.lease_seconds = lease_seconds
+        self.retention_seconds = retention_seconds
+        self.maintenance_interval_seconds = maintenance_interval_seconds
         self.worker_id = f"embedded-{secrets.token_urlsafe(8)}"
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.next_maintenance_at = 0.0
 
     def start(self) -> None:
         if self.thread is None:
@@ -98,6 +111,10 @@ class _EmbeddedProcessor:
         while not self.stop_event.is_set():
             found = False
             try:
+                now = float(self.app.state.clock())
+                if now >= self.next_maintenance_at:
+                    _purge_expired_jobs(self.app, retention_seconds=self.retention_seconds)
+                    self.next_maintenance_at = now + self.maintenance_interval_seconds
                 self.app.state.job_store.requeue_expired_leases()
                 job = self.app.state.job_store.lease_next(
                     worker_id=self.worker_id,
@@ -106,7 +123,8 @@ class _EmbeddedProcessor:
                 if job is not None:
                     found = True
                     _run_analysis(self.app, job.job_id)
-            except Exception:
+            except Exception as exc:
+                _LOGGER.error("embedded_worker_loop_failed exception_type=%s", type(exc).__name__)
                 found = False
             if not found:
                 self.stop_event.wait(self.poll_seconds)
@@ -279,7 +297,10 @@ def _status_payload(app: FastAPI, job_id: str) -> dict[str, Any]:
     upload_offset = 0
     size_bytes = 0
     try:
-        upload = app.state.upload_manager.status(job_id)
+        if job.state in {JobState.UPLOADING, JobState.QUEUED, JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+            upload = app.state.upload_manager.status(job_id)
+        else:
+            upload = app.state.job_store.get_upload(job_id)
         upload_offset = upload.offset
         size_bytes = upload.expected_size
     except (JobNotFound, UploadIntegrityError):
@@ -326,6 +347,55 @@ def _transition_if_current(store: SQLiteJobStore, job_id: str, source: JobState,
         pass
 
 
+def _remove_job_artifacts(app: FastAPI, job_id: str, *, keep_report: bool = False) -> None:
+    """Remove only the fixed, containment-checked files owned by one validated job."""
+    paths = JobPaths(app.state.upload_root).for_job(job_id)
+    targets = [paths.upload_part, paths.source_wav]
+    if not keep_report:
+        targets.append(paths.report_json)
+    for target in targets:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as exc:
+            _LOGGER.warning(
+                "job_artifact_cleanup_failed artifact=%s exception_type=%s",
+                target.name,
+                type(exc).__name__,
+            )
+    try:
+        paths.directory.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # A report intentionally keeps the directory alive. Unexpected files are
+        # never recursively deleted by maintenance.
+        pass
+
+
+def _acknowledge_cancel(app: FastAPI, job_id: str) -> bool:
+    current = app.state.job_store.get_job(job_id)
+    if current.state == JobState.CANCEL_REQUESTED:
+        _transition_if_current(
+            app.state.job_store,
+            job_id,
+            JobState.CANCEL_REQUESTED,
+            JobState.CANCELLED,
+        )
+        current = app.state.job_store.get_job(job_id)
+    if current.state == JobState.CANCELLED:
+        _remove_job_artifacts(app, job_id)
+        return True
+    return False
+
+
+def _purge_expired_jobs(app: FastAPI, *, retention_seconds: float) -> tuple[str, ...]:
+    cutoff = float(app.state.clock()) - retention_seconds
+    purged = app.state.job_store.purge_terminal_before(cutoff_timestamp=cutoff)
+    for job_id in purged:
+        _remove_job_artifacts(app, job_id)
+    return purged
+
+
 def _run_analysis(app: FastAPI, job_id: str) -> None:
     store: SQLiteJobStore = app.state.job_store
     paths = JobPaths(app.state.upload_root).for_job(job_id)
@@ -333,16 +403,29 @@ def _run_analysis(app: FastAPI, job_id: str) -> None:
         inspect_wav_file(paths.source_wav, _wav_limits(app))
     except (OSError, WavValidationError):
         current = store.get_job(job_id)
+        if current.state in {JobState.CANCEL_REQUESTED, JobState.CANCELLED}:
+            _acknowledge_cancel(app, job_id)
+            return
         if current.state == JobState.QUEUED:
             _transition_if_current(store, job_id, JobState.QUEUED, JobState.FAILED)
         elif current.state == JobState.RUNNING:
             _transition_if_current(store, job_id, JobState.RUNNING, JobState.FAILED)
+        if store.get_job(job_id).state == JobState.FAILED:
+            _remove_job_artifacts(app, job_id)
         return
 
     try:
         _transition_if_current(store, job_id, JobState.QUEUED, JobState.RUNNING)
+        current = store.get_job(job_id)
+        if current.state in {JobState.CANCEL_REQUESTED, JobState.CANCELLED}:
+            _acknowledge_cancel(app, job_id)
+            return
+        if current.state != JobState.RUNNING:
+            return
         source_sha256 = sha256_file(paths.source_wav)
         report = app.state.analyzer.analyze_wav(paths.source_wav, job_id=job_id, source_sha256=source_sha256)
+        if _acknowledge_cancel(app, job_id):
+            return
         if sha256_file(paths.source_wav) != source_sha256:
             raise RuntimeError("analysis mutated the immutable source")
         clean_report = validate_source_report(report, expected_source_sha256=source_sha256)
@@ -356,16 +439,25 @@ def _run_analysis(app: FastAPI, job_id: str) -> None:
             raise ReportValidationError("report source facts disagree with the WAV header")
         _atomic_json(paths.report_json, clean_report)
         _transition_if_current(store, job_id, JobState.RUNNING, JobState.SUCCEEDED)
-    except Exception:
+        if _acknowledge_cancel(app, job_id):
+            return
+        if store.get_job(job_id).state == JobState.SUCCEEDED:
+            _remove_job_artifacts(app, job_id, keep_report=True)
+    except Exception as exc:
+        _LOGGER.error("analysis_failed job_id=%s exception_type=%s", job_id, type(exc).__name__)
         try:
             paths.report_json.unlink(missing_ok=True)
         except OSError:
             pass
         current = store.get_job(job_id)
-        if current.state == JobState.QUEUED:
+        if current.state in {JobState.CANCEL_REQUESTED, JobState.CANCELLED}:
+            _acknowledge_cancel(app, job_id)
+        elif current.state == JobState.QUEUED:
             _transition_if_current(store, job_id, JobState.QUEUED, JobState.FAILED)
         elif current.state == JobState.RUNNING:
             _transition_if_current(store, job_id, JobState.RUNNING, JobState.FAILED)
+        if store.get_job(job_id).state == JobState.FAILED:
+            _remove_job_artifacts(app, job_id)
 
 
 def create_app(config: dict[str, Any] | None = None) -> FastAPI:
@@ -471,6 +563,24 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         ),
         60.0,
     )
+    retention_seconds = _positive_float(
+        settings.get("retention_seconds", os.environ.get("EXTREME_ML_RETENTION_SECONDS")),
+        86_400.0,
+    )
+    maintenance_interval_seconds = _positive_float(
+        settings.get(
+            "maintenance_interval_seconds",
+            os.environ.get("EXTREME_ML_MAINTENANCE_INTERVAL_SECONDS"),
+        ),
+        300.0,
+    )
+    max_active_jobs_per_owner = _positive_int(
+        settings.get(
+            "max_active_jobs_per_owner",
+            os.environ.get("EXTREME_ML_MAX_ACTIVE_JOBS_PER_OWNER"),
+        ),
+        4,
+    )
     inline_analysis = explicit_config
     if "inline_analysis" in settings:
         inline_analysis = bool(settings["inline_analysis"])
@@ -502,6 +612,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.ticket_ttl_seconds = ticket_ttl_seconds
     app.state.worker_poll_seconds = worker_poll_seconds
     app.state.lease_seconds = lease_seconds
+    app.state.retention_seconds = retention_seconds
+    app.state.maintenance_interval_seconds = maintenance_interval_seconds
+    app.state.max_active_jobs_per_owner = max_active_jobs_per_owner
     app.state.job_store = _ShortLivedJobStore(storage_root / "jobs.sqlite3", clock=clock)
     app.state.upload_root = storage_root / "jobs"
     app.state.upload_manager = UploadManager(root=app.state.upload_root, store=app.state.job_store)
@@ -514,7 +627,13 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.admission_authority = None
     app.state.admission_lock = threading.Lock()
     app.state.inline_analysis = inline_analysis
-    app.state.processor = _EmbeddedProcessor(app, worker_poll_seconds, lease_seconds)
+    app.state.processor = _EmbeddedProcessor(
+        app,
+        worker_poll_seconds,
+        lease_seconds,
+        retention_seconds,
+        maintenance_interval_seconds,
+    )
     app.state.rate_limiter = RateLimiter(
         maximum=rate_limit_requests,
         window_seconds=rate_limit_window_seconds,
@@ -640,23 +759,39 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             }
         )
         try:
-            job, _created = app.state.job_store.create_or_rotate_api_job(
+            job, created = app.state.job_store.create_or_rotate_api_job(
                 owner_identity_hash=claims.scope.owner_hash,
                 access_token_hash=app.state.token_hasher.hash(access_token),
                 idempotency_key=payload["idempotencyKey"],
                 request_fingerprint=request_fingerprint,
+                max_active_jobs_per_owner=max_active_jobs_per_owner,
             )
-            if payload["sha256"] is None:
-                app.state.upload_manager.start_deferred_checksum(job.job_id, expected_size=payload["sizeBytes"])
+            if not created and job.state == JobState.SUCCEEDED:
+                upload_offset = app.state.job_store.get_upload(job.job_id).offset
+            elif not created and job.state in {JobState.FAILED, JobState.CANCELLED}:
+                return _json(409, {"error": "terminal job requires a new idempotency key"}, request)
             else:
-                app.state.upload_manager.start(
-                    job.job_id,
-                    expected_size=payload["sizeBytes"],
-                    expected_sha256=payload["sha256"],
-                )
-            upload = app.state.upload_manager.status(job.job_id)
+                if payload["sha256"] is None:
+                    app.state.upload_manager.start_deferred_checksum(
+                        job.job_id,
+                        expected_size=payload["sizeBytes"],
+                    )
+                else:
+                    app.state.upload_manager.start(
+                        job.job_id,
+                        expected_size=payload["sizeBytes"],
+                        expected_sha256=payload["sha256"],
+                    )
+                upload_offset = app.state.upload_manager.status(job.job_id).offset
         except IdempotencyConflict:
             return _json(409, {"error": "idempotency conflict"}, request)
+        except ActiveJobLimitExceeded:
+            return _json(
+                429,
+                {"error": "too many active analysis jobs"},
+                request,
+                {"Retry-After": "5"},
+            )
         except (ValueError, UploadIntegrityError):
             return _json(400, {"error": "invalid upload"}, request)
 
@@ -665,7 +800,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             {
                 "jobId": job.job_id,
                 "accessToken": access_token,
-                "uploadOffset": upload.offset,
+                "uploadOffset": upload_offset,
                 "maxChunkBytes": max_chunk_bytes,
             },
             request,
@@ -678,6 +813,18 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         except JobNotFound:
             return _json(404, {"error": "not found"}, request)
         return _json(200, _status_payload(app, job_id), request)
+
+    @app.delete("/v1/jobs/{job_id}")
+    async def cancel_job(request: Request, job_id: str):
+        try:
+            job = _job_for_token(request, job_id)
+        except JobNotFound:
+            return _json(404, {"error": "not found"}, request)
+        cancelled = app.state.job_store.request_cancel(job.job_id)
+        if cancelled.state == JobState.CANCELLED:
+            _remove_job_artifacts(app, job.job_id)
+        status_code = 202 if cancelled.state == JobState.CANCEL_REQUESTED else 200
+        return _json(status_code, _status_payload(app, job.job_id), request)
 
     @app.patch("/v1/jobs/{job_id}/input")
     async def upload_chunk(request: Request, job_id: str):
@@ -744,6 +891,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             inspect_wav_file(paths.upload_part, _wav_limits(app))
         except (OSError, WavValidationError):
             _transition_if_current(app.state.job_store, job_id, JobState.UPLOADING, JobState.FAILED)
+            _remove_job_artifacts(app, job_id)
             return _json(422, _status_payload(app, job_id), request)
         except UploadIntegrityError:
             return _json(409, {"error": "upload integrity verification failed"}, request)

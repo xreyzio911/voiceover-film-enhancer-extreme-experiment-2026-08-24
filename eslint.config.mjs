@@ -19,6 +19,7 @@ const eslintConfig = defineConfig([
     "_qctest/**",
     // Local browser/render proof and private audio fixtures are not app source.
     ".playwright-mcp/**",
+    ".vercel/**",
     "tasks/render-evidence/**",
     "audio testing/**",
     // FFmpeg core bundles are third-party generated artifacts.

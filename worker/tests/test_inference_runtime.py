@@ -264,6 +264,27 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(report["telemetry"]["components"]["silero-vad"]["status"], "unavailable")
         self.assertFalse(report["canBlockDelivery"])
 
+    def test_local_fallback_never_claims_models_that_were_not_executed(self) -> None:
+        LocalFallbackAnalyzer, = require_symbols(
+            self,
+            "extreme_worker.api_support",
+            "LocalFallbackAnalyzer",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "source.wav")
+            _pcm16_wav(source_path, seconds=0.1)
+            digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            report = LocalFallbackAnalyzer().analyze_wav(
+                source_path,
+                job_id="job_fallback",
+                source_sha256=digest,
+            )
+
+        self.assertEqual(report["vad"]["frames"], [])
+        self.assertEqual(report["models"], [])
+        self.assertEqual(report["modelSetId"], "unavailable-local-fallback")
+        self.assertEqual(report["telemetry"]["runtimeStatus"], "degraded")
+
     def test_runtime_serializes_model_calls_to_one_bounded_inference_lane(self) -> None:
         _, RuntimeConfig, _, _, _, _ = self._model_symbols()
         AdvisoryInferenceRuntime, _ = self._inference_symbols()

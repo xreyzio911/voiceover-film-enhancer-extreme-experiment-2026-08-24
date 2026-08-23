@@ -163,6 +163,38 @@ class SQLiteJobStoreContractTests(unittest.TestCase):
         with self.assertRaises(self.JobNotFound):
             self.store.get_job_for_owner("job_missing", presented_token=raw_token, hasher=hasher)
 
+    def test_active_job_limit_is_atomic_but_allows_idempotent_token_rotation(self) -> None:
+        ActiveJobLimitExceeded, = require_symbols(
+            self,
+            "extreme_worker.job_store",
+            "ActiveJobLimitExceeded",
+        )
+        first, created = self.store.create_or_rotate_api_job(
+            owner_identity_hash="a" * 64,
+            access_token_hash="token-hash-1",
+            idempotency_key="limited-1",
+            request_fingerprint="fingerprint-1",
+            max_active_jobs_per_owner=1,
+        )
+        self.assertTrue(created)
+        retried, created = self.store.create_or_rotate_api_job(
+            owner_identity_hash="a" * 64,
+            access_token_hash="token-hash-2",
+            idempotency_key="limited-1",
+            request_fingerprint="fingerprint-1",
+            max_active_jobs_per_owner=1,
+        )
+        self.assertFalse(created)
+        self.assertEqual(retried.job_id, first.job_id)
+        with self.assertRaises(ActiveJobLimitExceeded):
+            self.store.create_or_rotate_api_job(
+                owner_identity_hash="a" * 64,
+                access_token_hash="token-hash-3",
+                idempotency_key="limited-2",
+                request_fingerprint="fingerprint-2",
+                max_active_jobs_per_owner=1,
+            )
+
     def test_raw_job_token_is_never_persisted(self) -> None:
         hasher_type, = require_symbols(self, "extreme_worker.security", "JobTokenHasher")
         hasher = hasher_type()
