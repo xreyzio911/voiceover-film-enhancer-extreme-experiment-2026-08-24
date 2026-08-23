@@ -4,6 +4,7 @@ node_modules
 .venv-audio-splitter
 .audio-separator-models
 .playwright-mcp
+worker
 VO example
 Audio split example
 *.tsbuildinfo
