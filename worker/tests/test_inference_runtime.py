@@ -32,6 +32,39 @@ def _pcm16_wav(path: Path, *, sample_rate: int = 16_000, seconds: float = 0.08) 
     return path.read_bytes()
 
 
+def _extensible_pcm24_wav(path: Path, *, sample_rate: int = 48_000, frames: int = 4_800) -> bytes:
+    channels = 1
+    bits_per_sample = 24
+    block_align = channels * (bits_per_sample // 8)
+    samples = b"\x00\x00\x20" * frames
+    subformat_guid = struct.pack("<I", 1) + bytes.fromhex("00001000800000aa00389b71")
+    fmt = struct.pack(
+        "<HHIIHHHHI",
+        0xFFFE,
+        channels,
+        sample_rate,
+        sample_rate * block_align,
+        block_align,
+        bits_per_sample,
+        22,
+        bits_per_sample,
+        4,
+    ) + subformat_guid
+    data_chunk = b"data" + struct.pack("<I", len(samples)) + samples
+    if len(samples) % 2:
+        data_chunk += b"\x00"
+    body = (
+        b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + data_chunk
+    )
+    payload = b"RIFF" + struct.pack("<I", len(body)) + body
+    path.write_bytes(payload)
+    return payload
+
+
 class _FakeVad:
     def __init__(self, probabilities: tuple[float, ...] = (0.2, 0.9, 0.7)) -> None:
         self.probabilities = probabilities
@@ -284,6 +317,62 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(report["models"], [])
         self.assertEqual(report["modelSetId"], "unavailable-local-fallback")
         self.assertEqual(report["telemetry"]["runtimeStatus"], "degraded")
+
+    def test_local_fallback_reads_extensible_pcm_without_stdlib_wave_support(self) -> None:
+        LocalFallbackAnalyzer, = require_symbols(
+            self,
+            "extreme_worker.api_support",
+            "LocalFallbackAnalyzer",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "source-extensible.wav")
+            payload = _extensible_pcm24_wav(source_path)
+            report = LocalFallbackAnalyzer().analyze_wav(
+                source_path,
+                job_id="job_extensible_fallback",
+                source_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+
+        self.assertEqual(report["source"]["sampleRate"], 48_000)
+        self.assertEqual(report["source"]["channels"], 1)
+        self.assertEqual(report["source"]["durationMs"], 100.0)
+        self.assertEqual(report["telemetry"]["runtimeStatus"], "degraded")
+
+    def test_runtime_decodes_valid_wave_format_extensible_integer_pcm(self) -> None:
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "extensible-pcm24.wav")
+            _extensible_pcm24_wav(source_path)
+            audio, sample_rate, channels, duration_seconds = module._read_pcm_wav(
+                source_path,
+                max_duration_seconds=1.0,
+            )
+
+        self.assertEqual(sample_rate, 48_000)
+        self.assertEqual(channels, 1)
+        self.assertEqual(audio.shape, (4_800,))
+        self.assertAlmostEqual(duration_seconds, 0.1, places=6)
+        self.assertTrue((audio > 0).all())
+
+    def test_runtime_decodes_large_pcm_payload_in_bounded_chunks(self) -> None:
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        chunk_frames = module._PCM_DECODE_CHUNK_FRAMES
+        frame_count = chunk_frames * 2 + 17
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "bounded-extensible-pcm24.wav")
+            _extensible_pcm24_wav(source_path, frames=frame_count)
+            with patch.object(
+                module,
+                "_decode_pcm_samples",
+                wraps=module._decode_pcm_samples,
+            ) as decode:
+                audio, _, _, _ = module._read_pcm_wav(source_path, max_duration_seconds=10.0)
+
+        self.assertEqual(audio.shape, (frame_count,))
+        self.assertGreaterEqual(decode.call_count, 3)
+        self.assertTrue(
+            all(len(call.args[0]) <= chunk_frames * 3 for call in decode.call_args_list)
+        )
 
     def test_runtime_serializes_model_calls_to_one_bounded_inference_lane(self) -> None:
         _, RuntimeConfig, _, _, _, _ = self._model_symbols()

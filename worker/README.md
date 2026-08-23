@@ -21,6 +21,8 @@ The tests specify these production modules:
 - `extreme_worker.job_store`: durable SQLite jobs, leases, cancellation, and retention.
 - `extreme_worker.paths`: containment-safe internal artifact paths.
 - `extreme_worker.wav_validation`: bounded PCM WAV structural validation.
+- `extreme_worker.inference`: checksum-pinned model execution plus bounded decoding
+  for integer PCM and integer-PCM WAVE_FORMAT_EXTENSIBLE sources.
 - `extreme_worker.uploads`: offset-checked, checksum-verified resumable uploads.
 - `extreme_worker.origin_policy`: exact allowlist CORS policy.
 - `extreme_worker.report_schema`: bounded advisory-only analysis reports.

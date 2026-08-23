@@ -2,19 +2,31 @@ from __future__ import annotations
 
 import math
 import threading
-import wave
 from pathlib import Path
 from typing import Callable
+
+from .wav_validation import WavLimits, inspect_wav_file
+
 
 class LocalFallbackAnalyzer:
     """Dependency-free advisory fallback for explicitly configured local/test apps."""
 
     def analyze_wav(self, path: Path, *, job_id: str, source_sha256: str) -> dict[str, object]:
         del job_id
-        with wave.open(str(path), "rb") as source:
-            sample_rate = source.getframerate()
-            channels = source.getnchannels()
-            duration_ms = source.getnframes() * 1000.0 / sample_rate
+        source_path = Path(path)
+        upload_bytes = source_path.stat().st_size
+        info = inspect_wav_file(
+            source_path,
+            WavLimits(
+                max_upload_bytes=max(1, upload_bytes),
+                allowed_sample_rates=frozenset({16_000, 24_000, 44_100, 48_000}),
+                allowed_channels=frozenset({1, 2}),
+                allowed_sample_width_bytes=frozenset({2, 3, 4}),
+                max_duration_seconds=1_000_000_000.0,
+                max_decoded_frames=max(1, upload_bytes),
+            ),
+        )
+        duration_ms = info.duration_seconds * 1000.0
         return {
             "schemaVersion": 1,
             "advisoryOnly": True,
@@ -25,8 +37,8 @@ class LocalFallbackAnalyzer:
             "source": {
                 "sha256": source_sha256,
                 "durationMs": round(duration_ms, 3),
-                "sampleRate": sample_rate,
-                "channels": channels,
+                "sampleRate": info.sample_rate,
+                "channels": info.channels,
             },
             "vad": {"frameMs": 10, "frames": []},
             "metrics": {

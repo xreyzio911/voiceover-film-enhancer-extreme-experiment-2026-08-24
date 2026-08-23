@@ -28,6 +28,8 @@ class WavInfo:
     frames: int
     duration_seconds: float
     upload_bytes: int
+    data_offset: int
+    data_bytes: int
 
 
 @dataclass(frozen=True)
@@ -47,7 +49,40 @@ def _u32(data: bytes, offset: int) -> int:
     return int.from_bytes(data[offset : offset + 4], "little")
 
 
-def _parse_chunks(data: bytes) -> tuple[dict[str, int], int]:
+_WAVE_FORMAT_PCM = 0x0001
+_WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+_PCM_SUBFORMAT_GUID = bytes.fromhex("0100000000001000800000aa00389b71")
+
+
+def _parse_format_payload(payload: bytes) -> dict[str, int]:
+    if len(payload) < 16:
+        raise WavValidationError("invalid format chunk")
+    raw_format = _u16(payload, 0)
+    bits = _u16(payload, 14)
+    canonical_format = raw_format
+    if raw_format == _WAVE_FORMAT_EXTENSIBLE:
+        if len(payload) < 40:
+            raise WavValidationError("invalid extensible format chunk")
+        extension_bytes = _u16(payload, 16)
+        if extension_bytes < 22 or 18 + extension_bytes > len(payload):
+            raise WavValidationError("invalid extensible format size")
+        valid_bits = _u16(payload, 18)
+        if valid_bits != bits:
+            raise WavValidationError("unsupported extensible valid-bit width")
+        if payload[24:40] != _PCM_SUBFORMAT_GUID:
+            raise WavValidationError("only integer PCM WAV is accepted")
+        canonical_format = _WAVE_FORMAT_PCM
+    return {
+        "format": canonical_format,
+        "channels": _u16(payload, 2),
+        "sample_rate": _u32(payload, 4),
+        "byte_rate": _u32(payload, 8),
+        "block_align": _u16(payload, 12),
+        "bits": bits,
+    }
+
+
+def _parse_chunks(data: bytes) -> tuple[dict[str, int], int, int]:
     if not isinstance(data, bytes):
         raise WavValidationError("WAV upload must be bytes")
     if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
@@ -57,6 +92,7 @@ def _parse_chunks(data: bytes) -> tuple[dict[str, int], int]:
     offset = 12
     fmt: dict[str, int] | None = None
     data_bytes: int | None = None
+    data_offset: int | None = None
     while offset < len(data):
         if offset + 8 > len(data):
             raise WavValidationError("truncated chunk header")
@@ -70,25 +106,25 @@ def _parse_chunks(data: bytes) -> tuple[dict[str, int], int]:
         if chunk_id == b"fmt " and chunk_size >= 16:
             if fmt is not None:
                 raise WavValidationError("multiple format chunks")
-            fmt = {
-                "format": _u16(data, chunk_start),
-                "channels": _u16(data, chunk_start + 2),
-                "sample_rate": _u32(data, chunk_start + 4),
-                "byte_rate": _u32(data, chunk_start + 8),
-                "block_align": _u16(data, chunk_start + 12),
-                "bits": _u16(data, chunk_start + 14),
-            }
+            fmt = _parse_format_payload(data[chunk_start:chunk_end])
         elif chunk_id == b"data":
             if data_bytes is not None:
                 raise WavValidationError("multiple data chunks")
             data_bytes = chunk_size
+            data_offset = chunk_start
         offset = padded_end
-    if fmt is None or data_bytes is None:
+    if fmt is None or data_bytes is None or data_offset is None:
         raise WavValidationError("missing required WAV chunks")
-    return fmt, data_bytes
+    return fmt, data_bytes, data_offset
 
 
-def _validate_info(fmt: dict[str, int], data_bytes: int, upload_bytes: int, limits: WavLimits) -> WavInfo:
+def _validate_info(
+    fmt: dict[str, int],
+    data_bytes: int,
+    data_offset: int,
+    upload_bytes: int,
+    limits: WavLimits,
+) -> WavInfo:
     if limits.max_upload_bytes <= 0 or limits.max_duration_seconds <= 0 or limits.max_decoded_frames <= 0:
         raise ValueError("WAV validation limits must be positive")
     if upload_bytes > limits.max_upload_bytes:
@@ -110,6 +146,8 @@ def _validate_info(fmt: dict[str, int], data_bytes: int, upload_bytes: int, limi
         raise WavValidationError("inconsistent WAV format math")
     if fmt["block_align"] <= 0 or data_bytes <= 0 or data_bytes % fmt["block_align"] != 0:
         raise WavValidationError("invalid audio data length")
+    if data_offset < 20 or data_offset + data_bytes > upload_bytes:
+        raise WavValidationError("invalid audio data bounds")
     frames = data_bytes // fmt["block_align"]
     duration_seconds = frames / fmt["sample_rate"]
     if duration_seconds > limits.max_duration_seconds:
@@ -124,14 +162,16 @@ def _validate_info(fmt: dict[str, int], data_bytes: int, upload_bytes: int, limi
         frames,
         duration_seconds,
         upload_bytes,
+        data_offset,
+        data_bytes,
     )
 
 
 def inspect_wav_bytes(data: bytes, limits: WavLimits) -> WavInfo:
     if len(data) > limits.max_upload_bytes:
         raise WavValidationError("upload exceeds byte limit")
-    fmt, data_bytes = _parse_chunks(data)
-    return _validate_info(fmt, data_bytes, len(data), limits)
+    fmt, data_bytes, data_offset = _parse_chunks(data)
+    return _validate_info(fmt, data_bytes, data_offset, len(data), limits)
 
 
 def inspect_wav_file(path: str | Path, limits: WavLimits) -> WavInfo:
@@ -151,6 +191,7 @@ def inspect_wav_file(path: str | Path, limits: WavLimits) -> WavInfo:
         offset = 12
         fmt: dict[str, int] | None = None
         data_bytes: int | None = None
+        data_offset: int | None = None
         while offset < upload_bytes:
             if offset + 8 > upload_bytes:
                 raise WavValidationError("truncated chunk header")
@@ -167,30 +208,26 @@ def inspect_wav_file(path: str | Path, limits: WavLimits) -> WavInfo:
                 if fmt is not None or chunk_size < 16 or chunk_size > 4096:
                     raise WavValidationError("invalid format chunk")
                 stream.seek(chunk_start)
-                payload = stream.read(16)
-                fmt = {
-                    "format": _u16(payload, 0),
-                    "channels": _u16(payload, 2),
-                    "sample_rate": _u32(payload, 4),
-                    "byte_rate": _u32(payload, 8),
-                    "block_align": _u16(payload, 12),
-                    "bits": _u16(payload, 14),
-                }
+                payload = stream.read(chunk_size)
+                if len(payload) != chunk_size:
+                    raise WavValidationError("truncated format chunk")
+                fmt = _parse_format_payload(payload)
             elif chunk_id == b"data":
                 if data_bytes is not None:
                     raise WavValidationError("multiple data chunks")
                 data_bytes = chunk_size
+                data_offset = chunk_start
             offset = padded_end
-    if fmt is None or data_bytes is None:
+    if fmt is None or data_bytes is None or data_offset is None:
         raise WavValidationError("missing required WAV chunks")
-    return _validate_info(fmt, data_bytes, upload_bytes, limits)
+    return _validate_info(fmt, data_bytes, data_offset, upload_bytes, limits)
 
 
 def validate_wav_upload(data: bytes, *, max_bytes: int, max_duration_seconds: float) -> WavValidationResult:
     try:
         if len(data) > max_bytes:
             raise WavValidationError("upload exceeds byte limit")
-        fmt, data_bytes = _parse_chunks(data)
+        fmt, data_bytes, _data_offset = _parse_chunks(data)
         sample_width_bytes = fmt["bits"] // 8
         expected_block_align = fmt["channels"] * sample_width_bytes
         if fmt["format"] != 1:

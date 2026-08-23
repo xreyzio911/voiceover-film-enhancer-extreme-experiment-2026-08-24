@@ -34,6 +34,41 @@ def pcm_wav(
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
+def extensible_pcm_wav(
+    *,
+    sample_rate: int = 48_000,
+    channels: int = 1,
+    bits_per_sample: int = 24,
+    frames: int = 480,
+    valid_bits_per_sample: int | None = None,
+    subformat_code: int = 1,
+) -> bytes:
+    sample_bytes = bits_per_sample // 8
+    block_align = channels * sample_bytes
+    byte_rate = sample_rate * block_align
+    samples = b"\x00" * (frames * block_align)
+    subformat_guid = struct.pack("<I", subformat_code) + bytes.fromhex(
+        "00001000800000aa00389b71"
+    )
+    fmt = struct.pack(
+        "<HHIIHHHHI",
+        0xFFFE,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        22,
+        valid_bits_per_sample or bits_per_sample,
+        4 if channels == 1 else 3,
+    ) + subformat_guid
+    data_chunk = b"data" + struct.pack("<I", len(samples)) + samples
+    if len(samples) % 2:
+        data_chunk += b"\x00"
+    body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + data_chunk
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
 class WavValidationContractTests(unittest.TestCase):
     MODULE = "extreme_worker.wav_validation"
 
@@ -64,6 +99,29 @@ class WavValidationContractTests(unittest.TestCase):
         self.assertEqual(info.frames, 4_800)
         self.assertAlmostEqual(info.duration_seconds, 0.1, places=6)
         self.assertEqual(info.upload_bytes, len(payload))
+
+    def test_valid_extensible_integer_pcm_is_canonicalized_and_reports_data_bounds(self) -> None:
+        payload = extensible_pcm_wav(frames=4_800)
+        info = self.inspect_wav_bytes(payload, self.limits)
+        self.assertEqual(info.format_code, 1)
+        self.assertEqual(info.sample_rate, 48_000)
+        self.assertEqual(info.channels, 1)
+        self.assertEqual(info.sample_width_bytes, 3)
+        self.assertEqual(info.frames, 4_800)
+        self.assertEqual(info.data_offset, 68)
+        self.assertEqual(info.data_bytes, 4_800 * 3)
+
+    def test_extensible_float_and_malformed_pcm_extensions_are_rejected(self) -> None:
+        malformed = bytearray(extensible_pcm_wav())
+        malformed[36:38] = struct.pack("<H", 0)
+        variants = (
+            extensible_pcm_wav(subformat_code=3),
+            extensible_pcm_wav(valid_bits_per_sample=20),
+            bytes(malformed),
+        )
+        for payload in variants:
+            with self.subTest(payload=payload[12:52].hex()), self.assertRaises(self.WavValidationError):
+                self.inspect_wav_bytes(payload, self.limits)
 
     def test_non_riff_or_non_wave_payload_is_rejected(self) -> None:
         valid = pcm_wav()

@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from contract_support import MutableClock, require_symbols
-from test_wav_validation import pcm_wav
+from test_wav_validation import extensible_pcm_wav, pcm_wav
 
 
 class FakeAnalyzer:
@@ -285,6 +285,35 @@ class WorkerHttpApiContractTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {retry_payload['accessToken']}"},
         )
         self.assertEqual(retained_report.status_code, 200, retained_report.text)
+
+    def test_valid_wave_format_extensible_pcm_completes_through_http_boundary(self) -> None:
+        source = extensible_pcm_wav(frames=4_800)
+        metadata = self._metadata(
+            sizeBytes=len(source),
+            idempotencyKey="extensible-pcm-http-contract",
+        )
+        job = self._job(ticket=self._ticket(metadata=metadata), metadata=metadata)
+        offset = 0
+        while offset < len(source):
+            response = self.client.patch(
+                f"/v1/jobs/{job['jobId']}/input",
+                headers={
+                    "Authorization": f"Bearer {job['accessToken']}",
+                    "Content-Type": "application/offset+octet-stream",
+                    "Upload-Offset": str(offset),
+                },
+                content=source[offset : offset + 1_024],
+            )
+            self.assertEqual(response.status_code, 204, response.text)
+            offset = int(response.headers["Upload-Offset"])
+
+        complete = self.client.post(
+            f"/v1/jobs/{job['jobId']}/input/complete",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+            json={},
+        )
+        self.assertEqual(complete.status_code, 200, complete.text)
+        self.assertEqual(complete.json()["state"], "succeeded")
 
     def test_production_completion_returns_accepted_and_embedded_worker_finishes_report(self) -> None:
         app = self.create_app(

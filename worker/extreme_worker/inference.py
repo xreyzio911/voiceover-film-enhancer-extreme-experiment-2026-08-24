@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import threading
-import wave
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
@@ -13,6 +12,7 @@ from .model_runtime import (
     sha256_file,
     verify_artifact,
 )
+from .wav_validation import WavLimits, WavValidationError, inspect_wav_file
 
 
 _METRIC_OUTPUTS: dict[str, tuple[str, ...]] = {
@@ -21,6 +21,7 @@ _METRIC_OUTPUTS: dict[str, tuple[str, ...]] = {
     "sigmos": ("col", "disc", "loud", "noise", "reverb", "sig", "ovrl"),
     "utmos": ("value",),
 }
+_PCM_DECODE_CHUNK_FRAMES = 65_536
 
 
 class VadBackend(Protocol):
@@ -154,25 +155,53 @@ def _read_pcm_wav(
     path: Path,
     max_duration_seconds: float | None = None,
 ) -> tuple[Any, int, int, float]:
-    with wave.open(str(path), "rb") as source:
-        channels = source.getnchannels()
-        sample_width = source.getsampwidth()
-        sample_rate = source.getframerate()
-        frame_count = source.getnframes()
-        compression = source.getcomptype()
-        if compression != "NONE" or channels not in (1, 2) or sample_width not in (2, 3, 4):
-            raise ValueError("unsupported-pcm-wav")
-        if sample_rate not in (16_000, 24_000, 44_100, 48_000):
-            raise ValueError("unsupported-sample-rate")
-        duration_seconds = frame_count / sample_rate
-        if max_duration_seconds is not None and frame_count > max(0, math.floor(sample_rate * max_duration_seconds)):
-            raise AnalysisDurationLimit(
-                sample_rate=sample_rate,
-                channels=channels,
-                duration_seconds=duration_seconds,
+    source_path = Path(path)
+    upload_bytes = source_path.stat().st_size
+    info = inspect_wav_file(
+        source_path,
+        WavLimits(
+            max_upload_bytes=max(1, upload_bytes),
+            allowed_sample_rates=frozenset({16_000, 24_000, 44_100, 48_000}),
+            allowed_channels=frozenset({1, 2}),
+            allowed_sample_width_bytes=frozenset({2, 3, 4}),
+            max_duration_seconds=1_000_000_000.0,
+            max_decoded_frames=max(1, upload_bytes),
+        ),
+    )
+    if max_duration_seconds is not None and info.frames > max(
+        0,
+        math.floor(info.sample_rate * max_duration_seconds),
+    ):
+        raise AnalysisDurationLimit(
+            sample_rate=info.sample_rate,
+            channels=info.channels,
+            duration_seconds=info.duration_seconds,
+        )
+    import numpy as np
+
+    bytes_per_frame = info.sample_width_bytes * info.channels
+    audio = np.empty(info.frames, dtype=np.float32)
+    decoded_frames = 0
+    with source_path.open("rb") as source:
+        source.seek(info.data_offset)
+        while decoded_frames < info.frames:
+            chunk_frames = min(_PCM_DECODE_CHUNK_FRAMES, info.frames - decoded_frames)
+            chunk_bytes = chunk_frames * bytes_per_frame
+            raw = source.read(chunk_bytes)
+            if len(raw) != chunk_bytes:
+                raise EOFError("truncated-pcm-payload")
+            audio[decoded_frames : decoded_frames + chunk_frames] = _decode_pcm_samples(
+                raw,
+                info.sample_width_bytes,
+                info.channels,
             )
-        raw = source.readframes(frame_count)
-    return _decode_pcm_samples(raw, sample_width, channels), sample_rate, channels, duration_seconds
+            decoded_frames += chunk_frames
+    return (
+        audio,
+        info.sample_rate,
+        info.channels,
+        info.duration_seconds,
+    )
 
 
 def _resample_for_vad(audio: Any, sample_rate: int) -> Any:
@@ -323,7 +352,7 @@ class AdvisoryInferenceRuntime:
                 channels=error.channels,
                 reason="analysis-duration-limit",
             )
-        except (OSError, EOFError, ValueError, wave.Error):
+        except (OSError, EOFError, ValueError, WavValidationError):
             return self._base_report(
                 source_sha256=actual_sha256,
                 duration_ms=0.0,
