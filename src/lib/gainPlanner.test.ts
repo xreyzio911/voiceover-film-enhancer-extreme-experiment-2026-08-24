@@ -67,9 +67,64 @@ describe("realized gain-motion telemetry", () => {
       gainDbAtFrame(protectedPlan.gainCurve, 38) > gainDbAtFrame(basePlan.gainCurve, 38) + 0.2,
       "ML protection should keep the weak tail closer to speech gain",
     );
+    const mlAddedGainDb = frameDb.map(
+      (_, frame) =>
+        gainDbAtFrame(protectedPlan.gainCurve, frame)
+        - gainDbAtFrame(basePlan.gainCurve, frame),
+    );
+    assert.ok(
+      Math.max(...mlAddedGainDb) <= 3.001,
+      "ML-only tail protection must never add more than 3 dB over the identical legacy plan",
+    );
     assert.equal(protectedPlan.mlProtectedTailRunCount, 1);
     assert.equal(protectedPlan.mlProtectedTailFrameCount, 8);
     assert.equal(protectedPlan.gainDbAuthority, "gainPlanner");
+  });
+
+  it("bounds ML-only uplift against the identical legacy plan across a close run handoff", () => {
+    const frameDb = new Array<number>(180).fill(-80);
+    const speechBodyFrameDb = new Array<number>(180).fill(-80);
+    for (let frame = 10; frame < 50; frame += 1) {
+      frameDb[frame] = -60;
+      speechBodyFrameDb[frame] = -60;
+    }
+    frameDb[50] = -64;
+    speechBodyFrameDb[50] = -64;
+    for (let frame = 58; frame < 98; frame += 1) {
+      frameDb[frame] = -30;
+      speechBodyFrameDb[frame] = -30;
+    }
+
+    const input = {
+      frameDb,
+      speechBodyFrameDb,
+      speechRuns: [
+        { startFrame: 10, endFrame: 50 },
+        { startFrame: 58, endFrame: 98 },
+      ],
+      noiseFloorDb: -70,
+      speechThresholdDb: -50,
+      pauseNoiseRisk: 1,
+      frameMs: FRAME_MS,
+      levelingConsistency: 0.35,
+    } as const;
+    const basePlan = planGainCurve(input);
+    const protectedPlan = planGainCurve({
+      ...input,
+      protectedSpeechFrameMask: frameDb.map((_, frame) => frame === 50),
+    });
+    const mlAddedGainDb = frameDb.map(
+      (_, frame) =>
+        gainDbAtFrame(protectedPlan.gainCurve, frame)
+        - gainDbAtFrame(basePlan.gainCurve, frame),
+    );
+    const maxAddedGainDb = Math.max(...mlAddedGainDb);
+
+    assert.ok(maxAddedGainDb > 0.2, "valid attached ML evidence should retain a bounded benefit");
+    assert.ok(
+      maxAddedGainDb <= 3.001,
+      `ML-only protection added ${maxAddedGainDb.toFixed(3)} dB over legacy`,
+    );
   });
 
   it("ignores malformed ML protection evidence and returns the legacy gain curve", () => {
