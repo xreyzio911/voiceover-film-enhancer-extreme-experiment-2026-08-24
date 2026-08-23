@@ -65,6 +65,32 @@ def _extensible_pcm24_wav(path: Path, *, sample_rate: int = 48_000, frames: int 
     return payload
 
 
+def _float32_wav(
+    path: Path,
+    *,
+    samples: tuple[float, ...] = (0.5, -0.5, 0.25, -0.25),
+    sample_rate: int = 48_000,
+) -> bytes:
+    channels = 1
+    bits_per_sample = 32
+    block_align = channels * 4
+    raw_samples = struct.pack(f"<{len(samples)}f", *samples)
+    fmt = struct.pack(
+        "<HHIIHH",
+        3,
+        channels,
+        sample_rate,
+        sample_rate * block_align,
+        block_align,
+        bits_per_sample,
+    )
+    data_chunk = b"data" + struct.pack("<I", len(raw_samples)) + raw_samples
+    body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + data_chunk
+    payload = b"RIFF" + struct.pack("<I", len(body)) + body
+    path.write_bytes(payload)
+    return payload
+
+
 class _FakeVad:
     def __init__(self, probabilities: tuple[float, ...] = (0.2, 0.9, 0.7)) -> None:
         self.probabilities = probabilities
@@ -353,6 +379,31 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(audio.shape, (4_800,))
         self.assertAlmostEqual(duration_seconds, 0.1, places=6)
         self.assertTrue((audio > 0).all())
+
+    def test_runtime_decodes_exact_float32_deliverable_samples(self) -> None:
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "rendered-float32.wav")
+            _float32_wav(source_path)
+            audio, sample_rate, channels, duration_seconds = module._read_pcm_wav(
+                source_path,
+                max_duration_seconds=10.0,
+            )
+
+        import numpy as np
+
+        self.assertEqual(sample_rate, 48_000)
+        self.assertEqual(channels, 1)
+        self.assertAlmostEqual(duration_seconds, 4 / 48_000, places=9)
+        self.assertTrue(np.allclose(audio, [0.5, -0.5, 0.25, -0.25]))
+
+    def test_runtime_rejects_non_finite_float32_samples(self) -> None:
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "non-finite-float32.wav")
+            _float32_wav(source_path, samples=(0.0, math.nan, math.inf, -math.inf))
+            with self.assertRaisesRegex(ValueError, "non-finite-float-samples"):
+                module._read_pcm_wav(source_path, max_duration_seconds=10.0)
 
     def test_runtime_decodes_large_pcm_payload_in_bounded_chunks(self) -> None:
         module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])

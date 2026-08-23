@@ -315,6 +315,36 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         self.assertEqual(complete.status_code, 200, complete.text)
         self.assertEqual(complete.json()["state"], "succeeded")
 
+    def test_valid_ieee_float32_completes_through_http_boundary(self) -> None:
+        source = pcm_wav(bits_per_sample=32, format_code=3, frames=4_800)
+        metadata = self._metadata(
+            sizeBytes=len(source),
+            idempotencyKey="float32-render-http-contract",
+            scope="render_analysis",
+        )
+        job = self._job(ticket=self._ticket(metadata=metadata), metadata=metadata)
+        offset = 0
+        while offset < len(source):
+            response = self.client.patch(
+                f"/v1/jobs/{job['jobId']}/input",
+                headers={
+                    "Authorization": f"Bearer {job['accessToken']}",
+                    "Content-Type": "application/offset+octet-stream",
+                    "Upload-Offset": str(offset),
+                },
+                content=source[offset : offset + 1_024],
+            )
+            self.assertEqual(response.status_code, 204, response.text)
+            offset = int(response.headers["Upload-Offset"])
+
+        complete = self.client.post(
+            f"/v1/jobs/{job['jobId']}/input/complete",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+            json={},
+        )
+        self.assertEqual(complete.status_code, 200, complete.text)
+        self.assertEqual(complete.json()["state"], "succeeded")
+
     def test_production_completion_returns_accepted_and_embedded_worker_finishes_report(self) -> None:
         app = self.create_app(
             {

@@ -111,12 +111,28 @@ class WavValidationContractTests(unittest.TestCase):
         self.assertEqual(info.data_offset, 68)
         self.assertEqual(info.data_bytes, 4_800 * 3)
 
-    def test_extensible_float_and_malformed_pcm_extensions_are_rejected(self) -> None:
+    def test_ieee_float32_is_accepted_in_classic_and_extensible_wav(self) -> None:
+        variants = (
+            pcm_wav(bits_per_sample=32, format_code=3, frames=4_800),
+            extensible_pcm_wav(
+                bits_per_sample=32,
+                subformat_code=3,
+                frames=4_800,
+            ),
+        )
+        for payload in variants:
+            with self.subTest(payload=payload[12:52].hex()):
+                info = self.inspect_wav_bytes(payload, self.limits)
+                self.assertEqual(info.format_code, 3)
+                self.assertEqual(info.sample_width_bytes, 4)
+                self.assertEqual(info.frames, 4_800)
+
+    def test_malformed_or_unsupported_extensible_formats_are_rejected(self) -> None:
         malformed = bytearray(extensible_pcm_wav())
         malformed[36:38] = struct.pack("<H", 0)
         variants = (
-            extensible_pcm_wav(subformat_code=3),
             extensible_pcm_wav(valid_bits_per_sample=20),
+            extensible_pcm_wav(subformat_code=6),
             bytes(malformed),
         )
         for payload in variants:
@@ -140,10 +156,17 @@ class WavValidationContractTests(unittest.TestCase):
         with self.assertRaises(self.WavValidationError):
             self.inspect_wav_bytes(bytes(declared_too_large), self.limits)
 
-    def test_float_and_compressed_wav_formats_are_rejected(self) -> None:
-        for format_code in (3, 6, 7, 17):
-            with self.subTest(format_code=format_code), self.assertRaises(self.WavValidationError):
-                self.inspect_wav_bytes(pcm_wav(format_code=format_code), self.limits)
+    def test_non_float32_and_compressed_wav_formats_are_rejected(self) -> None:
+        variants = (
+            pcm_wav(format_code=3, bits_per_sample=16),
+            pcm_wav(format_code=3, bits_per_sample=64),
+            pcm_wav(format_code=6),
+            pcm_wav(format_code=7),
+            pcm_wav(format_code=17),
+        )
+        for payload in variants:
+            with self.subTest(payload=payload[12:44].hex()), self.assertRaises(self.WavValidationError):
+                self.inspect_wav_bytes(payload, self.limits)
 
     def test_upload_byte_limit_is_enforced_before_decode(self) -> None:
         tiny_limit = self.WavLimits(

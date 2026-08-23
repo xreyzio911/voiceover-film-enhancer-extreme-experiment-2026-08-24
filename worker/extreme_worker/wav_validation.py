@@ -50,8 +50,10 @@ def _u32(data: bytes, offset: int) -> int:
 
 
 _WAVE_FORMAT_PCM = 0x0001
+_WAVE_FORMAT_IEEE_FLOAT = 0x0003
 _WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 _PCM_SUBFORMAT_GUID = bytes.fromhex("0100000000001000800000aa00389b71")
+_IEEE_FLOAT_SUBFORMAT_GUID = bytes.fromhex("0300000000001000800000aa00389b71")
 
 
 def _parse_format_payload(payload: bytes) -> dict[str, int]:
@@ -69,9 +71,13 @@ def _parse_format_payload(payload: bytes) -> dict[str, int]:
         valid_bits = _u16(payload, 18)
         if valid_bits != bits:
             raise WavValidationError("unsupported extensible valid-bit width")
-        if payload[24:40] != _PCM_SUBFORMAT_GUID:
-            raise WavValidationError("only integer PCM WAV is accepted")
-        canonical_format = _WAVE_FORMAT_PCM
+        subformat_guid = payload[24:40]
+        if subformat_guid == _PCM_SUBFORMAT_GUID:
+            canonical_format = _WAVE_FORMAT_PCM
+        elif subformat_guid == _IEEE_FLOAT_SUBFORMAT_GUID:
+            canonical_format = _WAVE_FORMAT_IEEE_FLOAT
+        else:
+            raise WavValidationError("unsupported extensible WAV subformat")
     return {
         "format": canonical_format,
         "channels": _u16(payload, 2),
@@ -134,8 +140,10 @@ def _validate_info(
     sample_width_bytes = fmt["bits"] // 8
     expected_block_align = fmt["channels"] * sample_width_bytes
     expected_byte_rate = fmt["sample_rate"] * expected_block_align
-    if fmt["format"] != 1:
-        raise WavValidationError("only PCM WAV is accepted")
+    if fmt["format"] not in {_WAVE_FORMAT_PCM, _WAVE_FORMAT_IEEE_FLOAT}:
+        raise WavValidationError("only integer PCM or IEEE float32 WAV is accepted")
+    if fmt["format"] == _WAVE_FORMAT_IEEE_FLOAT and fmt["bits"] != 32:
+        raise WavValidationError("IEEE float WAV must use 32-bit samples")
     if fmt["sample_rate"] not in limits.allowed_sample_rates:
         raise WavValidationError("sample rate outside allowlist")
     if fmt["channels"] not in limits.allowed_channels:
@@ -230,8 +238,10 @@ def validate_wav_upload(data: bytes, *, max_bytes: int, max_duration_seconds: fl
         fmt, data_bytes, _data_offset = _parse_chunks(data)
         sample_width_bytes = fmt["bits"] // 8
         expected_block_align = fmt["channels"] * sample_width_bytes
-        if fmt["format"] != 1:
-            raise WavValidationError("only PCM WAV is accepted")
+        if fmt["format"] not in {_WAVE_FORMAT_PCM, _WAVE_FORMAT_IEEE_FLOAT}:
+            raise WavValidationError("only integer PCM or IEEE float32 WAV is accepted")
+        if fmt["format"] == _WAVE_FORMAT_IEEE_FLOAT and fmt["bits"] != 32:
+            raise WavValidationError("IEEE float WAV must use 32-bit samples")
         if fmt["channels"] < 1 or fmt["channels"] > 16:
             raise WavValidationError("channel count outside allowlist")
         if fmt["sample_rate"] < 8_000 or fmt["sample_rate"] > 384_000:

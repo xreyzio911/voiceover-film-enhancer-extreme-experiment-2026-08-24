@@ -126,10 +126,23 @@ class SpeechOnnxMetricsBackend:
         return metric(audio, sample_rate)
 
 
-def _decode_pcm_samples(raw: bytes, sample_width: int, channels: int) -> Any:
+def _decode_pcm_samples(
+    raw: bytes,
+    sample_width: int,
+    channels: int,
+    format_code: int = 1,
+) -> Any:
     import numpy as np
 
-    if sample_width == 2:
+    if format_code == 3:
+        if sample_width != 4:
+            raise ValueError("unsupported-float-width")
+        decoded = np.frombuffer(raw, dtype="<f4")
+        if not np.isfinite(decoded).all():
+            raise ValueError("non-finite-float-samples")
+    elif format_code != 1:
+        raise ValueError("unsupported-wav-format")
+    elif sample_width == 2:
         decoded = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32_768.0
     elif sample_width == 3:
         octets = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
@@ -148,6 +161,8 @@ def _decode_pcm_samples(raw: bytes, sample_width: int, channels: int) -> Any:
         raise ValueError("misaligned-pcm-frames")
     frames = decoded.reshape(-1, channels)
     mono = frames.mean(axis=1, dtype=np.float32)
+    if not np.isfinite(mono).all():
+        raise ValueError("non-finite-float-samples")
     return np.clip(mono, -1.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -194,6 +209,7 @@ def _read_pcm_wav(
                 raw,
                 info.sample_width_bytes,
                 info.channels,
+                info.format_code,
             )
             decoded_frames += chunk_frames
     return (
