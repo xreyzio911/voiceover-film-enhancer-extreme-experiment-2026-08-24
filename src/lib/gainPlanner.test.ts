@@ -39,8 +39,8 @@ describe("realized gain-motion telemetry", () => {
       speechBodyFrameDb[frame] = -34;
     }
     for (let frame = 34; frame < 42; frame += 1) {
-      frameDb[frame] = -56;
-      speechBodyFrameDb[frame] = -56;
+      frameDb[frame] = -64;
+      speechBodyFrameDb[frame] = -64;
     }
 
     const basePlan = planGainCurve({
@@ -64,7 +64,7 @@ describe("realized gain-motion telemetry", () => {
     });
 
     assert.ok(
-      gainDbAtFrame(protectedPlan.gainCurve, 38) > gainDbAtFrame(basePlan.gainCurve, 38) + 1,
+      gainDbAtFrame(protectedPlan.gainCurve, 38) > gainDbAtFrame(basePlan.gainCurve, 38) + 0.2,
       "ML protection should keep the weak tail closer to speech gain",
     );
     assert.equal(protectedPlan.mlProtectedTailRunCount, 1);

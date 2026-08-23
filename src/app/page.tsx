@@ -29,7 +29,7 @@ export default async function Home() {
             <span className={styles.brandMark} aria-hidden="true">SP</span>
             <div>
               <div className={styles.brandName}>Shorts Projektt</div>
-              <div className={styles.brandContext}>Experiment</div>
+              <div className={styles.brandContext}>Extreme Experiment</div>
             </div>
           </div>
           <div className={styles.headerActions}>
@@ -49,9 +49,9 @@ export default async function Home() {
 
         <section className={styles.pageIntro} aria-labelledby="workspace-title">
           <div className={styles.introCopy}>
-            <h1 id="workspace-title" className={styles.title}>Voiceover Experiment</h1>
+            <h1 id="workspace-title" className={styles.title}>Extreme Experiment</h1>
             <p className={styles.subtitle}>
-              Level, check, and export voiceover in one place.
+              Level and check voiceover with the Extreme test pipeline.
             </p>
           </div>
           <dl className={styles.specs} aria-label="Workspace specifications">

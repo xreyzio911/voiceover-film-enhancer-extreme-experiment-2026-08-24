@@ -14,8 +14,8 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Shorts Projektt | Voiceover Experiment",
-  description: "Internal voiceover processing and delivery workspace.",
+  title: "Shorts Projektt | Extreme Experiment",
+  description: "Internal Extreme voiceover processing and delivery workspace.",
 };
 
 const themeBootstrap = `

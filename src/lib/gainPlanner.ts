@@ -41,6 +41,12 @@ export type GainPlannerInput = {
    * cannot withdraw gain from a steady voiced body.
    */
   speechBodyFrameDb?: number[];
+  /**
+   * Optional same-length ML speech-protection mask. This is advisory only and
+   * can only preserve weak post-run tails attached to an existing body-speech
+   * run. It never creates speech runs or level targets.
+   */
+  protectedSpeechFrameMask?: ArrayLike<boolean | number>;
   /** Speech runs (frame index ranges) already detected by the analyzer. */
   speechRuns: SpeechRun[];
   /** Noise floor of the source in dB (pauseNoiseFloorDb). */
@@ -186,6 +192,12 @@ export type GainPlannerOutput = {
   tailRescueFrameCount: number;
   /** Longest soft-tail rescue in milliseconds. */
   tailRescueMaxMs: number;
+  /** Count of body-speech runs whose weak tails were preserved by advisory ML evidence. */
+  mlProtectedTailRunCount: number;
+  /** Total number of post-run frames preserved by advisory ML evidence. */
+  mlProtectedTailFrameCount: number;
+  /** Explicit authority marker: ML evidence never owns broadband/time-varying gain. */
+  gainDbAuthority: "gainPlanner";
   /** Count of body-speech releases shortened because lifted post-run bed would become audible. */
   bedReleaseAdaptedRunCount: number;
   /** Largest continuous reduction from the normal 500 ms release. */
@@ -2032,6 +2044,15 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       : Number.POSITIVE_INFINITY;
   const hasCompletePostRunVetoEvidence =
     hasExplicitSpeechBodyEvidence && fricativeFrameDb !== null;
+  const protectedSpeechFrameMask =
+    input.protectedSpeechFrameMask?.length === frameCount
+      ? input.protectedSpeechFrameMask
+      : null;
+  const hasMlProtectedSpeechFrame = (frame: number) => {
+    if (!protectedSpeechFrameMask || frame < 0 || frame >= frameCount) return false;
+    const value = protectedSpeechFrameMask[frame];
+    return value === true || value === 1;
+  };
   const hasFricativeEvidence = (frame: number) =>
     fricativeFrameDb !== null && (fricativeFrameDb[frame] ?? -120) >= fricativeEvidenceFloorDb;
   const gainDbCurve = new Float32Array(frameCount);
@@ -2589,6 +2610,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   let tailRescueRunCount = 0;
   let tailRescueFrameCount = 0;
   let tailRescueMaxFrames = 0;
+  let mlProtectedTailRunCount = 0;
+  let mlProtectedTailFrameCount = 0;
   let bedReleaseAdaptedRunCount = 0;
   let bedReleaseMaxAccelerationFrames = 0;
   const protectedEndFrameByRun = new Array<number>(runMeta.length).fill(0);
@@ -2616,7 +2639,11 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         f - meta.endFrame < fricativeTailRescueMaxFrames &&
         frameDb >= hardNoiseFloorDb &&
         hasFricativeEvidence(f);
-      if (frameDb >= tailFloorDb || attachedFricativeTailEvidence) {
+      const attachedMlTailEvidence =
+        protectedSpeechFrameMask !== null &&
+        frameDb >= hardNoiseFloorDb &&
+        hasMlProtectedSpeechFrame(f);
+      if (frameDb >= tailFloorDb || attachedFricativeTailEvidence || attachedMlTailEvidence) {
         activeFrames += 1;
         quietBridgeFrames = 0;
         rescueEndFrame = f + 1;
@@ -2793,13 +2820,19 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     const softTailEndFrame = resolveSoftTailRescueEndFrame(runMeta[r], nextRunStart);
     protectedEndFrameByRun[r] = softTailEndFrame;
     if (softTailEndFrame > endFrame) {
+      let mlProtectedFramesInTail = 0;
       for (let f = endFrame; f < softTailEndFrame; f += 1) {
         gainDbCurve[f] = bodyGainAtEnd;
+        if (hasMlProtectedSpeechFrame(f)) mlProtectedFramesInTail += 1;
       }
       const rescuedFrames = softTailEndFrame - endFrame;
       tailRescueRunCount += 1;
       tailRescueFrameCount += rescuedFrames;
       tailRescueMaxFrames = Math.max(tailRescueMaxFrames, rescuedFrames);
+      if (mlProtectedFramesInTail > 0) {
+        mlProtectedTailRunCount += 1;
+        mlProtectedTailFrameCount += mlProtectedFramesInTail;
+      }
     }
 
     const releaseStart = softTailEndFrame;
@@ -3292,6 +3325,9 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     tailRescueRunCount,
     tailRescueFrameCount,
     tailRescueMaxMs: tailRescueMaxFrames * frameMs,
+    mlProtectedTailRunCount,
+    mlProtectedTailFrameCount,
+    gainDbAuthority: "gainPlanner",
     bedReleaseAdaptedRunCount,
     bedReleaseMaxAccelerationMs: bedReleaseMaxAccelerationFrames * frameMs,
     gainMotion,

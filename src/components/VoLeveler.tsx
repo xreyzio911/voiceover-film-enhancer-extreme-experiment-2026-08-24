@@ -1937,6 +1937,10 @@ const summarizeFailureReason = (error: unknown) => {
     tailRescueFrameCount: number;
     /** Longest soft-tail rescue in milliseconds. */
     tailRescueMaxMs: number;
+    /** Body-speech runs whose weak tails were preserved by advisory ML evidence. */
+    mlProtectedTailRunCount: number;
+    /** Post-run frames preserved by advisory ML evidence. */
+    mlProtectedTailFrameCount: number;
     /** Body-speech releases shortened because positive gain would expose the post-run bed. */
     bedReleaseAdaptedRunCount: number;
     /** Largest reduction from the normal consonant-safe release in milliseconds. */
@@ -2188,6 +2192,8 @@ const summarizeFailureReason = (error: unknown) => {
         tailRescueRunCount: plan.tailRescueRunCount,
         tailRescueFrameCount: plan.tailRescueFrameCount,
         tailRescueMaxMs: plan.tailRescueMaxMs,
+        mlProtectedTailRunCount: plan.mlProtectedTailRunCount,
+        mlProtectedTailFrameCount: plan.mlProtectedTailFrameCount,
         bedReleaseAdaptedRunCount: plan.bedReleaseAdaptedRunCount,
         bedReleaseMaxAccelerationMs: plan.bedReleaseMaxAccelerationMs,
         gainMotion: plan.gainMotion,
@@ -7220,6 +7226,10 @@ const summarizeFailureReason = (error: unknown) => {
       plan.tailRescueRunCount > 0
         ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
         : "";
+    const mlTailNote =
+      plan.mlProtectedTailRunCount > 0
+        ? `, ML protected ${plan.mlProtectedTailRunCount} weak tail${plan.mlProtectedTailRunCount === 1 ? "" : "s"} (${plan.mlProtectedTailFrameCount} frames, advisory)`
+        : "";
     const bedReleaseNote =
       plan.bedReleaseAdaptedRunCount > 0
         ? `, ${plan.bedReleaseAdaptedRunCount} audible bed release${plan.bedReleaseAdaptedRunCount === 1 ? "" : "s"} shortened (max ${plan.bedReleaseMaxAccelerationMs.toFixed(0)} ms)`
@@ -7229,7 +7239,7 @@ const summarizeFailureReason = (error: unknown) => {
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}${bedReleaseNote}).`,
+      )} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}${mlTailNote}${bedReleaseNote}).`,
     );
     appendLog(
       `[GainMotion] ${job.base}: p95/max dB per ${plan.frameMs.toFixed(0)} ms; ${summarizeGainMotion(plan.gainMotion)}. Advisory only.`,
@@ -7559,12 +7569,16 @@ const summarizeFailureReason = (error: unknown) => {
             plan.tailRescueRunCount > 0
               ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
               : "";
+          const mlTailNote =
+            plan.mlProtectedTailRunCount > 0
+              ? `, ML protected ${plan.mlProtectedTailRunCount} weak tail${plan.mlProtectedTailRunCount === 1 ? "" : "s"} (${plan.mlProtectedTailFrameCount} frames, advisory)`
+              : "";
           const bedReleaseNote =
             plan.bedReleaseAdaptedRunCount > 0
               ? `, ${plan.bedReleaseAdaptedRunCount} audible bed release${plan.bedReleaseAdaptedRunCount === 1 ? "" : "s"} shortened (max ${plan.bedReleaseMaxAccelerationMs.toFixed(0)} ms)`
               : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}${bedReleaseNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}${mlTailNote}${bedReleaseNote}).`,
           );
           appendLog(
             `[GainMotion] ${job.base}: p95/max dB per ${plan.frameMs.toFixed(0)} ms; ${summarizeGainMotion(plan.gainMotion)}. Advisory only.`,
