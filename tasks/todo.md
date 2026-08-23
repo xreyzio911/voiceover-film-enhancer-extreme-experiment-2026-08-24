@@ -1,3 +1,70 @@
+# Extreme AI/ML Experiment (2026-08-24)
+
+## Objective
+
+Create a fully separate `Extreme Experiment` edition that adds learned perception and, only when proven safe, optional neural repair around the existing deterministic browser DSP. `gainPlanner.ts` remains the sole broadband/time-varying level authority. The current experiment, its deployment, private audio, and unrelated dirty work must remain untouched.
+
+## Proven Starting State
+
+- [x] Preserve the complete source checkout in `A:\CodexBackups\voiceover-film-enhancer-experiment-2026-07-22-full-backup-2026-08-23T1945-Jakarta`.
+- [x] Verify the backup independently: 26,195 files, 113,253,447,510 bytes, identical Git HEAD/status, clean Robocopy comparison, and 26,195/26,195 SHA-256 source/destination matches.
+- [x] Create `E:\Work Files\Audio volume fixer\voiceover-film-enhancer-extreme-experiment-2026-08-24` from commit `768f44013a85c54a7b2704caf99c97dd75fac035` with no inherited Git remote or Vercel linkage.
+- [x] Put implementation work on `codex/extreme-ai-ml`; do not modify the original checkout.
+
+## Decisions From The Two Reviews
+
+- [x] Keep the current planner and deterministic QC/integrity protections. Learned models may measure, protect, or produce a separate candidate; they may not become a second gain rider.
+- [x] Exclude TEN VAD until legal approval because its licence adds product/competition restrictions.
+- [x] Exclude NISQA weights because they are CC BY-NC-SA / non-commercial. Use only models whose code and weights permit the intended deployment.
+- [x] Defer LAION vocal-burst runtime/distillation until project-specific positive and negative labels are human-reviewed; pseudo-labels are not ground truth.
+- [ ] Verify and pin every adopted package, model revision, weight licence, and weight checksum in source-controlled manifests.
+- [ ] Choose the final deployment topology only after local load/runtime tests: separate Vercel web + Render job service is preferred if secure direct upload works; all-Render is the fallback if cross-cloud state weakens reliability.
+
+## Quality And Significance Contract
+
+- Integrity outranks every learned score: exact output count, valid WAV, duration/sample alignment, channels/rate/format, complete speech, and peak safety must remain green.
+- Learned MOS, VAD, identity, and transcript evidence are advisory. They may select or recommend a candidate only inside the Extreme opt-in lane; they may never suppress the deterministic deliverable or create a new hard download gate.
+- Silero may only add bounded, evidence-supported bridge/head/tail protection or reduce processing authority. It may not create isolated speech runs, erase an energy/body-owned speech frame, or authorize extra gain/cleanup by itself.
+- Neural repair is disabled by default and produces a separately named candidate. It is promotable only when exact source/candidate comparison proves no geometry, identity, intelligibility, expressive-retention, peak, or stability regression.
+- A model-backed strategy counts as a significant measured improvement only when a predeclared paired corpus analysis shows a positive effect beyond trivial score noise on the eligible subset, the full-corpus non-regression policy passes, and a repeat run reproduces the result. Metrics alone remain `CONDITIONAL` until the exact downloaded WAVs are level-matched and auditioned.
+- Search budget: baseline plus at most five single-hypothesis variants per ML stage. Stop on licence uncertainty, nondeterminism, model-download drift, identity/content loss, expressive flattening, unsafe resource use, or a non-reproducible gain.
+
+## TDD And Implementation Checklist
+
+- [ ] Freeze baseline: `npm ci`, focused/full tests, TypeScript, lint, production build, dependency audit, Git diff check, and representative existing-corpus measurements.
+- [ ] Write and run RED tests for model-manifest validation, advisory report schema, input/size/duration validation, job-state transitions, ownership/auth, timeout/cancel/retry, cleanup, and explicit fail-open behavior.
+- [ ] Write and run RED tests for deterministic VAD frame alignment, immutable dual-mask construction, no isolated VAD-only runs, bounded gap/head/tail protection, and exact legacy fallback.
+- [ ] Add a pinned CPU-side AI analysis worker with job-scoped temp storage, bounded resources, structured errors, model/version/checksum provenance, and no raw-audio/transcript logging.
+- [ ] Add permissively licensed ONNX quality dimensions (`dnsmos`, `dnsmos_p808`, `sigmos`, `utmos`) and speaker similarity; add ASR integrity only if its runtime and model licence pass the same gate.
+- [ ] Add Silero VAD as a deterministic CPU/WASM or worker-produced evidence lane; keep `buildSpeechMask` authoritative and preserve exact legacy output when evidence is absent or invalid.
+- [ ] Add secure browser integration with explicit `Extreme` opt-in, visible job states, progress, cancellation, retry, advisory results, and deterministic fallback to the existing path.
+- [ ] Add short-lived upload/download authorization, authenticated job ownership, bounded file types/sizes/durations, rate/concurrency limits, retention cleanup, and idempotency.
+- [ ] Add DeepFilterNet as a separate optional candidate only after the critic/identity/integrity stack is green.
+- [ ] Record every RED and GREEN checkpoint and retain a factual TDD evidence report.
+
+## Corpus And Delivery Verification
+
+- [ ] Use the backed-up corpus as read-only input; write all new artifacts only under the Extreme checkout/evidence root.
+- [ ] Establish representative clean, noisy/roomy, quiet/whisper, expressive-event, cold-open/tail, and long-form subsets before tuning.
+- [ ] Run source/current/Extreme comparisons with exact SHA-256 identities, repeated MOS/identity/VAD metrics, current stability/QC metrics, and stage/runtime/resource telemetry.
+- [ ] Run the winning safe strategy across the complete current corpus and preserve per-file results, aggregate paired statistics, outliers, failures, and the unchanged-file count.
+- [ ] Render through the real browser path, download exact WAVs, re-open/probe them, and generate counterbalanced level-matched A/B packages for human audition.
+- [ ] Run unit, integration, e2e, coverage, full audio-QC, typecheck, lint, build, dependency/security review, and independent code/audio-policy review.
+
+## Isolated Release
+
+- [ ] Create a new GitHub repository for Extreme; never repoint or push to the current experiment remote.
+- [ ] Create only necessary Render resources through the **Localization Chrome profile** after local worker proof; start with one-job concurrency and the smallest adequate paid compute only when required.
+- [ ] Create/deploy a separate web project named `Extreme Experiment` through the **X Chrome profile**, unless the evidence-backed final topology is all-Render.
+- [ ] Configure the exact new OAuth callback/allowlist without copying secrets into Git or logs.
+- [ ] Verify exact deployed commit, health/config, authenticated upload/process/poll/cancel/download, retention cleanup, real WAV output, logs, and browser title/visible Extreme identity.
+- [ ] Record rollback: disable Extreme flags, stop/delete isolated services, and retain the existing experiment unchanged.
+
+## Review
+
+- Status: implementation not started; backup, isolation, recommendation triage, and model/legal preflight complete.
+- Completion remains unproven until every applicable checklist item above has authoritative evidence.
+
 # Word-Scale Body Arc Follow-up
 
 ## Checklist
