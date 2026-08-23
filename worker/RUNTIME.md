@@ -1,6 +1,6 @@
 # Extreme advisory ML runtime addendum
 
-This runtime measures uploaded PCM WAV sources. It never renders, rewrites, repairs,
+This runtime measures uploaded WAV sources. It never renders, rewrites, repairs,
 selects, normalizes, compresses, EQs, limits, or changes gain. The browser's
 `gainPlanner` remains the only broadband and time-varying level authority. A missing,
 late, invalid, or failing model produces `runtimeStatus: degraded` telemetry and empty
@@ -36,11 +36,14 @@ speech authority. The analysis-duration bound is enforced from validated WAV hea
 metadata before PCM frames are decoded or allocated; an oversized source returns a
 degraded, non-blocking report with its header-derived source facts.
 
-The WAV boundary accepts canonical integer PCM and WAVE_FORMAT_EXTENSIBLE only when
-its subformat GUID is integer PCM and its valid-bit width matches the container. The
-runtime parses that header itself so the Python 3.11 container can handle the app's
-24-bit production sources, and decodes long payloads in fixed 65,536-frame chunks to
-bound temporary allocation before the mono analysis buffer is populated.
+The WAV boundary accepts canonical integer PCM plus 32-bit IEEE float, including
+WAVE_FORMAT_EXTENSIBLE only when its subformat GUID matches one of those two formats
+and its valid-bit width matches the container. Other float widths, compressed
+subformats, and non-finite float samples are rejected. The runtime parses that header
+itself so the Python 3.11 container can handle both the app's 24-bit source files and
+its 48 kHz float32 final deliverables, and decodes long payloads in fixed
+65,536-frame chunks to bound temporary allocation before the mono analysis buffer is
+populated.
 
 ## Immutable model set
 

@@ -20,9 +20,11 @@ The tests specify these production modules:
 - `extreme_worker.security`: one-time HMAC upload tickets and opaque job tokens.
 - `extreme_worker.job_store`: durable SQLite jobs, leases, cancellation, and retention.
 - `extreme_worker.paths`: containment-safe internal artifact paths.
-- `extreme_worker.wav_validation`: bounded PCM WAV structural validation.
+- `extreme_worker.wav_validation`: bounded integer-PCM/IEEE-float32 WAV structural
+  validation.
 - `extreme_worker.inference`: checksum-pinned model execution plus bounded decoding
-  for integer PCM and integer-PCM WAVE_FORMAT_EXTENSIBLE sources.
+  for integer PCM and IEEE-float32 sources, including their valid
+  WAVE_FORMAT_EXTENSIBLE forms.
 - `extreme_worker.uploads`: offset-checked, checksum-verified resumable uploads.
 - `extreme_worker.origin_policy`: exact allowlist CORS policy.
 - `extreme_worker.report_schema`: bounded advisory-only analysis reports.
