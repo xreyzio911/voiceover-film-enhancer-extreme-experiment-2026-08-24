@@ -925,6 +925,97 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(status.json()["uploadOffset"], 0)
 
+    def test_disconnected_upload_is_resumable_without_advancing_offset(self) -> None:
+        ClientDisconnect, StarletteRequest = require_symbols(
+            self,
+            "starlette.requests",
+            "ClientDisconnect",
+            "Request",
+        )
+        job = self._job()
+        headers = {
+            "Authorization": f"Bearer {job['accessToken']}",
+            "Content-Type": "application/offset+octet-stream",
+            "Upload-Offset": "0",
+        }
+
+        async def disconnect_mid_body(_request):
+            yield self.wav[:128]
+            raise ClientDisconnect()
+
+        with patch.object(StarletteRequest, "stream", disconnect_mid_body):
+            interrupted = self.client.patch(
+                f"/v1/jobs/{job['jobId']}/input",
+                headers=headers,
+                content=self.wav[:512],
+            )
+
+        self.assertEqual(interrupted.status_code, 408, interrupted.text)
+        self.assertEqual(interrupted.headers["Upload-Offset"], "0")
+        status = self.client.get(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["state"], "uploading")
+        self.assertEqual(status.json()["uploadOffset"], 0)
+
+        retried = self.client.patch(
+            f"/v1/jobs/{job['jobId']}/input",
+            headers=headers,
+            content=self.wav[:512],
+        )
+        self.assertEqual(retried.status_code, 204, retried.text)
+        self.assertEqual(retried.headers["Upload-Offset"], "512")
+
+    def test_disconnected_later_upload_reports_committed_offset(self) -> None:
+        ClientDisconnect, StarletteRequest = require_symbols(
+            self,
+            "starlette.requests",
+            "ClientDisconnect",
+            "Request",
+        )
+        job = self._job()
+        headers = {
+            "Authorization": f"Bearer {job['accessToken']}",
+            "Content-Type": "application/offset+octet-stream",
+        }
+        first = self.client.patch(
+            f"/v1/jobs/{job['jobId']}/input",
+            headers={**headers, "Upload-Offset": "0"},
+            content=self.wav[:512],
+        )
+        self.assertEqual(first.status_code, 204, first.text)
+        self.assertEqual(first.headers["Upload-Offset"], "512")
+
+        async def disconnect_mid_body(_request):
+            yield self.wav[512:640]
+            raise ClientDisconnect()
+
+        with patch.object(StarletteRequest, "stream", disconnect_mid_body):
+            interrupted = self.client.patch(
+                f"/v1/jobs/{job['jobId']}/input",
+                headers={**headers, "Upload-Offset": "512"},
+                content=self.wav[512:1024],
+            )
+
+        self.assertEqual(interrupted.status_code, 408, interrupted.text)
+        self.assertEqual(interrupted.headers["Upload-Offset"], "512")
+        status = self.client.get(
+            f"/v1/jobs/{job['jobId']}",
+            headers={"Authorization": f"Bearer {job['accessToken']}"},
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["uploadOffset"], 512)
+
+        retried = self.client.patch(
+            f"/v1/jobs/{job['jobId']}/input",
+            headers={**headers, "Upload-Offset": "512"},
+            content=self.wav[512:1024],
+        )
+        self.assertEqual(retried.status_code, 204, retried.text)
+        self.assertEqual(retried.headers["Upload-Offset"], "1024")
+
     def test_job_tokens_are_owner_scoped_and_non_enumerating(self) -> None:
         first = self._job()
         second = self._job(

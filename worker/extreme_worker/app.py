@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 
 from .api_support import LazyRuntimeAnalyzer, LocalFallbackAnalyzer, RateLimiter
 from .capabilities import build_capabilities
@@ -958,6 +959,11 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             return _json(400, {"error": "invalid offset"}, request)
         try:
             chunk = await _bounded_body(request, max_chunk_bytes)
+        except ClientDisconnect:
+            current = _upload_offset_if_accepting(app, job_id)
+            if current is None:
+                return _json(409, {"error": "job is not accepting upload bytes"}, request)
+            return _empty(408, request, {"Upload-Offset": str(current)})
         except OverflowError:
             current = _upload_offset_if_accepting(app, job_id)
             if current is None:
