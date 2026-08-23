@@ -351,7 +351,12 @@ const resolveExplicitWav = async (
   if (path.extname(requestedPath).toLowerCase() !== ".wav") {
     throw new Error(`Explicit ${role} path must end in .wav.`);
   }
-  const absolutePath = path.resolve(repoRoot, requestedPath);
+  const relativeExternalRoot = !path.isAbsolute(requestedPath)
+    ? role === "source"
+      ? externalSourceRoot
+      : externalResultRoot
+    : null;
+  const absolutePath = path.resolve(relativeExternalRoot?.absolutePath ?? repoRoot, requestedPath);
   const isLexicallyInsideRepo = isPathInside(repoRoot, absolutePath);
   const allowedExternalRoot = role === "source"
     ? externalSourceRoot
