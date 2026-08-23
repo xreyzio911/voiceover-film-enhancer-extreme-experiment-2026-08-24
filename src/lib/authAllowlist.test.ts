@@ -19,6 +19,8 @@ test("rejects missing and unapproved accounts", () => {
 
 test("localhost bypass runs before next-auth middleware initialization", () => {
   const proxySource = readFileSync(new URL("../proxy.ts", import.meta.url), "utf8");
+  const bootstrapIndex = proxySource.indexOf("bootstrapVercelAuthUrl();");
+  const proxyConstructionIndex = proxySource.indexOf("const authenticatedProxy = withAuth(");
   const exportedProxyIndex = proxySource.indexOf("export default function proxy");
   const localBypassIndex = proxySource.indexOf(
     "if (isLocalHost(request.nextUrl.hostname))",
@@ -29,6 +31,11 @@ test("localhost bypass runs before next-auth middleware initialization", () => {
     exportedProxyIndex,
   );
 
+  assert.ok(bootstrapIndex >= 0, "Vercel URL bootstrap must be present");
+  assert.ok(
+    proxyConstructionIndex > bootstrapIndex,
+    "Vercel URL bootstrap must run before next-auth middleware is constructed",
+  );
   assert.ok(exportedProxyIndex >= 0, "proxy must expose an explicit pre-auth dispatcher");
   assert.ok(localBypassIndex > exportedProxyIndex, "localhost must be handled in the dispatcher");
   assert.ok(

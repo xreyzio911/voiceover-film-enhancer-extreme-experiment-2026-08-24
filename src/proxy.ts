@@ -6,6 +6,28 @@ import { isLocalHost } from "@/lib/isLocalHost";
 const LOGIN_PATH = "/login";
 const QC_LAB_PATH = "/qc-lab";
 
+const bootstrapVercelAuthUrl = () => {
+  if ((process.env.NEXTAUTH_URL ?? process.env.AUTH_URL ?? "").trim()) return;
+  const vercelUrl = (process.env.VERCEL_URL ?? "").trim();
+  if (!vercelUrl) return;
+  try {
+    const candidate = new URL(vercelUrl.startsWith("http") ? vercelUrl : `https://${vercelUrl}`);
+    if (
+      candidate.protocol === "https:" &&
+      !candidate.username &&
+      !candidate.password &&
+      !candidate.search &&
+      !candidate.hash
+    ) {
+      process.env.NEXTAUTH_URL = candidate.origin;
+    }
+  } catch {
+    // Auth remains normally configured by environment variables.
+  }
+};
+
+bootstrapVercelAuthUrl();
+
 const authenticatedProxy = withAuth(
   (request) => {
     const { nextUrl } = request;
