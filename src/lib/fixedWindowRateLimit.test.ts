@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { consumeFixedWindowRateLimit } from "./fixedWindowRateLimit.ts";
+import {
+  consumeFixedWindowRateLimit,
+  type FixedWindowRateLimitState,
+} from "./fixedWindowRateLimit.ts";
 
 const LIMIT = Object.freeze({ windowMs: 1_000, maxRequests: 2, maxEntries: 2 });
 
@@ -34,7 +37,10 @@ test("consumeFixedWindowRateLimit counts an authenticated identity without mutat
 });
 
 test("consumeFixedWindowRateLimit prunes expired identities and starts a fresh window", () => {
-  const staleState = new Map([
+  const staleState: FixedWindowRateLimitState = new Map<
+    string,
+    Readonly<{ count: number; resetAtMs: number }>
+  >([
     ["stale@example.com", Object.freeze({ count: 2, resetAtMs: 1_000 })],
     ["active@example.com", Object.freeze({ count: 1, resetAtMs: 5_000 })],
   ]);
@@ -52,7 +58,10 @@ test("consumeFixedWindowRateLimit prunes expired identities and starts a fresh w
 });
 
 test("consumeFixedWindowRateLimit keeps the process map bounded without evicting active identities", () => {
-  const fullState = new Map([
+  const fullState: FixedWindowRateLimitState = new Map<
+    string,
+    Readonly<{ count: number; resetAtMs: number }>
+  >([
     ["one@example.com", Object.freeze({ count: 1, resetAtMs: 5_000 })],
     ["two@example.com", Object.freeze({ count: 1, resetAtMs: 5_000 })],
   ]);

@@ -2,7 +2,12 @@ import { createHmac } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 import { getServerAuthSession } from "@/auth";
 import { isAllowedEmail } from "@/lib/authAllowlist";
+import { readBoundedJson } from "@/lib/boundedRequestJson";
 import { normalizeExtremeWorkerBaseUrl } from "@/lib/extremeMlClient";
+import {
+  consumeFixedWindowRateLimit,
+  type FixedWindowRateLimitState,
+} from "@/lib/fixedWindowRateLimit";
 import { isLocalHost } from "@/lib/isLocalHost";
 
 export const runtime = "nodejs";
@@ -16,7 +21,8 @@ const DEFAULT_MAX_AUDIO_BYTES = 1024 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 8_000;
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1_000;
 const RATE_LIMIT_MAX = 40;
-const rateLimitState = new Map<string, Readonly<{ count: number; resetAtMs: number }>>();
+const RATE_LIMIT_MAX_ENTRIES = 256;
+let rateLimitState: FixedWindowRateLimitState = new Map();
 
 const jsonError = (error: string, status: number, code: TicketErrorCode) =>
   NextResponse.json({ error, code }, { status, headers: { "Cache-Control": "no-store" } });
@@ -43,22 +49,17 @@ const readIdentity = async (request: NextRequest) => {
   return isAllowedEmail(email) ? email?.trim().toLowerCase() ?? null : null;
 };
 
-const clientKey = (request: NextRequest) => {
-  const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const host = request.nextUrl.hostname || "unknown";
-  return `${forwardedFor || host}:extreme-ml-ticket`;
-};
-
-const consumeRateLimit = (key: string) => {
-  const now = Date.now();
-  const current = rateLimitState.get(key);
-  if (!current || current.resetAtMs <= now) {
-    rateLimitState.set(key, Object.freeze({ count: 1, resetAtMs: now + RATE_LIMIT_WINDOW_MS }));
-    return true;
-  }
-  if (current.count >= RATE_LIMIT_MAX) return false;
-  rateLimitState.set(key, Object.freeze({ ...current, count: current.count + 1 }));
-  return true;
+const consumeRateLimit = (identity: string) => {
+  const result = consumeFixedWindowRateLimit({
+    state: rateLimitState,
+    key: identity,
+    nowMs: Date.now(),
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    maxRequests: RATE_LIMIT_MAX,
+    maxEntries: RATE_LIMIT_MAX_ENTRIES,
+  });
+  rateLimitState = result.state;
+  return result.allowed;
 };
 
 const normalizeTicketRequest = (value: unknown) => {
@@ -102,22 +103,18 @@ export async function POST(request: NextRequest) {
   const identity = await readIdentity(request);
   if (!identity) return jsonError("Unauthorized", 401, "auth");
   if (!isEnabled()) return jsonError("Extreme ML analysis is disabled.", 503, "config");
-  if (!consumeRateLimit(clientKey(request))) {
+  if (!consumeRateLimit(identity)) {
     return jsonError("Too many analysis requests. Wait a few minutes and try again.", 429, "rate_limit");
   }
 
-  const contentLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > MAX_METADATA_BYTES) {
+  const rawPayload = await readBoundedJson(request, MAX_METADATA_BYTES);
+  if (!rawPayload.ok && rawPayload.error === "too_large") {
     return jsonError("Metadata request is too large.", 413, "bad_request");
   }
-
-  let rawPayload: unknown;
-  try {
-    rawPayload = await request.json();
-  } catch {
+  if (!rawPayload.ok) {
     return jsonError("Expected a JSON metadata payload.", 400, "bad_request");
   }
-  const payload = normalizeTicketRequest(rawPayload);
+  const payload = normalizeTicketRequest(rawPayload.value);
   if (!payload) return jsonError("Invalid analysis metadata.", 400, "bad_request");
 
   const workerBaseUrl = normalizeExtremeWorkerBaseUrl(process.env.EXTREME_ML_WORKER_URL);

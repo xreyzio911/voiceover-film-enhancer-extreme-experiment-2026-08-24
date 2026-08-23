@@ -107,7 +107,7 @@ describe("realized gain-motion telemetry", () => {
       pauseNoiseRisk: 1,
       frameMs: FRAME_MS,
       levelingConsistency: 0.35,
-    } as const;
+    };
     const basePlan = planGainCurve(input);
     const protectedPlan = planGainCurve({
       ...input,
