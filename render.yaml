@@ -9,7 +9,6 @@ services:
     dockerContext: .
     autoDeployTrigger: checksPass
     healthCheckPath: /health/ready
-    maxShutdownDelaySeconds: 300
     numInstances: 1
     disk:
       name: extreme-worker-data
