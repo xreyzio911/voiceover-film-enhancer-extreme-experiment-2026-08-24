@@ -39,7 +39,8 @@ degraded, non-blocking report with its header-derived source facts.
 The WAV boundary accepts canonical integer PCM plus 32-bit IEEE float, including
 WAVE_FORMAT_EXTENSIBLE only when its subformat GUID matches one of those two formats
 and its valid-bit width matches the container. Other float widths, compressed
-subformats, and non-finite float samples are rejected. The runtime parses that header
+subformats, non-finite float samples, and float values outside `[-1, 1]` are rejected
+instead of being silently clipped. The runtime parses that header
 itself so the Python 3.11 container can handle both the app's 24-bit source files and
 its 48 kHz float32 final deliverables, and decodes long payloads in fixed
 65,536-frame chunks to bound temporary allocation before the mono analysis buffer is

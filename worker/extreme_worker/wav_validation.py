@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import FrozenSet
@@ -54,6 +56,7 @@ _WAVE_FORMAT_IEEE_FLOAT = 0x0003
 _WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 _PCM_SUBFORMAT_GUID = bytes.fromhex("0100000000001000800000aa00389b71")
 _IEEE_FLOAT_SUBFORMAT_GUID = bytes.fromhex("0300000000001000800000aa00389b71")
+_FLOAT_SCAN_CHUNK_SAMPLES = 16_384
 
 
 def _parse_format_payload(payload: bytes) -> dict[str, int]:
@@ -229,6 +232,29 @@ def inspect_wav_file(path: str | Path, limits: WavLimits) -> WavInfo:
     if fmt is None or data_bytes is None or data_offset is None:
         raise WavValidationError("missing required WAV chunks")
     return _validate_info(fmt, data_bytes, data_offset, upload_bytes, limits)
+
+
+def validate_float_sample_values(path: str | Path, info: WavInfo) -> None:
+    """Reject float WAV values that cannot be passed to the model unchanged."""
+    if info.format_code != _WAVE_FORMAT_IEEE_FLOAT:
+        return
+    if info.sample_width_bytes != 4:
+        raise WavValidationError("IEEE float WAV must use 32-bit samples")
+    source = Path(path)
+    remaining = info.data_bytes
+    with source.open("rb") as stream:
+        stream.seek(info.data_offset)
+        while remaining > 0:
+            chunk_bytes = min(remaining, _FLOAT_SCAN_CHUNK_SAMPLES * 4)
+            raw = stream.read(chunk_bytes)
+            if len(raw) != chunk_bytes or chunk_bytes % 4:
+                raise WavValidationError("truncated float audio data")
+            for (sample,) in struct.iter_unpack("<f", raw):
+                if not math.isfinite(sample):
+                    raise WavValidationError("non-finite-float-samples")
+                if sample < -1.0 or sample > 1.0:
+                    raise WavValidationError("out-of-range-float-samples")
+            remaining -= chunk_bytes
 
 
 def validate_wav_upload(data: bytes, *, max_bytes: int, max_duration_seconds: float) -> WavValidationResult:

@@ -37,8 +37,7 @@ const isAnalysisScope = (value: unknown): value is AnalysisScope =>
   value === "source_analysis" || value === "render_analysis";
 
 const readIdentity = async (request: NextRequest) => {
-  const host = request.headers.get("x-forwarded-host") ?? request.headers.get("host");
-  if (isLocalHost(host)) return "local-development";
+  if (isLocalHost(request.nextUrl.hostname)) return "local-development";
   const session = await getServerAuthSession();
   const email = session?.user?.email;
   return isAllowedEmail(email) ? email?.trim().toLowerCase() ?? null : null;
@@ -46,7 +45,7 @@ const readIdentity = async (request: NextRequest) => {
 
 const clientKey = (request: NextRequest) => {
   const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const host = request.headers.get("x-forwarded-host") ?? request.headers.get("host") ?? "unknown";
+  const host = request.nextUrl.hostname || "unknown";
   return `${forwardedFor || host}:extreme-ml-ticket`;
 };
 

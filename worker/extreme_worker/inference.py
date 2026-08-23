@@ -140,6 +140,8 @@ def _decode_pcm_samples(
         decoded = np.frombuffer(raw, dtype="<f4")
         if not np.isfinite(decoded).all():
             raise ValueError("non-finite-float-samples")
+        if np.any((decoded < -1.0) | (decoded > 1.0)):
+            raise ValueError("out-of-range-float-samples")
     elif format_code != 1:
         raise ValueError("unsupported-wav-format")
     elif sample_width == 2:
@@ -163,7 +165,7 @@ def _decode_pcm_samples(
     mono = frames.mean(axis=1, dtype=np.float32)
     if not np.isfinite(mono).all():
         raise ValueError("non-finite-float-samples")
-    return np.clip(mono, -1.0, 1.0).astype(np.float32, copy=False)
+    return mono.astype(np.float32, copy=False)
 
 
 def _read_pcm_wav(

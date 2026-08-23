@@ -76,7 +76,7 @@ class WorkerContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_job_artifact_path(temp_dir, "job_1", "../secret.wav")
 
-    def test_wav_validation_accepts_only_bounded_pcm_wav(self) -> None:
+    def test_wav_validation_accepts_a_bounded_supported_wav(self) -> None:
         validate_wav_upload = require_symbols(
             self,
             "extreme_worker.wav_validation",

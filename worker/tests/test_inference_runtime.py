@@ -364,6 +364,27 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(report["source"]["durationMs"], 100.0)
         self.assertEqual(report["telemetry"]["runtimeStatus"], "degraded")
 
+    def test_local_fallback_rejects_invalid_float_sample_values(self) -> None:
+        LocalFallbackAnalyzer, = require_symbols(
+            self,
+            "extreme_worker.api_support",
+            "LocalFallbackAnalyzer",
+        )
+        cases = (
+            ("non-finite-float-samples", (0.0, math.nan, math.inf, -math.inf)),
+            ("out-of-range-float-samples", (0.0, 1.0001, -1.0001, 0.5)),
+        )
+        for expected_error, samples in cases:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as temp_dir:
+                source_path = Path(temp_dir, "invalid-fallback.wav")
+                payload = _float32_wav(source_path, samples=samples)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    LocalFallbackAnalyzer().analyze_wav(
+                        source_path,
+                        job_id="job_float_fallback",
+                        source_sha256=hashlib.sha256(payload).hexdigest(),
+                    )
+
     def test_runtime_decodes_valid_wave_format_extensible_integer_pcm(self) -> None:
         module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -403,6 +424,14 @@ class RuntimeModelContractTests(unittest.TestCase):
             source_path = Path(temp_dir, "non-finite-float32.wav")
             _float32_wav(source_path, samples=(0.0, math.nan, math.inf, -math.inf))
             with self.assertRaisesRegex(ValueError, "non-finite-float-samples"):
+                module._read_pcm_wav(source_path, max_duration_seconds=10.0)
+
+    def test_runtime_rejects_out_of_range_float32_instead_of_silently_clipping(self) -> None:
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "out-of-range-float32.wav")
+            _float32_wav(source_path, samples=(0.0, 1.0001, -1.0001, 0.5))
+            with self.assertRaisesRegex(ValueError, "out-of-range-float-samples"):
                 module._read_pcm_wav(source_path, max_duration_seconds=10.0)
 
     def test_runtime_decodes_large_pcm_payload_in_bounded_chunks(self) -> None:

@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from .wav_validation import WavLimits, inspect_wav_file
+from .wav_validation import WavLimits, inspect_wav_file, validate_float_sample_values
 
 
 class LocalFallbackAnalyzer:
@@ -26,6 +26,7 @@ class LocalFallbackAnalyzer:
                 max_decoded_frames=max(1, upload_bytes),
             ),
         )
+        validate_float_sample_values(source_path, info)
         duration_ms = info.duration_seconds * 1000.0
         return {
             "schemaVersion": 1,
