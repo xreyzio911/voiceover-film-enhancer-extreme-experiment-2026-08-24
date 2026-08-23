@@ -3,13 +3,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import math
 import os
 import re
 import secrets
 import threading
 import time
-import wave
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +16,9 @@ from typing import Any, Callable
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from .api_support import LazyRuntimeAnalyzer, LocalFallbackAnalyzer, RateLimiter
 from .capabilities import build_capabilities
-from .model_runtime import DEFAULT_RUNTIME_ARTIFACTS, RuntimeConfig, model_set_id, sha256_file
+from .model_runtime import sha256_file
 from .job_store import (
     ConcurrentUpdate,
     IdempotencyConflict,
@@ -75,57 +74,6 @@ class _ShortLivedJobStore:
         """Compatibility no-op; each facade operation closes its own connection."""
 
 
-class _LocalFallbackAnalyzer:
-    """Dependency-free advisory fallback for explicitly configured local/test apps."""
-
-    def analyze_wav(self, path: Path, *, job_id: str, source_sha256: str) -> dict[str, object]:
-        del job_id
-        with wave.open(str(path), "rb") as source:
-            sample_rate = source.getframerate()
-            channels = source.getnchannels()
-            duration_ms = source.getnframes() * 1000.0 / sample_rate
-        return {
-            "schemaVersion": 1,
-            "advisoryOnly": True,
-            "canBlockDelivery": False,
-            "canChangeGainDb": False,
-            "levelAuthority": "gainPlanner",
-            "modelSetId": "extreme-advisory-unavailable",
-            "source": {
-                "sha256": source_sha256,
-                "durationMs": round(duration_ms, 3),
-                "sampleRate": sample_rate,
-                "channels": channels,
-            },
-            "vad": {"frameMs": 10, "frames": []},
-            "metrics": {
-                "dnsmos.ovrl": {"value": None, "available": False, "higherIsBetter": True}
-            },
-            "models": [],
-            "telemetry": {
-                "runtimeStatus": "degraded",
-                "reason": "local-placeholder",
-                "provenanceKind": "configured-not-executed",
-                "audioMutation": False,
-                "candidateSelected": False,
-                "gainDbChanged": False,
-            },
-        }
-
-
-class _LazyRuntimeAnalyzer:
-    def __init__(self) -> None:
-        self.fallback = _LocalFallbackAnalyzer()
-
-    def analyze_wav(self, path: Path, *, job_id: str, source_sha256: str) -> dict[str, object]:
-        try:
-            from .inference import get_runtime
-
-            return get_runtime().analyze_wav(path, job_id=job_id, source_sha256=source_sha256)
-        except Exception:
-            return self.fallback.analyze_wav(path, job_id=job_id, source_sha256=source_sha256)
-
-
 class _EmbeddedProcessor:
     def __init__(self, app: FastAPI, poll_seconds: float, lease_seconds: float) -> None:
         self.app = app
@@ -162,27 +110,6 @@ class _EmbeddedProcessor:
                 found = False
             if not found:
                 self.stop_event.wait(self.poll_seconds)
-
-
-class _RateLimiter:
-    def __init__(self, *, maximum: int, window_seconds: float, clock: Callable[[], float]) -> None:
-        self.maximum = maximum
-        self.window_seconds = window_seconds
-        self.clock = clock
-        self.guard = threading.Lock()
-        self.buckets: dict[str, tuple[float, int]] = {}
-
-    def allow(self, client_key: str) -> tuple[bool, int]:
-        now = float(self.clock())
-        with self.guard:
-            started_at, count = self.buckets.get(client_key, (now, 0))
-            if now - started_at >= self.window_seconds:
-                started_at, count = now, 0
-            if count >= self.maximum:
-                retry_after = max(1, math.ceil(self.window_seconds - (now - started_at)))
-                return False, retry_after
-            self.buckets = {**self.buckets, client_key: (started_at, count + 1)}
-            return True, 0
 
 
 def _positive_int(value: Any, fallback: int) -> int:
@@ -405,7 +332,11 @@ def _run_analysis(app: FastAPI, job_id: str) -> None:
     try:
         inspect_wav_file(paths.source_wav, _wav_limits(app))
     except (OSError, WavValidationError):
-        _transition_if_current(store, job_id, JobState.QUEUED, JobState.FAILED)
+        current = store.get_job(job_id)
+        if current.state == JobState.QUEUED:
+            _transition_if_current(store, job_id, JobState.QUEUED, JobState.FAILED)
+        elif current.state == JobState.RUNNING:
+            _transition_if_current(store, job_id, JobState.RUNNING, JobState.FAILED)
         return
 
     try:
@@ -576,7 +507,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.upload_manager = UploadManager(root=app.state.upload_root, store=app.state.job_store)
     app.state.token_hasher = JobTokenHasher()
     app.state.analyzer = settings.get("analyzer") or (
-        _LocalFallbackAnalyzer() if explicit_config else _LazyRuntimeAnalyzer()
+        LocalFallbackAnalyzer() if explicit_config else LazyRuntimeAnalyzer()
     )
     if not callable(getattr(app.state.analyzer, "analyze_wav", None)):
         raise ValueError("analyzer must provide analyze_wav")
@@ -584,7 +515,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     app.state.admission_lock = threading.Lock()
     app.state.inline_analysis = inline_analysis
     app.state.processor = _EmbeddedProcessor(app, worker_poll_seconds, lease_seconds)
-    app.state.rate_limiter = _RateLimiter(
+    app.state.rate_limiter = RateLimiter(
         maximum=rate_limit_requests,
         window_seconds=rate_limit_window_seconds,
         clock=clock,
