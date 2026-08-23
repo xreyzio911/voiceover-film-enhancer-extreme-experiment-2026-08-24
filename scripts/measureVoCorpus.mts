@@ -13,6 +13,9 @@
  *   npm run measure:vo-corpus -- --out tasks/render-evidence/current-goal/external-audition.json \
  *     --pairs-json tasks/render-evidence/current-goal/external-pairs.json \
  *     --external-result-root "A:/CodexTaskEvidence/current-run"
+ *   npm run measure:vo-corpus -- --out tasks/render-evidence/current-goal/backup-audition.json \
+ *     --pairs-json tasks/render-evidence/current-goal/backup-pairs.json \
+ *     --external-source-root "A:/CodexBackups/voiceover-extreme-baseline"
  */
 import { createHash } from "node:crypto";
 import {
@@ -305,14 +308,18 @@ const parseExplicitPairSpec = (spec: string) => {
   return { sourcePath, resultPath, id };
 };
 
-type ExternalResultRoot = Readonly<{
+type ExternalWavRoot = Readonly<{
   absolutePath: string;
   realPath: string;
 }>;
 
-const resolveExternalResultRoot = async (requestedPath: string): Promise<ExternalResultRoot> => {
+const resolveExternalWavRoot = async (
+  requestedPath: string,
+  optionName: "--external-result-root" | "--external-source-root",
+  displayName: "External result root" | "External source root",
+): Promise<ExternalWavRoot> => {
   if (!path.isAbsolute(requestedPath)) {
-    throw new Error("--external-result-root requires an absolute directory path.");
+    throw new Error(`${optionName} requires an absolute directory path.`);
   }
   const absolutePath = path.resolve(requestedPath);
   let info;
@@ -320,12 +327,12 @@ const resolveExternalResultRoot = async (requestedPath: string): Promise<Externa
     info = await stat(absolutePath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(`External result root does not exist: ${requestedPath}`);
+      throw new Error(`${displayName} does not exist: ${requestedPath}`);
     }
     throw error;
   }
   if (!info.isDirectory()) {
-    throw new Error(`External result root is not a directory: ${requestedPath}`);
+    throw new Error(`${displayName} is not a directory: ${requestedPath}`);
   }
   return {
     absolutePath,
@@ -338,20 +345,27 @@ const resolveExplicitWav = async (
   realRepoRoot: string,
   requestedPath: string,
   role: "source" | "result",
-  externalResultRoot: ExternalResultRoot | null,
+  externalResultRoot: ExternalWavRoot | null,
+  externalSourceRoot: ExternalWavRoot | null,
 ) => {
   if (path.extname(requestedPath).toLowerCase() !== ".wav") {
     throw new Error(`Explicit ${role} path must end in .wav.`);
   }
   const absolutePath = path.resolve(repoRoot, requestedPath);
   const isLexicallyInsideRepo = isPathInside(repoRoot, absolutePath);
-  const isLexicallyInsideExternalResultRoot = role === "result"
-    && externalResultRoot !== null
-    && isPathInside(externalResultRoot.absolutePath, absolutePath);
-  if (!isLexicallyInsideRepo && !isLexicallyInsideExternalResultRoot) {
-    const boundary = role === "result" && externalResultRoot !== null
-      ? "the repository or the external result root"
-      : "the repository";
+  const allowedExternalRoot = externalSourceRoot
+    ?? (role === "result" ? externalResultRoot : null);
+  const externalBoundaryName = externalSourceRoot !== null
+    ? "the external source root"
+    : role === "result" && externalResultRoot !== null
+      ? "the external result root"
+      : null;
+  const isLexicallyInsideExternalRoot = allowedExternalRoot !== null
+    && isPathInside(allowedExternalRoot.absolutePath, absolutePath);
+  if (!isLexicallyInsideRepo && !isLexicallyInsideExternalRoot) {
+    const boundary = externalBoundaryName === null
+      ? "the repository"
+      : `the repository or ${externalBoundaryName}`;
     throw new Error(`Explicit ${role} path must stay inside ${boundary}.`);
   }
   let info;
@@ -366,13 +380,12 @@ const resolveExplicitWav = async (
   if (!info.isFile()) throw new Error(`Explicit ${role} WAV is not a file: ${requestedPath}`);
   const realFilePath = await realpath(absolutePath);
   const isReallyInsideRepo = isPathInside(realRepoRoot, realFilePath);
-  const isReallyInsideExternalResultRoot = role === "result"
-    && externalResultRoot !== null
-    && isPathInside(externalResultRoot.realPath, realFilePath);
-  if (!isReallyInsideRepo && !isReallyInsideExternalResultRoot) {
-    const boundary = role === "result" && externalResultRoot !== null
-      ? "the repository or the external result root"
-      : "the repository";
+  const isReallyInsideExternalRoot = allowedExternalRoot !== null
+    && isPathInside(allowedExternalRoot.realPath, realFilePath);
+  if (!isReallyInsideRepo && !isReallyInsideExternalRoot) {
+    const boundary = externalBoundaryName === null
+      ? "the repository"
+      : `the repository or ${externalBoundaryName}`;
     throw new Error(`Explicit ${role} path must resolve inside ${boundary}.`);
   }
   return {
@@ -386,14 +399,41 @@ export const resolveExplicitCorpusPairs = async (
   repoRoot: string,
   pairSpecs: readonly string[],
   externalResultRootPath: string | null = null,
+  externalSourceRootPath: string | null = null,
 ): Promise<readonly CorpusPair[]> => {
   if (pairSpecs.length > MAX_EXPLICIT_PAIRS) {
     throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
   }
+  if (externalResultRootPath !== null && externalSourceRootPath !== null) {
+    throw new Error("--external-source-root cannot be combined with --external-result-root.");
+  }
+  if (externalSourceRootPath !== null && pairSpecs.length === 0) {
+    throw new Error("--external-source-root requires at least one explicit pair.");
+  }
   const realRepoRoot = await realpath(repoRoot);
   const externalResultRoot = externalResultRootPath === null
     ? null
-    : await resolveExternalResultRoot(externalResultRootPath);
+    : await resolveExternalWavRoot(
+        externalResultRootPath,
+        "--external-result-root",
+        "External result root",
+      );
+  const externalSourceRoot = externalSourceRootPath === null
+    ? null
+    : await resolveExternalWavRoot(
+        externalSourceRootPath,
+        "--external-source-root",
+        "External source root",
+      );
+  if (
+    externalSourceRoot !== null
+    && (
+      isPathInside(realRepoRoot, externalSourceRoot.realPath)
+      || isPathInside(externalSourceRoot.realPath, realRepoRoot)
+    )
+  ) {
+    throw new Error("--external-source-root must not overlap the repository.");
+  }
   const seenIds = new Set<string>();
   const pairs: CorpusPair[] = [];
   for (const pairSpec of pairSpecs) {
@@ -406,6 +446,7 @@ export const resolveExplicitCorpusPairs = async (
       parsed.sourcePath,
       "source",
       externalResultRoot,
+      externalSourceRoot,
     );
     const result = await resolveExplicitWav(
       repoRoot,
@@ -413,6 +454,7 @@ export const resolveExplicitCorpusPairs = async (
       parsed.resultPath,
       "result",
       externalResultRoot,
+      externalSourceRoot,
     );
     pairs.push({
       id: parsed.id,
@@ -745,6 +787,7 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
   let output: string | null = null;
   let pairsJson: string | null = null;
   let externalResultRoot: string | null = null;
+  let externalSourceRoot: string | null = null;
   const pairSpecs: string[] = [];
   for (let index = 0; index < argumentsList.length; index += 1) {
     const argument = argumentsList[index];
@@ -770,7 +813,22 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
       if (externalRootPath === undefined) {
         throw new Error("--external-result-root requires an absolute directory path.");
       }
+      if (!path.isAbsolute(externalRootPath)) {
+        throw new Error("--external-result-root requires an absolute directory path.");
+      }
       externalResultRoot = externalRootPath;
+      index += 1;
+      continue;
+    }
+    if (argument === "--external-source-root") {
+      if (externalSourceRoot !== null) {
+        throw new Error("--external-source-root may only be supplied once.");
+      }
+      const externalRootPath = argumentsList[index + 1];
+      if (externalRootPath === undefined || !path.isAbsolute(externalRootPath)) {
+        throw new Error("--external-source-root requires an absolute directory path.");
+      }
+      externalSourceRoot = externalRootPath;
       index += 1;
       continue;
     }
@@ -792,7 +850,19 @@ export const parseMeasureVoCorpusArguments = (argumentsList: readonly string[]) 
   if (externalResultRoot !== null && pairsJson === null && pairSpecs.length === 0) {
     throw new Error("--external-result-root requires --pairs-json or at least one --pair.");
   }
-  return { externalResultRoot, output, pairSpecs: [...pairSpecs], pairsJson };
+  if (externalSourceRoot !== null && pairsJson === null && pairSpecs.length === 0) {
+    throw new Error("--external-source-root requires --pairs-json or at least one --pair.");
+  }
+  if (externalSourceRoot !== null && externalResultRoot !== null) {
+    throw new Error("--external-source-root cannot be combined with --external-result-root.");
+  }
+  return {
+    externalResultRoot,
+    externalSourceRoot,
+    output,
+    pairSpecs: [...pairSpecs],
+    pairsJson,
+  };
 };
 
 type ExplicitPairManifestEntry = Readonly<{
@@ -870,19 +940,31 @@ const toLedgerCorpusFile = (file: CorpusFile) => ({
 
 const main = async () => {
   const repoRoot = process.cwd();
-  const { externalResultRoot, output, pairSpecs, pairsJson } = parseMeasureVoCorpusArguments(
-    process.argv.slice(2),
-  );
+  const {
+    externalResultRoot,
+    externalSourceRoot,
+    output,
+    pairSpecs,
+    pairsJson,
+  } = parseMeasureVoCorpusArguments(process.argv.slice(2));
   const outputPath = await prepareLedgerOutputPath(repoRoot, output);
   const jsonPairSpecs = pairsJson ? await readExplicitPairSpecsJson(repoRoot, pairsJson) : [];
   const explicitPairSpecs = [...pairSpecs, ...jsonPairSpecs];
   if (explicitPairSpecs.length > MAX_EXPLICIT_PAIRS) {
     throw new Error(`At most ${MAX_EXPLICIT_PAIRS} explicit pairs may be measured at once.`);
   }
+  if (externalSourceRoot !== null && explicitPairSpecs.length === 0) {
+    throw new Error("--external-source-root requires at least one explicit pair.");
+  }
   const discovery: CorpusDiscovery = explicitPairSpecs.length === 0
     ? await discoverCorpusPairs(repoRoot)
     : {
-        pairs: await resolveExplicitCorpusPairs(repoRoot, explicitPairSpecs, externalResultRoot),
+        pairs: await resolveExplicitCorpusPairs(
+          repoRoot,
+          explicitPairSpecs,
+          externalResultRoot,
+          externalSourceRoot,
+        ),
         unmatchedSources: [],
         unmatchedResults: [],
         missingRoots: [],

@@ -681,6 +681,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
     ]),
     {
       externalResultRoot: null,
+      externalSourceRoot: null,
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [],
       pairsJson: null,
@@ -697,6 +698,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
     ]),
     {
       externalResultRoot: null,
+      externalSourceRoot: null,
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [
         "clips/a-source.wav|clips/a-result.wav|audition-a",
@@ -714,6 +716,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
     ]),
     {
       externalResultRoot: null,
+      externalSourceRoot: null,
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [],
       pairsJson: "tasks/render-evidence/current-goal/pairs.json",
@@ -730,6 +733,7 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
     ]),
     {
       externalResultRoot: "A:/CodexTaskEvidence/current-run",
+      externalSourceRoot: null,
       output: "tasks/render-evidence/current-goal/audition.json",
       pairSpecs: [],
       pairsJson: "tasks/render-evidence/current-goal/pairs.json",
@@ -742,6 +746,59 @@ test("measure CLI parses repeatable explicit pairs without changing its default 
       "--pairs-json",
     ]),
     /requires a JSON path/i,
+  );
+});
+
+test("measure CLI scopes an external source root to explicit pairs only", () => {
+  assert.deepEqual(
+    parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--pairs-json",
+      "tasks/render-evidence/current-goal/pairs.json",
+      "--external-source-root",
+      "A:/CodexBackups/voiceover-extreme-baseline",
+    ]),
+    {
+      externalResultRoot: null,
+      externalSourceRoot: "A:/CodexBackups/voiceover-extreme-baseline",
+      output: "tasks/render-evidence/current-goal/audition.json",
+      pairSpecs: [],
+      pairsJson: "tasks/render-evidence/current-goal/pairs.json",
+    },
+  );
+  assert.throws(
+    () => parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--external-source-root",
+      "A:/CodexBackups/voiceover-extreme-baseline",
+    ]),
+    /external-source-root.*requires.*pairs-json|external-source-root.*requires.*pair/i,
+  );
+  assert.throws(
+    () => parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--pair",
+      "clips/source.wav|clips/result.wav|relative-root",
+      "--external-source-root",
+      "../backup",
+    ]),
+    /external-source-root.*absolute/i,
+  );
+  assert.throws(
+    () => parseMeasureVoCorpusArguments([
+      "--out",
+      "tasks/render-evidence/current-goal/audition.json",
+      "--pair",
+      "clips/source.wav|clips/result.wav|ambiguous-roots",
+      "--external-source-root",
+      "A:/CodexBackups/voiceover-extreme-baseline",
+      "--external-result-root",
+      "A:/CodexTaskEvidence/current-run",
+    ]),
+    /external-source-root.*external-result-root|external-result-root.*external-source-root/i,
   );
 });
 
@@ -905,6 +962,115 @@ test("explicit pairs may read results from one exact external evidence root", as
     await rm(root, { recursive: true, force: true });
     await rm(externalRoot, { recursive: true, force: true });
     await rm(siblingRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit pairs may read source and result WAVs from one exact external source root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-source-repo-"));
+  const externalRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-source-"));
+  const siblingRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-source-sibling-"));
+  try {
+    const source = path.join(externalRoot, "audio testing/source.wav");
+    const result = path.join(externalRoot, "audio testing/result/result.wav");
+    const siblingWav = path.join(siblingRoot, "outside.wav");
+    await mkdir(path.dirname(source), { recursive: true });
+    await mkdir(path.dirname(result), { recursive: true });
+    await writeFile(source, new Uint8Array());
+    await writeFile(result, new Uint8Array());
+    await writeFile(siblingWav, new Uint8Array());
+
+    const [pair] = await resolveExplicitCorpusPairs(
+      root,
+      [`${source}|${result}|external-source-pair`],
+      null,
+      externalRoot,
+    );
+
+    assert.equal(pair.source.path, path.resolve(source));
+    assert.equal(pair.result.path, path.resolve(result));
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${siblingWav}|${result}|external-source-escape`],
+        null,
+        externalRoot,
+      ),
+      /external source root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${source}|${siblingWav}|external-result-escape`],
+        null,
+        externalRoot,
+      ),
+      /external source root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${source}|${result}|ambiguous-external-roots`],
+        externalRoot,
+        externalRoot,
+      ),
+      /external-source-root.*external-result-root|external-result-root.*external-source-root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(root, [], null, externalRoot),
+      /external-source-root.*explicit pair/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        ["missing.wav|missing.wav|overlapping-root"],
+        null,
+        root,
+      ),
+      /external-source-root.*overlap.*repository/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+    await rm(siblingRoot, { recursive: true, force: true });
+  }
+});
+
+test("external source root rejects a nested junction or symlink escape", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-source-link-repo-"));
+  const externalRoot = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-source-link-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "vo-explicit-external-source-link-outside-"));
+  try {
+    const safeSource = path.join(externalRoot, "source.wav");
+    const safeResult = path.join(externalRoot, "result.wav");
+    const outsideSource = path.join(outside, "source.wav");
+    const redirect = path.join(externalRoot, "redirect");
+    await writeFile(safeSource, new Uint8Array());
+    await writeFile(safeResult, new Uint8Array());
+    await writeFile(outsideSource, new Uint8Array());
+    await symlink(outside, redirect, process.platform === "win32" ? "junction" : "dir");
+
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${path.join(redirect, "source.wav")}|${safeResult}|external-link-escape`],
+        null,
+        externalRoot,
+      ),
+      /external source root/i,
+    );
+    await assert.rejects(
+      () => resolveExplicitCorpusPairs(
+        root,
+        [`${safeSource}|${path.join(redirect, "source.wav")}|external-result-link-escape`],
+        null,
+        externalRoot,
+      ),
+      /external source root/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
