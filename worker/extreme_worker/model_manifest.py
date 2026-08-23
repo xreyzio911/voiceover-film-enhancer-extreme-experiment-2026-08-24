@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
+
+from .model_runtime import DEFAULT_RUNTIME_ARTIFACTS
 
 
 @dataclass(frozen=True)
@@ -15,100 +18,55 @@ class ModelArtifact:
     sha256: str
     filename: str
     source_url: str
+    license: str
     role: str
     enabled_by_default: bool
+    shippable: bool
 
 
-def _artifact(
-    model_id: str,
-    component: str,
-    package_name: str,
-    version: str,
-    sha256: str,
-    filename: str,
-    source_url: str,
-    role: str,
-    enabled: bool,
-) -> ModelArtifact:
+def _runtime_artifact(artifact_id: str, *, component: str, role: str, enabled: bool) -> ModelArtifact:
+    artifact = next(item for item in DEFAULT_RUNTIME_ARTIFACTS if item.id == artifact_id)
     return ModelArtifact(
-        model_id=model_id,
+        model_id=artifact_id,
         component=component,
-        package_name=package_name,
-        version=version,
-        revision=f"pypi:{version}",
-        sha256=sha256,
-        filename=filename,
-        source_url=source_url,
+        package_name="onnx-artifact",
+        version=artifact.version,
+        revision=artifact.revision,
+        sha256=artifact.sha256,
+        filename=artifact.filename,
+        source_url=artifact.source_url,
+        license=artifact.license,
         role=role,
         enabled_by_default=enabled,
+        shippable=True,
     )
-
-
-SILERO_VAD_WHEEL = {
-    "package_name": "silero-vad",
-    "version": "6.2.1",
-    "sha256": "09de93c4d874bb19c53e62a47dd38be5f163cedad2b5599583231f2a84ef79cb",
-    "filename": "silero_vad-6.2.1-py3-none-any.whl",
-    "source_url": "https://files.pythonhosted.org/packages/0b/2b/48566f29a8b53d856ceb1994f209122749b3fda0a733a07e82047257de7a/silero_vad-6.2.1-py3-none-any.whl",
-}
-
-SPEECHONNXMETRICS_WHEEL = {
-    "package_name": "speechonnxmetrics",
-    "version": "0.0.1",
-    "sha256": "50f1c88c4fd6bc9319e2194973c86f2204ad22a44ac725b0294cc9b87c6a45dc",
-    "filename": "speechonnxmetrics-0.0.1-py3-none-any.whl",
-    "source_url": "https://files.pythonhosted.org/packages/46/b4/7721b25714363de1ad956c9437a4315d48ddec5bd77014627ad72c6ef578/speechonnxmetrics-0.0.1-py3-none-any.whl",
-}
-
-SPEAKERONNX_WHEEL = {
-    "package_name": "speakeronnx",
-    "version": "0.0.1",
-    "sha256": "56209f4e6f95518eb5bd592c5a828264c562f220309c998043a70efc44ae2146",
-    "filename": "speakeronnx-0.0.1-py3-none-any.whl",
-    "source_url": "https://files.pythonhosted.org/packages/fa/9f/93d04fe2fa7ca0a9f641b549dd4e35713b0d3bc7c62fb5e3835a3fbe481d/speakeronnx-0.0.1-py3-none-any.whl",
-}
-
-DEEPFILTERNET_WHEEL = {
-    "package_name": "deepfilternet",
-    "version": "0.5.6",
-    "sha256": "99f5688d954fcfa8f853bf8bb8c3b2a59e4f9dc5d95643c9e6a32053234ba7c6",
-    "filename": "deepfilternet-0.5.6-py3-none-any.whl",
-    "source_url": "https://files.pythonhosted.org/packages/70/71/2edcc970c4dc689c301ea83e89a169fde08d6af0dfb26b14009ab27ee105/deepfilternet-0.5.6-py3-none-any.whl",
-}
 
 
 MODEL_MANIFEST: Mapping[str, ModelArtifact] = MappingProxyType(
     {
-        "silero_vad_v6": _artifact("silero_vad_v6", "silero_vad", role="analysis", enabled=True, **SILERO_VAD_WHEEL),
-        "dnsmos_sig_bak_ovrl": _artifact(
-            "dnsmos_sig_bak_ovrl",
-            "dnsmos",
+        "silero-vad": _runtime_artifact("silero-vad", component="silero_vad", role="analysis", enabled=True),
+        "dnsmos": _runtime_artifact("dnsmos", component="dnsmos", role="analysis", enabled=True),
+        "dnsmos_p808": _runtime_artifact(
+            "dnsmos_p808",
+            component="dnsmos_p808",
             role="analysis",
             enabled=True,
-            **SPEECHONNXMETRICS_WHEEL,
         ),
-        "dnsmos_p808": _artifact(
-            "dnsmos_p808",
-            "dnsmos_p808",
-            role="analysis",
-            enabled=True,
-            **SPEECHONNXMETRICS_WHEEL,
-        ),
-        "sigmos": _artifact("sigmos", "sigmos", role="analysis", enabled=True, **SPEECHONNXMETRICS_WHEEL),
-        "utmos": _artifact("utmos", "utmos", role="analysis_optional", enabled=False, **SPEECHONNXMETRICS_WHEEL),
-        "speakeronnx_resnet34": _artifact(
-            "speakeronnx_resnet34",
-            "speakeronnx",
-            role="analysis_deferred",
-            enabled=False,
-            **SPEAKERONNX_WHEEL,
-        ),
-        "deepfilternet3": _artifact(
-            "deepfilternet3",
-            "deepfilternet3",
-            role="repair_candidate",
-            enabled=False,
-            **DEEPFILTERNET_WHEEL,
+        "sigmos": _runtime_artifact("sigmos", component="sigmos", role="analysis", enabled=True),
+        "utmos": _runtime_artifact("utmos", component="utmos", role="analysis_optional", enabled=False),
+        "deepfilternet3": ModelArtifact(
+            model_id="deepfilternet3",
+            component="deepfilternet3",
+            package_name="",
+            version="",
+            revision="",
+            sha256="",
+            filename="",
+            source_url="https://github.com/Rikorose/DeepFilterNet/issues/700",
+            license="UNRESOLVED",
+            role="deferred_license_review",
+            enabled_by_default=False,
+            shippable=False,
         ),
     }
 )
@@ -116,8 +74,11 @@ MODEL_MANIFEST: Mapping[str, ModelArtifact] = MappingProxyType(
 DEFAULT_ANALYSIS_MODELS = tuple(
     model_id
     for model_id, artifact in MODEL_MANIFEST.items()
-    if artifact.enabled_by_default and artifact.role == "analysis"
+    if artifact.enabled_by_default and artifact.role == "analysis" and artifact.shippable
 )
+
+_HEX_40 = re.compile(r"^[0-9a-f]{40}$")
+_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def validate_manifest(manifest: Mapping[str, ModelArtifact]) -> tuple[str, ...]:
@@ -125,28 +86,21 @@ def validate_manifest(manifest: Mapping[str, ModelArtifact]) -> tuple[str, ...]:
     for model_id, artifact in manifest.items():
         if model_id != artifact.model_id:
             errors.append(f"{model_id}: key mismatch")
-        if artifact.revision != f"pypi:{artifact.version}":
-            errors.append(f"{model_id}: invalid revision")
-        if len(artifact.sha256) != 64 or artifact.sha256 == "0" * 64:
+        if artifact.enabled_by_default and (artifact.role != "analysis" or not artifact.shippable):
+            errors.append(f"{model_id}: default model must be shippable analysis only")
+        if not artifact.shippable:
+            if artifact.license != "UNRESOLVED" or artifact.revision or artifact.sha256 or artifact.filename:
+                errors.append(f"{model_id}: deferred model must not claim a shippable artifact")
+            continue
+        if artifact.license != "MIT":
+            errors.append(f"{model_id}: unsupported deployment license")
+        if not _HEX_40.fullmatch(artifact.revision):
+            errors.append(f"{model_id}: revision must be an immutable commit")
+        if not _HEX_64.fullmatch(artifact.sha256) or artifact.sha256 == "0" * 64:
             errors.append(f"{model_id}: invalid sha256")
         rendered = f"{artifact.model_id} {artifact.version} {artifact.revision} {artifact.source_url}".lower()
-        if any(
-            term in rendered
-            for term in (
-                "latest",
-                "main",
-                "master",
-                "head",
-                "nisqa",
-                "noncommercial",
-                "non-commercial",
-                "cc-by-nc",
-                "example.",
-            )
-        ):
+        if any(term in rendered for term in ("latest", "/main/", "/master/", "nisqa", "noncommercial")):
             errors.append(f"{model_id}: disallowed mutable or noncommercial asset")
-        if not artifact.source_url.startswith("https://files.pythonhosted.org/"):
-            errors.append(f"{model_id}: source url is not an immutable PyPI distribution")
-        if artifact.enabled_by_default and artifact.role != "analysis":
-            errors.append(f"{model_id}: default model must be analysis only")
+        if not artifact.source_url.startswith(("https://raw.githubusercontent.com/", "https://huggingface.co/")):
+            errors.append(f"{model_id}: artifact source is not an approved immutable host")
     return tuple(errors)
