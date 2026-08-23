@@ -323,6 +323,10 @@ const SPEECH_BODY_BAND_LOW_HZ = 180;
 const SPEECH_BODY_BAND_HIGH_HZ = 3000;
 const FRICATIVE_EVIDENCE_MARGIN_DB = 10;
 const FRICATIVE_TAIL_RESCUE_MAX_MS = 240;
+// ML may preserve a weak attached tail, but it must never acquire independent
+// broadband gain authority. Bound its final uplift against the exact plan the
+// same input would have received without ML evidence.
+const ML_PROTECTED_MAX_ADDED_GAIN_DB = 3;
 const SOFT_TAIL_RESCUE_MAX_MS = 500;
 const SOFT_TAIL_RESCUE_NOISY_MAX_MS = 240;
 const SOFT_TAIL_RESCUE_NOISY_RISK = 0.55;
@@ -2053,6 +2057,13 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     const value = protectedSpeechFrameMask[frame];
     return value === true || value === 1;
   };
+  const hasAnyMlProtectedSpeechFrame = (() => {
+    if (!protectedSpeechFrameMask) return false;
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      if (hasMlProtectedSpeechFrame(frame)) return true;
+    }
+    return false;
+  })();
   const hasFricativeEvidence = (frame: number) =>
     fricativeFrameDb !== null && (fricativeFrameDb[frame] ?? -120) >= fricativeEvidenceFloorDb;
   const gainDbCurve = new Float32Array(frameCount);
@@ -3272,6 +3283,28 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       LOCAL_PLANNER_DIP_SOFT_LIMIT_DB,
     );
     slewed[f] -= boundedAdditionalDipDb;
+  }
+
+  if (hasAnyMlProtectedSpeechFrame) {
+    // This one counterfactual call cannot recurse because the advisory mask is
+    // explicitly omitted. It gives the safety envelope the exact legacy plan,
+    // including every release, peak, and source-adaptive decision, without
+    // duplicating that fragile logic here. The clamp can only leave the ML
+    // curve unchanged or withdraw positive excess; it never increases gain or
+    // deepens an attenuation that the protected plan already chose.
+    const legacyPlan = planGainCurve({
+      ...input,
+      protectedSpeechFrameMask: undefined,
+    });
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      const legacyGainLin = legacyPlan.gainCurve[frame];
+      if (!Number.isFinite(legacyGainLin) || legacyGainLin <= 0) continue;
+      const legacyGainDb = 20 * Math.log10(legacyGainLin);
+      slewed[frame] = Math.min(
+        slewed[frame],
+        legacyGainDb + ML_PROTECTED_MAX_ADDED_GAIN_DB,
+      );
+    }
   }
 
   // Stash diagnostics for the caller (logged via PlannedGain output).
