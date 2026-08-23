@@ -5,8 +5,8 @@ services:
     plan: standard
     region: singapore
     rootDir: worker
-    dockerfilePath: ./worker/Dockerfile
-    dockerContext: ./worker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     autoDeployTrigger: checksPass
     healthCheckPath: /health/ready
     maxShutdownDelaySeconds: 300
