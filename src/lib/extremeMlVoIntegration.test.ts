@@ -261,6 +261,31 @@ test("source enhancement uses the same bounded fail-open lane instead of serial 
   assert.equal(JSON.stringify(outcomes).includes("private-enhancer-detail"), false);
 });
 
+test("enhancement cutoff prevents bounded lanes from launching later queued uploads", async () => {
+  const jobs = Array.from({ length: 7 }, (_, index) => ({
+    key: `enhance-cutoff-${index}`,
+    source: new Blob([String(index)], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: `enhance:cutoff:${index}`,
+  }));
+  let accepting = true;
+  const launched: string[] = [];
+
+  await enhanceExtremeSourcesBounded({
+    jobs,
+    shouldContinue: () => accepting,
+    enhance: async ({ idempotencyKey }): Promise<ExtremeEnhancementOutcome> => {
+      launched.push(idempotencyKey);
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      accepting = false;
+      return { status: "unavailable", reason: "poll-timeout" };
+    },
+    onOutcome: () => undefined,
+  });
+
+  assert.equal(launched.length, EXTREME_ML_MAX_CONCURRENT_ANALYSES);
+});
+
 test("ML snapshot grace scales for real WAV uploads but remains a bounded fail-open wait", () => {
   assert.equal(getExtremeMlSnapshotGraceMs([]), EXTREME_ML_MIN_SNAPSHOT_GRACE_MS);
   assert.equal(getExtremeMlSnapshotGraceMs([384_044]), 12_046);

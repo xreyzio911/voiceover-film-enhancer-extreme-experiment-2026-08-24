@@ -109,7 +109,10 @@ def resolve_rnnoise_candidate_policy(report: Mapping[str, Any]) -> RnnoiseCandid
         )
         if value is not None
     )
-    if signal_values and min(signal_values) < 2.8:
+    if signal_values and (
+        max(signal_values) < 2.65
+        or sum(signal_values) / len(signal_values) < 2.45
+    ):
         return RnnoiseCandidatePolicy(False, "fragile-source-speech", 0.0, noise_evidence, speech_fraction)
     mix = min(0.32, max(0.28, 0.24 + noise_evidence * 0.10))
     return RnnoiseCandidatePolicy(True, "noise-limited-source", mix, noise_evidence, speech_fraction)
@@ -119,6 +122,15 @@ def assess_rnnoise_candidate(
     source_report: Mapping[str, Any],
     candidate_report: Mapping[str, Any],
 ) -> RnnoiseCandidateAssessment:
+    source_speech_fraction = _speech_fraction(source_report)
+    candidate_speech_fraction = _speech_fraction(candidate_report)
+    if source_speech_fraction < 0.12 or candidate_speech_fraction < 0.12:
+        return RnnoiseCandidateAssessment(
+            False,
+            "insufficient-speech-support",
+            0.0,
+            0.0,
+        )
     noise_deltas = [
         candidate - source
         for key in ("dnsmos.bak", "sigmos.noise")
@@ -157,8 +169,6 @@ def assess_rnnoise_candidate(
             worst_quality_delta,
         )
 
-    source_speech_fraction = _speech_fraction(source_report)
-    candidate_speech_fraction = _speech_fraction(candidate_report)
     if source_speech_fraction > 0 and candidate_speech_fraction < source_speech_fraction * 0.97:
         return RnnoiseCandidateAssessment(
             False,

@@ -142,6 +142,69 @@ class EnhancementCandidateTests(unittest.TestCase):
         self.assertFalse(silence_heavy_noisy.eligible)
         self.assertEqual(silence_heavy_noisy.reason, "insufficient-speech-support")
 
+    def test_rnnoise_policy_leaves_disputed_noisy_speech_for_candidate_quality_gate(self) -> None:
+        resolve_policy, = require_symbols(
+            self,
+            "extreme_worker.enhancement",
+            "resolve_rnnoise_candidate_policy",
+        )
+        disputed_but_usable = resolve_policy(
+            self._report({
+                "dnsmos.bak": 2.85,
+                "dnsmos.sig": 2.83,
+                "sigmos.noise": 1.89,
+                "sigmos.sig": 2.29,
+            })
+        )
+        consistently_fragile = resolve_policy(
+            self._report({
+                "dnsmos.bak": 2.6,
+                "dnsmos.sig": 2.18,
+                "sigmos.noise": 2.3,
+                "sigmos.sig": 2.24,
+            })
+        )
+
+        self.assertTrue(disputed_but_usable.eligible)
+        self.assertEqual(disputed_but_usable.reason, "noise-limited-source")
+        self.assertGreaterEqual(disputed_but_usable.mix, 0.28)
+        self.assertFalse(consistently_fragile.eligible)
+        self.assertEqual(consistently_fragile.reason, "fragile-source-speech")
+
+    def test_candidate_quality_gate_refuses_insufficient_speech_support(self) -> None:
+        assess_candidate, = require_symbols(
+            self,
+            "extreme_worker.enhancement",
+            "assess_rnnoise_candidate",
+        )
+        source = self._report(
+            {
+                "dnsmos.bak": 2.6,
+                "dnsmos.sig": 3.4,
+                "dnsmos.ovrl": 2.7,
+                "sigmos.noise": 2.7,
+                "sigmos.sig": 3.45,
+                "sigmos.ovrl": 2.75,
+            },
+            speech_fraction=0.09,
+        )
+        candidate = self._report(
+            {
+                "dnsmos.bak": 3.2,
+                "dnsmos.sig": 3.42,
+                "dnsmos.ovrl": 2.82,
+                "sigmos.noise": 3.25,
+                "sigmos.sig": 3.46,
+                "sigmos.ovrl": 2.84,
+            },
+            speech_fraction=0.09,
+        )
+
+        assessment = assess_candidate(source, candidate)
+
+        self.assertFalse(assessment.selected)
+        self.assertEqual(assessment.reason, "insufficient-speech-support")
+
     def test_candidate_quality_gate_requires_noise_gain_without_speech_or_overall_regression(self) -> None:
         assess_candidate, = require_symbols(
             self,

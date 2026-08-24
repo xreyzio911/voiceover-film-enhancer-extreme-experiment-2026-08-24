@@ -144,15 +144,17 @@ export const enhanceExtremeSourcesBounded = async ({
   jobs,
   enhance,
   onOutcome,
+  shouldContinue = () => true,
 }: Readonly<{
   jobs: readonly ExtremeMlSourceJob[];
   enhance: EnhanceExtremeSource;
   onOutcome: (result: ExtremeMlEnhancementOutcome) => void;
+  shouldContinue?: () => boolean;
 }>): Promise<void> => {
   const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
 
   const runLane = async (index: number): Promise<void> => {
-    if (index >= jobs.length) return;
+    if (index >= jobs.length || !shouldContinue()) return;
     const job = jobs[index];
     let outcome: ExtremeEnhancementOutcome;
     try {
@@ -165,6 +167,7 @@ export const enhanceExtremeSourcesBounded = async ({
       outcome = unavailableEnhancementOutcome();
     }
     onOutcome(Object.freeze({ key: job.key, outcome }));
+    if (!shouldContinue()) return;
     await runLane(index + laneCount);
   };
 

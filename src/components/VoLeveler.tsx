@@ -8137,7 +8137,8 @@ const summarizeFailureReason = (error: unknown) => {
         const jobsBeforeEnhancement = jobs;
         const extremeMlEnhancementPromise = enhanceExtremeSourcesBounded({
           jobs: enhancementJobs,
-          enhance: enhanceSourceWithExtremeWorker,
+          enhance: (input) => enhanceSourceWithExtremeWorker({ ...input, maxPolls: 30 }),
+          shouldContinue: () => acceptingExtremeMlEnhancements,
           onOutcome: ({ key, outcome }) => {
             if (!acceptingExtremeMlEnhancements) return;
             const enhancementJob = enhancementJobs.find((candidate) => candidate.key === key);
