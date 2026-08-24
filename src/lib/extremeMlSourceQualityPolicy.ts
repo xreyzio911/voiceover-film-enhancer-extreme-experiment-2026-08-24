@@ -120,21 +120,22 @@ export const buildExtremeMlSourceQualityPolicy = (
   const rawNoiseEvidence = Math.max(
     deficit(dnsmosBackground, 3.55, 2.15),
     deficit(sigmosNoise, 3.55, 2.2),
-    broadQualityEvidence * 0.48,
   );
-  const rawRoomEvidence = Math.max(
-    deficit(sigmosReverb, 3.45, 2.1),
-    broadQualityEvidence * 0.36,
-  );
+  const rawRoomEvidence = deficit(sigmosReverb, 3.45, 2.1);
   const rawStabilityEvidence = Math.max(
     deficit(sigmosLoud, 3.55, 2.25),
     deficit(sigmosDiscontinuity, 3.5, 2.2),
-    broadQualityEvidence * 0.28,
+    broadQualityEvidence * 0.58,
   );
   const noiseEvidence = rawNoiseEvidence * cleanupConfidence;
   const roomEvidence = rawRoomEvidence * cleanupConfidence;
   const stabilityEvidence = rawStabilityEvidence * cleanupConfidence;
-  const strongestEvidence = Math.max(noiseEvidence, roomEvidence, stabilityEvidence);
+  const strongestEvidence = Math.max(
+    noiseEvidence,
+    roomEvidence,
+    stabilityEvidence,
+    speechFragilityEvidence,
+  );
   if (strongestEvidence < 0.18 || usedMetricKeys.size === 0) return fallbackPolicy();
 
   const orderedMetricKeys = Object.freeze([...usedMetricKeys].sort());
@@ -145,15 +146,17 @@ export const buildExtremeMlSourceQualityPolicy = (
     reason: "ml-source-quality",
     noiseRiskFloor: floorFromEvidence(noiseEvidence),
     roomRiskFloor: floorFromEvidence(roomEvidence),
-    pauseNoiseRiskFloor: clamp(0.22 + noiseEvidence * 0.62 + roomEvidence * 0.18 + stabilityEvidence * 0.12, 0, 0.84),
+    pauseNoiseRiskFloor:
+      Math.max(noiseEvidence, roomEvidence) >= 0.18
+        ? clamp(0.18 + noiseEvidence * 0.62 + roomEvidence * 0.18, 0, 0.84)
+        : 0,
     denoiseBias: clamp(noiseEvidence * 0.34 + roomEvidence * 0.08, 0, 0.4),
-    roomCleanupBias: clamp(roomEvidence * 0.44 + stabilityEvidence * 0.08, 0, 0.42),
+    roomCleanupBias: clamp(roomEvidence * 0.5, 0, 0.42),
     instabilityHintBoost: clamp(stabilityEvidence * 0.18 + roomEvidence * 0.06, 0, 0.24),
     speechSpikeTamingBoost: clamp(stabilityEvidence * 0.14, 0, 0.16),
     plannerMaxGainPenaltyDb: clamp(
       noiseEvidence * 1.05 +
         roomEvidence * 0.55 +
-        stabilityEvidence * 0.36 +
         speechFragilityEvidence * 0.8,
       0,
       1.5,
