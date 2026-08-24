@@ -58,6 +58,7 @@ _AUDIO_TYPES = frozenset({"audio/wav", "audio/x-wav"})
 _UPLOAD_TYPES = frozenset({"audio/wav", "audio/x-wav", "application/offset+octet-stream"})
 _ANALYSIS_SCOPES = frozenset({"source_analysis", "render_analysis"})
 _LOGGER = logging.getLogger("extreme_worker")
+_TICKET_REPLAY_RETENTION_SAFETY_SECONDS = 60.0
 
 
 class _ShortLivedJobStore:
@@ -136,6 +137,7 @@ class _EmbeddedProcessor:
                         stale_job_seconds=self.stale_job_seconds,
                     )
                     _purge_expired_jobs(self.app, retention_seconds=self.retention_seconds)
+                    _prune_expired_ticket_replays(self.app, now=now)
                     self.next_maintenance_at = now + self.maintenance_interval_seconds
                 self.app.state.job_store.requeue_expired_leases()
                 job = self.app.state.job_store.lease_next(
@@ -308,6 +310,15 @@ def _admission_authority(app: FastAPI) -> AdmissionTicketAuthority | None:
                 max_ttl_seconds=300,
             )
         return app.state.admission_authority
+
+
+def _prune_expired_ticket_replays(app: FastAPI, *, now: float | None = None) -> int:
+    current_time = float(app.state.clock() if now is None else now)
+    cutoff = current_time - (
+        float(app.state.ticket_ttl_seconds) + _TICKET_REPLAY_RETENTION_SAFETY_SECONDS
+    )
+    replay_store = SQLiteReplayStore(app.state.storage_root / "tickets.sqlite3")
+    return replay_store.prune_before(cutoff)
 
 
 def _normalize_metadata(payload: Any, *, max_audio_bytes: int, require_owner: bool = False) -> dict[str, Any] | None:

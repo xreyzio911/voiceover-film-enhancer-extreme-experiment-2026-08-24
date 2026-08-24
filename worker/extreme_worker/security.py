@@ -68,9 +68,13 @@ class InMemoryReplayStore:
                 raise TicketReplayError("Ticket was already consumed.")
             self._seen.add(digest)
 
+    def prune_before(self, cutoff: float) -> int:
+        return 0
+
 
 class ReplayStore(Protocol):
     def consume(self, nonce: str) -> None: ...
+    def prune_before(self, cutoff: float) -> int: ...
 
 
 class SQLiteReplayStore:
@@ -102,6 +106,14 @@ class SQLiteReplayStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise TicketReplayError("Ticket was already consumed.") from exc
+
+    def prune_before(self, cutoff: float) -> int:
+        with closing(sqlite3.connect(self.path, timeout=self.timeout_seconds)) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM consumed_ticket_nonces WHERE consumed_at < ?",
+                (float(cutoff),),
+            )
+            return int(cursor.rowcount or 0)
 
     def probe_writable(self) -> None:
         """Roll back a bounded write so readiness never consumes a real nonce."""
