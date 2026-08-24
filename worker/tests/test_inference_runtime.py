@@ -364,6 +364,130 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(first[3]["dnsmos"]["status"], "available")
         self.assertEqual(first[3]["dnsmos"]["code"], "ok-partial-windows")
 
+    def test_runtime_scores_sparse_editorial_timeline_from_speech_active_windows_only(self) -> None:
+        import numpy as np
+
+        _, RuntimeConfig, _, _, _, _ = self._model_symbols()
+        AdvisoryInferenceRuntime, _ = self._inference_symbols()
+        sample_rate = 16_000
+        duration_seconds = 70
+        audio = np.zeros(sample_rate * duration_seconds, dtype=np.float32)
+        active_ranges = ((11.0, 14.0), (34.0, 38.0), (57.0, 61.0))
+        for start_seconds, end_seconds in active_ranges:
+            start = round(start_seconds * sample_rate)
+            stop = round(end_seconds * sample_rate)
+            timeline = np.arange(stop - start, dtype=np.float32) / sample_rate
+            audio[start:stop] = 0.18 * np.sin(2 * np.pi * 220 * timeline)
+
+        chunk_count = math.ceil(len(audio) / 512)
+        probabilities = [0.01] * chunk_count
+        for chunk_index in range(chunk_count):
+            midpoint_seconds = (chunk_index * 512 + 256) / sample_rate
+            if any(start <= midpoint_seconds < stop for start, stop in active_ranges):
+                probabilities[chunk_index] = 0.94
+
+        class RecordingMetrics:
+            def __init__(self) -> None:
+                self.rms_values: list[float] = []
+
+            def score(self, metric_id: str, window, received_sample_rate: int):
+                self.assertions(metric_id, received_sample_rate)
+                self.rms_values.append(float(np.sqrt(np.mean(np.square(window)))))
+                return {"sig": 4.1, "bak": 3.7, "ovrl": 3.8}
+
+            @staticmethod
+            def assertions(metric_id: str, received_sample_rate: int) -> None:
+                if metric_id != "dnsmos" or received_sample_rate != sample_rate:
+                    raise AssertionError("unexpected speech-aware metric request")
+
+        vad_payload = b"speech-aware-vad"
+        metric_payload = b"speech-aware-dnsmos"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            (model_dir / "vad.onnx").write_bytes(vad_payload)
+            (model_dir / "dnsmos.onnx").write_bytes(metric_payload)
+            source_path = model_dir / "sparse.wav"
+            pcm = np.clip(audio * 32_767, -32_768, 32_767).astype("<i2")
+            with wave.open(str(source_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                output.writeframes(pcm.tobytes())
+            backend = RecordingMetrics()
+            runtime = AdvisoryInferenceRuntime(
+                RuntimeConfig(
+                    model_dir=model_dir,
+                    metric_ids=("dnsmos",),
+                    artifacts=(
+                        self._spec("silero-vad", "silero_vad", "vad.onnx", vad_payload),
+                        self._spec("dnsmos", "dnsmos", "dnsmos.onnx", metric_payload),
+                    ),
+                    max_analysis_seconds=duration_seconds + 1,
+                ),
+                vad_factory=lambda _: _FakeVad(tuple(probabilities)),
+                metrics_factory=lambda _: backend,
+            )
+
+            report = runtime.analyze_wav(source_path)
+
+        self.assertGreaterEqual(len(backend.rms_values), 3)
+        self.assertLessEqual(len(backend.rms_values), 7)
+        self.assertTrue(all(rms > 0.025 for rms in backend.rms_values), backend.rms_values)
+        self.assertTrue(report["metrics"]["dnsmos.ovrl"]["available"])
+        self.assertEqual(report["telemetry"]["components"]["dnsmos"]["status"], "available")
+
+    def test_runtime_refuses_silence_only_mos_instead_of_authorizing_cleanup(self) -> None:
+        import numpy as np
+
+        _, RuntimeConfig, _, _, _, _ = self._model_symbols()
+        AdvisoryInferenceRuntime, _ = self._inference_symbols()
+
+        class UnexpectedMetrics:
+            calls = 0
+
+            def score(self, _metric_id: str, _audio, _sample_rate: int):
+                self.calls += 1
+                return {"sig": 2.5, "bak": 2.1, "ovrl": 1.9}
+
+        sample_rate = 16_000
+        duration_seconds = 30
+        vad_payload = b"silence-vad"
+        metric_payload = b"silence-dnsmos"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            (model_dir / "vad.onnx").write_bytes(vad_payload)
+            (model_dir / "dnsmos.onnx").write_bytes(metric_payload)
+            source_path = model_dir / "silence.wav"
+            samples = np.zeros(sample_rate * duration_seconds, dtype="<i2")
+            with wave.open(str(source_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                output.writeframes(samples.tobytes())
+            backend = UnexpectedMetrics()
+            runtime = AdvisoryInferenceRuntime(
+                RuntimeConfig(
+                    model_dir=model_dir,
+                    metric_ids=("dnsmos",),
+                    artifacts=(
+                        self._spec("silero-vad", "silero_vad", "vad.onnx", vad_payload),
+                        self._spec("dnsmos", "dnsmos", "dnsmos.onnx", metric_payload),
+                    ),
+                    max_analysis_seconds=duration_seconds + 1,
+                ),
+                vad_factory=lambda _: _FakeVad(tuple([0.01] * math.ceil(len(samples) / 512))),
+                metrics_factory=lambda _: backend,
+            )
+
+            report = runtime.analyze_wav(source_path)
+
+        self.assertEqual(backend.calls, 0)
+        self.assertFalse(report["metrics"]["dnsmos.ovrl"]["available"])
+        self.assertEqual(
+            report["telemetry"]["components"]["dnsmos"],
+            {"status": "unavailable", "code": "no-speech-metric-windows"},
+        )
+
     def test_short_metric_scoring_preserves_one_call_behavior(self) -> None:
         import numpy as np
 
