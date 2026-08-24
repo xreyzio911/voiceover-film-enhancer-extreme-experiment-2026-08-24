@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import shutil
+import struct
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 
 from contract_support import require_symbols
@@ -174,6 +177,52 @@ class EnhancementCandidateTests(unittest.TestCase):
         self.assertGreaterEqual(accepted.noise_delta, 0.08)
         self.assertFalse(rejected.selected)
         self.assertEqual(rejected.reason, "speech-quality-regression")
+
+    def test_waveform_gate_preserves_energy_owned_expressive_contrast(self) -> None:
+        assess_waveform, WavLimits = require_symbols(
+            self,
+            "extreme_worker.enhancement",
+            "assess_waveform_retention",
+            "WavLimits",
+        )
+        sample_rate = 48_000
+        frame_count = sample_rate * 2
+
+        def write_voice(path: Path, *, ordinary_scale: float, expressive_scale: float) -> None:
+            samples = []
+            for index in range(frame_count):
+                expressive = index >= round(frame_count * 0.9)
+                amplitude = 0.58 * expressive_scale if expressive else 0.14 * ordinary_scale
+                samples.append(round(math.sin(2 * math.pi * 220 * index / sample_rate) * amplitude * 32_767))
+            with wave.open(str(path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                output.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = root / "source.wav"
+            retained_path = root / "retained.wav"
+            flattened_path = root / "flattened.wav"
+            write_voice(source_path, ordinary_scale=1.0, expressive_scale=1.0)
+            write_voice(retained_path, ordinary_scale=0.98, expressive_scale=0.95)
+            write_voice(flattened_path, ordinary_scale=0.98, expressive_scale=0.55)
+            limits = WavLimits(
+                max_upload_bytes=2 * 1024 * 1024,
+                allowed_sample_rates=frozenset({48_000}),
+                allowed_channels=frozenset({1}),
+                allowed_sample_width_bytes=frozenset({2}),
+                max_duration_seconds=3,
+                max_decoded_frames=frame_count + 1,
+            )
+            retained = assess_waveform(source_path, retained_path, limits=limits)
+            flattened = assess_waveform(source_path, flattened_path, limits=limits)
+
+        self.assertTrue(retained.preserved)
+        self.assertGreaterEqual(retained.expressive_contrast_retention, 0.9)
+        self.assertFalse(flattened.preserved)
+        self.assertEqual(flattened.reason, "expressive-contrast-regression")
 
     @unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg is not installed")
     def test_local_passthrough_candidate_preserves_wav_contract_for_api_tests(self) -> None:
