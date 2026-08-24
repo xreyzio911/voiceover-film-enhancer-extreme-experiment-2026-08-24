@@ -94,7 +94,7 @@ test("moderately poor perceptual noise and room evidence is promoted to a decisi
   assert.ok(policy.plannerMaxGainPenaltyDb >= 0.55);
 });
 
-test("optional naturalness and overall MOS widen cleanup when artifact scores are incomplete", () => {
+test("optional naturalness and overall MOS widen stability evidence without inventing noise", () => {
   const policy = buildExtremeMlSourceQualityPolicy(
     reportWithMetrics(
       {
@@ -110,11 +110,14 @@ test("optional naturalness and overall MOS widen cleanup when artifact scores ar
   );
 
   assert.equal(policy.reason, "ml-source-quality");
-  assert.equal(policy.noiseRiskFloor, "medium");
+  assert.equal(policy.noiseRiskFloor, null);
   assert.equal(policy.roomRiskFloor, null);
-  assert.ok(policy.pauseNoiseRiskFloor >= 0.4);
-  assert.ok(policy.denoiseBias >= 0.12);
-  assert.ok(policy.plannerMaxGainPenaltyDb >= 0.35);
+  assert.equal(policy.pauseNoiseRiskFloor, 0);
+  assert.equal(policy.denoiseBias, 0);
+  assert.equal(policy.roomCleanupBias, 0);
+  assert.ok(policy.instabilityHintBoost >= 0.06);
+  assert.ok(policy.speechSpikeTamingBoost >= 0.04);
+  assert.equal(policy.plannerMaxGainPenaltyDb, 0);
   assert.deepEqual(policy.usedMetricKeys, [
     "dnsmos.ovrl",
     "dnsmos.sig",
@@ -123,6 +126,36 @@ test("optional naturalness and overall MOS widen cleanup when artifact scores ar
     "sigmos.sig",
     "utmos",
   ]);
+});
+
+test("clean but perceptually unstable speech gets planner help without neural cleanup", () => {
+  const policy = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics(
+      {
+        "dnsmos.ovrl": { value: 2.78, available: true, higherIsBetter: true },
+        "dnsmos.sig": { value: 3.21, available: true, higherIsBetter: true },
+        "dnsmos.bak": { value: 3.98, available: true, higherIsBetter: true },
+        "dnsmos_p808": { value: 3.72, available: true, higherIsBetter: true },
+        "sigmos.ovrl": { value: 2.38, available: true, higherIsBetter: true },
+        "sigmos.sig": { value: 3.5, available: true, higherIsBetter: true },
+        "sigmos.noise": { value: 4.65, available: true, higherIsBetter: true },
+        "sigmos.reverb": { value: 4.71, available: true, higherIsBetter: true },
+        "sigmos.loud": { value: 2.0, available: true, higherIsBetter: true },
+        "sigmos.disc": { value: 3.92, available: true, higherIsBetter: true },
+      },
+      { vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.92)) } },
+    ),
+  );
+
+  assert.equal(policy.reason, "ml-source-quality");
+  assert.equal(policy.noiseRiskFloor, null);
+  assert.equal(policy.roomRiskFloor, null);
+  assert.equal(policy.pauseNoiseRiskFloor, 0);
+  assert.equal(policy.denoiseBias, 0);
+  assert.equal(policy.roomCleanupBias, 0);
+  assert.ok(policy.instabilityHintBoost >= 0.14);
+  assert.ok(policy.speechSpikeTamingBoost >= 0.1);
+  assert.ok(policy.plannerMaxGainPenaltyDb <= 0.08);
 });
 
 test("broad MOS-only evidence is ignored when VAD shows a silence-heavy editorial timeline", () => {
