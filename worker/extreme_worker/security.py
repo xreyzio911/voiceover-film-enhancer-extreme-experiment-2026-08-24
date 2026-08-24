@@ -68,13 +68,8 @@ class InMemoryReplayStore:
                 raise TicketReplayError("Ticket was already consumed.")
             self._seen.add(digest)
 
-    def prune_before(self, cutoff: float) -> int:
-        return 0
-
-
 class ReplayStore(Protocol):
     def consume(self, nonce: str) -> None: ...
-    def prune_before(self, cutoff: float) -> int: ...
 
 
 class SQLiteReplayStore:
