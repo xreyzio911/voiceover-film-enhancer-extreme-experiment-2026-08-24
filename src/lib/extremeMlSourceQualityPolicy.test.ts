@@ -188,6 +188,35 @@ test("broad MOS-only evidence is ignored when VAD shows a silence-heavy editoria
   assert.equal(policy.plannerMaxGainPenaltyDb, 0);
 });
 
+test("noise and room MOS cannot authorize cleanup on a silence-heavy editorial timeline", () => {
+  const policy = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics(
+      {
+        "dnsmos.bak": { value: 2.15, available: true, higherIsBetter: true },
+        "sigmos.noise": { value: 2.2, available: true, higherIsBetter: true },
+        "sigmos.reverb": { value: 2.1, available: true, higherIsBetter: true },
+      },
+      {
+        vad: {
+          frameMs: 10,
+          frames: vadFrames([
+            ...new Array(9).fill(0.94),
+            ...new Array(91).fill(0.02),
+          ]),
+        },
+      },
+    ),
+  );
+
+  assert.equal(policy.reason, "legacy-fallback");
+  assert.equal(policy.noiseRiskFloor, null);
+  assert.equal(policy.roomRiskFloor, null);
+  assert.equal(policy.pauseNoiseRiskFloor, 0);
+  assert.equal(policy.denoiseBias, 0);
+  assert.equal(policy.roomCleanupBias, 0);
+  assert.equal(policy.plannerMaxGainPenaltyDb, 0);
+});
+
 test("poor speech/signal MOS damps cleanup authority instead of authorizing overprocessing", () => {
   const report = {
     "dnsmos.bak": { value: 2.35, available: true, higherIsBetter: true },

@@ -7,5 +7,5 @@ def build_capabilities() -> dict[str, object]:
         "canBlockDelivery": False,
         "canChangeGainDb": False,
         "levelAuthority": "gainPlanner",
-        "supports": ["vad_protection", "quality_metrics"],
+        "supports": ["vad_protection", "quality_metrics", "enhancement_candidate"],
     }

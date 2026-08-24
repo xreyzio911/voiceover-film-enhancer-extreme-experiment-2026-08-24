@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -10,7 +11,9 @@ import {
   type ExtremeSourceReport,
 } from "./extremeMlClient.ts";
 
-const validReport = (): unknown => ({
+const sha256Hex = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+const validReport = (sourceSha256 = "a".repeat(64)): unknown => ({
   schemaVersion: 1,
   advisoryOnly: true,
   canBlockDelivery: false,
@@ -18,7 +21,7 @@ const validReport = (): unknown => ({
   levelAuthority: "gainPlanner",
   modelSetId: "extreme-core-2026-08-24",
   source: {
-    sha256: "a".repeat(64),
+    sha256: sourceSha256,
     durationMs: 120,
     sampleRate: 48_000,
     channels: 1,
@@ -189,6 +192,7 @@ test("worker telemetry must prove advisory execution without audio mutation or h
 
 test("source analysis sends only metadata through Vercel and WAV bytes directly to Render", async () => {
   const sourceBytes = Uint8Array.from({ length: 10 }, (_, index) => index + 1);
+  const sourceSha256 = sha256Hex(sourceBytes);
   const source = new Blob([sourceBytes], { type: "audio/wav" });
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let statusPolls = 0;
@@ -212,7 +216,7 @@ test("source analysis sends only metadata through Vercel and WAV bytes directly 
       });
     }
     if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
-    if (url.endsWith("/report")) return Response.json(validReport());
+    if (url.endsWith("/report")) return Response.json(validReport(sourceSha256));
     if (url.endsWith("/v1/jobs/job_123")) {
       statusPolls += 1;
       return Response.json({ state: statusPolls < 2 ? "running" : "succeeded", progress: statusPolls < 2 ? 0.5 : 1 });
@@ -242,6 +246,7 @@ test("source analysis sends only metadata through Vercel and WAV bytes directly 
     contentType: "audio/wav",
     idempotencyKey: "batch-1-file-1",
     scope: "source_analysis",
+    sha256: sourceSha256,
   });
 
   const uploadCalls = calls.filter((call) => call.url.endsWith("/input") && call.init.method === "PATCH");
@@ -257,10 +262,51 @@ test("source analysis sends only metadata through Vercel and WAV bytes directly 
   );
 });
 
+test("source reports must match the exact uploaded source hash before becoming evidence", async () => {
+  const sourceBytes = Uint8Array.from([10, 20, 30, 40]);
+  const source = new Blob([sourceBytes], { type: "audio/wav" });
+  let statusPolls = 0;
+  const outcome = await analyzeSourceWithExtremeWorker({
+    source,
+    contentType: "audio/wav",
+    idempotencyKey: "source-hash-mismatch",
+    fetchImpl: async (input, init = {}) => {
+      const url = String(input);
+      if (url === "/api/extreme-ml/ticket") {
+        return Response.json({
+          workerBaseUrl: "https://worker.example",
+          ticket: "ticket_opaque",
+          expiresAt: "2026-08-24T01:00:00.000Z",
+        });
+      }
+      if (url.endsWith("/v1/jobs")) {
+        return Response.json({ jobId: "hash_job", accessToken: "hash_secret", uploadOffset: 0, maxChunkBytes: 16 });
+      }
+      if (url.endsWith("/input") && init.method === "PATCH") {
+        return new Response(null, { status: 204, headers: { "Upload-Offset": String(source.size) } });
+      }
+      if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
+      if (url.endsWith("/v1/jobs/hash_job")) {
+        statusPolls += 1;
+        return Response.json({ state: statusPolls < 2 ? "running" : "succeeded" });
+      }
+      if (url.endsWith("/report")) return Response.json(validReport("f".repeat(64)));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    sleep: async () => undefined,
+    maxPolls: 4,
+    allowedWorkerOrigins: ["https://worker.example"],
+  });
+
+  assert.deepEqual(outcome, { status: "unavailable", reason: "report-invalid" });
+});
+
 test("render analysis keeps its distinct least-privilege scope through ticket and job admission", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
+  const sourceBytes = new Uint8Array([1, 2, 3]);
+  const sourceSha256 = sha256Hex(sourceBytes);
   const outcome = await analyzeRenderedWithExtremeWorker({
-    source: new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }),
+    source: new Blob([sourceBytes], { type: "audio/wav" }),
     contentType: "audio/wav",
     idempotencyKey: "render-1",
     fetchImpl: async (input, init = {}) => {
@@ -285,7 +331,7 @@ test("render analysis keeps its distinct least-privilege scope through ticket an
         return new Response(null, { status: 204, headers: { "Upload-Offset": "3" } });
       }
       if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
-      if (url.endsWith("/report")) return Response.json(validReport());
+      if (url.endsWith("/report")) return Response.json(validReport(sourceSha256));
       if (url.endsWith("/v1/jobs/render_job")) return Response.json({ state: "succeeded" });
       throw new Error(`Unexpected request: ${url}`);
     },
@@ -309,8 +355,11 @@ test("render analysis keeps its distinct least-privilege scope through ticket an
 test("enhancement candidate downloads optional WAV bytes without granting gain authority", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const enhancedBytes = new Uint8Array([82, 73, 70, 70, 1, 2, 3]);
+  const sourceBytes = new Uint8Array([1, 2, 3]);
+  const sourceSha256 = sha256Hex(sourceBytes);
+  const candidateSha256 = sha256Hex(enhancedBytes);
   const outcome = await enhanceSourceWithExtremeWorker({
-    source: new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }),
+    source: new Blob([sourceBytes], { type: "audio/wav" }),
     contentType: "audio/wav",
     idempotencyKey: "enhance-1",
     fetchImpl: async (input, init = {}) => {
@@ -337,9 +386,16 @@ test("enhancement candidate downloads optional WAV bytes without granting gain a
       if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
       if (url.endsWith("/report")) {
         return Response.json({
-          ...(validReport() as Record<string, unknown>),
+          ...(validReport(sourceSha256) as Record<string, unknown>),
+          candidate: {
+            role: "enhancement_candidate",
+            sha256: candidateSha256,
+            durationMs: 120,
+            sampleRate: 48_000,
+            channels: 1,
+          },
           telemetry: {
-            ...(validReport() as { telemetry: Record<string, unknown> }).telemetry,
+            ...(validReport(sourceSha256) as { telemetry: Record<string, unknown> }).telemetry,
             candidateSelected: true,
           },
         });
@@ -360,8 +416,70 @@ test("enhancement candidate downloads optional WAV bytes without granting gain a
   }
   const ticketCall = calls.find((call) => call.url === "/api/extreme-ml/ticket");
   assert.ok(ticketCall);
-  assert.equal(JSON.parse(ticketCall.init.body as string).scope, "enhancement_candidate");
+  assert.deepEqual(JSON.parse(ticketCall.init.body as string), {
+    sizeBytes: 3,
+    contentType: "audio/wav",
+    idempotencyKey: "enhance-1",
+    scope: "enhancement_candidate",
+    sha256: sourceSha256,
+  });
   assert.ok(calls.some((call) => call.url.endsWith("/candidate")));
+});
+
+test("enhancement candidate hash mismatch fails open before returning candidate bytes", async () => {
+  const candidateBytes = new Uint8Array([82, 73, 70, 70, 9, 8, 7]);
+  const sourceBytes = new Uint8Array([7, 8, 9]);
+  const sourceSha256 = sha256Hex(sourceBytes);
+  let statusPolls = 0;
+  const outcome = await enhanceSourceWithExtremeWorker({
+    source: new Blob([sourceBytes], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: "enhance-hash-mismatch",
+    fetchImpl: async (input, init = {}) => {
+      const url = String(input);
+      if (url === "/api/extreme-ml/ticket") {
+        return Response.json({
+          workerBaseUrl: "https://worker.example",
+          ticket: "ticket_opaque",
+          expiresAt: "2026-08-24T01:00:00.000Z",
+        });
+      }
+      if (url.endsWith("/v1/jobs")) {
+        return Response.json({ jobId: "candidate_hash_job", accessToken: "candidate_hash_secret", uploadOffset: 0, maxChunkBytes: 16 });
+      }
+      if (url.endsWith("/input") && init.method === "PATCH") {
+        return new Response(null, { status: 204, headers: { "Upload-Offset": String(sourceBytes.byteLength) } });
+      }
+      if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
+      if (url.endsWith("/v1/jobs/candidate_hash_job")) {
+        statusPolls += 1;
+        return Response.json({ state: statusPolls < 2 ? "running" : "succeeded" });
+      }
+      if (url.endsWith("/report")) {
+        return Response.json({
+          ...(validReport(sourceSha256) as Record<string, unknown>),
+          candidate: {
+            role: "enhancement_candidate",
+            sha256: "e".repeat(64),
+            durationMs: 120,
+            sampleRate: 48_000,
+            channels: 1,
+          },
+          telemetry: {
+            ...(validReport(sourceSha256) as { telemetry: Record<string, unknown> }).telemetry,
+            candidateSelected: true,
+          },
+        });
+      }
+      if (url.endsWith("/candidate")) return new Response(candidateBytes, { headers: { "Content-Type": "audio/wav" } });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    sleep: async () => undefined,
+    allowedWorkerOrigins: ["https://worker.example"],
+    maxPolls: 4,
+  });
+
+  assert.deepEqual(outcome, { status: "unavailable", reason: "candidate-unavailable" });
 });
 
 test("worker failures and exhausted polling fail open without throwing", async () => {

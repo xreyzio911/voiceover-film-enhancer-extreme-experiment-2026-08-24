@@ -75,6 +75,7 @@ class JobRecord:
     attempts: int
     owner_identity_hash: str | None = None
     terminal_code: TerminalCode | None = None
+    scope: str = "source_analysis"
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,7 @@ class SQLiteJobStore:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 owner_identity_hash TEXT,
                 terminal_code TEXT,
+                scope TEXT NOT NULL DEFAULT 'source_analysis',
                 UNIQUE(owner_token_hash, idempotency_key)
             );
             CREATE INDEX IF NOT EXISTS jobs_queue_idx
@@ -157,6 +159,7 @@ class SQLiteJobStore:
         )
         self._ensure_column("jobs", "owner_identity_hash", "TEXT")
         self._ensure_column("jobs", "terminal_code", "TEXT")
+        self._ensure_column("jobs", "scope", "TEXT NOT NULL DEFAULT 'source_analysis'")
         self._ensure_column("uploads", "actual_sha256", "TEXT")
         self._connection.execute(
             """
@@ -189,6 +192,7 @@ class SQLiteJobStore:
             terminal_code=(
                 None if row["terminal_code"] is None else TerminalCode(str(row["terminal_code"]))
             ),
+            scope=str(row["scope"]),
         )
 
     def _row_to_upload(self, row: sqlite3.Row) -> UploadRecord:
@@ -236,8 +240,9 @@ class SQLiteJobStore:
         owner_token_hash: str,
         idempotency_key: str,
         request_fingerprint: str,
+        scope: str = "source_analysis",
     ) -> JobRecord:
-        if not owner_token_hash or not idempotency_key or not request_fingerprint:
+        if not owner_token_hash or not idempotency_key or not request_fingerprint or not scope:
             raise ValueError("owner hash, idempotency key, and fingerprint are required")
         now = float(self._clock())
         with self._lock:
@@ -257,8 +262,8 @@ class SQLiteJobStore:
                     """
                     INSERT INTO jobs(
                         job_id, owner_token_hash, idempotency_key, request_fingerprint,
-                        state, created_at, updated_at, attempts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                        state, created_at, updated_at, attempts, scope
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
                     """,
                     (
                         job_id,
@@ -268,6 +273,7 @@ class SQLiteJobStore:
                         JobState.UPLOADING.value,
                         now,
                         now,
+                        scope,
                     ),
                 )
                 row = self._connection.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -291,10 +297,11 @@ class SQLiteJobStore:
         access_token_hash: str,
         idempotency_key: str,
         request_fingerprint: str,
+        scope: str = "source_analysis",
         max_active_jobs_per_owner: int | None = None,
     ) -> tuple[JobRecord, bool]:
         """Create an API job or rotate its bearer hash on an idempotent retry."""
-        if not all((owner_identity_hash, access_token_hash, idempotency_key, request_fingerprint)):
+        if not all((owner_identity_hash, access_token_hash, idempotency_key, request_fingerprint, scope)):
             raise ValueError("API job identity and request fields are required")
         now = float(self._clock())
         with self._lock:
@@ -336,8 +343,8 @@ class SQLiteJobStore:
                     """
                     INSERT INTO jobs(
                         job_id, owner_token_hash, owner_identity_hash, idempotency_key,
-                        request_fingerprint, state, created_at, updated_at, attempts
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        request_fingerprint, state, created_at, updated_at, attempts, scope
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                     """,
                     (
                         job_id,
@@ -348,6 +355,7 @@ class SQLiteJobStore:
                         JobState.UPLOADING.value,
                         now,
                         now,
+                        scope,
                     ),
                 )
                 row = self._connection.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()

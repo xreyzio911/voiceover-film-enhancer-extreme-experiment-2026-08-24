@@ -1,16 +1,19 @@
 # Extreme advisory ML runtime addendum
 
-This runtime measures uploaded WAV sources. It never renders, rewrites, repairs,
-selects, normalizes, compresses, EQs, limits, or changes gain. The browser's
-`gainPlanner` remains the only broadband and time-varying level authority. A missing,
-late, invalid, or failing model produces `runtimeStatus: degraded` telemetry and empty
-or unavailable evidence; it does not block browser delivery.
+This runtime measures uploaded WAV sources and, only for the explicit
+`enhancement_candidate` scope, may produce one optional source-cleanup candidate. It
+never normalizes, compresses, EQs for tone, limits, selects a render candidate, or
+changes gain. The browser's `gainPlanner` remains the only broadband and
+time-varying level authority. A missing, late, invalid, or failing model produces
+`runtimeStatus: degraded` telemetry and empty or unavailable evidence; it does not
+block browser delivery.
 
 Uploaded source bytes are deleted immediately after success, failure, or acknowledged
-cancellation. Successful advisory reports remain available for 24 hours by default,
-then the SQLite row and fixed per-job artifacts are purged. The worker accepts at most
-four active jobs per authenticated owner by default; a full lane returns HTTP 429 and
-the browser continues through the unchanged local path.
+cancellation. Successful advisory reports and successful enhancement candidates
+remain available for 24 hours by default, then the SQLite row and fixed per-job
+artifacts are purged. The worker accepts at most four active jobs per authenticated
+owner by default; a full lane returns HTTP 429 and the browser continues through the
+unchanged local path.
 
 Non-terminal work has a separate two-hour stale TTL by default. Upload progress,
 state changes, and lease heartbeats refresh job activity. Stale uploading, queued, or
@@ -53,6 +56,18 @@ its 48 kHz float32 final deliverables, and decodes long payloads in fixed
 65,536-frame chunks to bound temporary allocation before the mono analysis buffer is
 populated.
 
+For `enhancement_candidate` jobs, the worker first validates and analyzes the exact
+uploaded source, then runs FFmpeg `arnndn` with a checksum-pinned RNNoise `bd.rnnn`
+model only when the source is noise-limited and speech-supported. The mix is bounded
+to 0.28-0.32 because corpus measurement showed the lower band reduces spread/arc
+regression risk compared with 0.36 while retaining similar expressive contrast. The
+filter graph resamples internally to 48 kHz for the recurrent model and then restores
+the original WAV sample rate and channel count before exposing the candidate. The
+worker rejects candidates whose sample rate, channel count, duration, or SHA-256 do
+not match the report, re-analyzes the candidate, and only exposes it when noise
+metrics improve without speech/overall regression. It also rechecks the source
+SHA-256 after enhancement so the uploaded source remains immutable.
+
 ## Immutable model set
 
 The first container includes only commercially permitted, advisory models:
@@ -63,12 +78,18 @@ The first container includes only commercially permitted, advisory models:
 | DNSMOS P.835 | `27691a53aa069b27be6ac957013d43b3c442da9d` | `269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd` | bundled |
 | DNSMOS P.808 | `27691a53aa069b27be6ac957013d43b3c442da9d` | `9246480c58567bc6affd4200938e77eef49468c8bc7ed3776d109c07456f6e91` | bundled |
 | SIGMOS P.804 | `33ccd4fca5b8ffe03828530753f0b35769b8e880` | `f939dcc1945055a435565b4369e27dafd0f87df3cea4e2ff6eb81225e52cc53b` | bundled |
+| RNNoise `bd.rnnn` | `3eee541a283fd3b8f81b85b1748e3b9ccbefa04d` | `ae3f7411e1e6a884f839a4a145c394408398f09854dbc1216ee02faafc98a17b` | bundled |
 | UTMOS | `ff41b8f440cb12ecda18261f9ff7326d058275ce` | `ece7ddb0999d0f12ffe8d7586b3618b8b6fa89269b5152288e4440d686409f69` | optional, not bundled |
 
 The Python package lock uses `--require-hashes`; the container also pins its base
 image by digest and verifies every remote model during the Docker build. Runtime model
 downloads are disabled with `HF_HUB_OFFLINE=1`. Checksum-pinned upstream MIT notices
-for Silero, DNSMOS, and SIGMOS are retained under `/opt/extreme/licenses`.
+for Silero, DNSMOS, and SIGMOS are retained under `/opt/extreme/licenses`. The
+RNNoise model data is included from GregorR/rnnoise-models at a pinned commit; that
+repository's README states that, aside from its README and tools, the model/data
+artifacts are not copyrightable. This is commercially usable enough for the Extreme
+experiment, but it is less clean than SPDX-licensed weights because the repository
+does not provide a formal license file for `bd.rnnn`.
 
 NISQA is excluded because its weights are noncommercial. DeepFilterNet is excluded
 from this runtime and image because repair is outside the first release and its model

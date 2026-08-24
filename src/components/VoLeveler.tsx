@@ -181,6 +181,7 @@ import { resolveAdaptiveVoicingPolicy } from "../lib/adaptiveVoicingPolicy";
 import {
   analyzeRenderedWithExtremeWorker,
   analyzeSourceWithExtremeWorker,
+  enhanceSourceWithExtremeWorker,
   type ExtremeSourceReport,
 } from "../lib/extremeMlClient";
 import {
@@ -684,6 +685,7 @@ type AdaptiveProfile = {
   earlyEchoCancelStrength: number;
   echoScore: number;
   instabilityScore: number;
+  speechSpikeTamingBoost: number;
   clickScore: number;
   clickTameStrength: number;
   lineSwingScore: number;
@@ -2133,11 +2135,17 @@ const summarizeFailureReason = (error: unknown) => {
         0,
         1,
       );
+      const mlSourceQualityPolicy = buildExtremeMlSourceQualityPolicy(
+        extremeSourceReportsByInputNameRef.current.get(inputName) ?? null,
+      );
+      const mlSpeechSpikeTamingBoost =
+        profile?.speechSpikeTamingBoost ?? mlSourceQualityPolicy.speechSpikeTamingBoost;
       const speechSpikeTaming = clamp(
         instabilityHint * 0.35 +
           (profile?.lineSwingScore ?? analysis?.lineSwingScore ?? 0) * 0.35 +
           (analysis?.onsetOvershootScore ?? 0) * 0.18 +
-          (profile?.clickScore ?? analysis?.clickScore ?? 0) * 0.12,
+          (profile?.clickScore ?? analysis?.clickScore ?? 0) * 0.12 +
+          mlSpeechSpikeTamingBoost,
         0,
         1,
       );
@@ -2153,9 +2161,6 @@ const summarizeFailureReason = (error: unknown) => {
       );
       const sparseSpeech = (analysis?.speechDutyCyclePct ?? 100) < 10 || (analysis?.speechSegmentCount ?? 999) <= 6;
       const directives = getActiveAudioReviewAdaptiveDirectives();
-      const mlSourceQualityPolicy = buildExtremeMlSourceQualityPolicy(
-        extremeSourceReportsByInputNameRef.current.get(inputName) ?? null,
-      );
       const plannerMaxGainDb = clamp(
         14 + cleanBoostHeadroom * (sparseSpeech ? 4 : 2) - mlSourceQualityPolicy.plannerMaxGainPenaltyDb,
         12,
@@ -4046,6 +4051,7 @@ const summarizeFailureReason = (error: unknown) => {
       earlyEchoCancelStrength,
       echoScore,
       instabilityScore,
+      speechSpikeTamingBoost: mlSourceQualityPolicy.speechSpikeTamingBoost,
       clickScore,
       clickTameStrength,
       lineSwingScore,
@@ -8108,11 +8114,62 @@ const summarizeFailureReason = (error: unknown) => {
     let extremeMlBatchId: string | null = null;
     try {
       let ffmpeg = await ensureFfmpeg();
-      const jobs = buildJobs(files);
+      let jobs = buildJobs(files);
+      let extremeMlEnhancedJobs: JobEntry[] | null = null;
       if (extremeMlEnabled) {
         acceptingExtremeMlEvidence = true;
         const batchId = globalThis.crypto?.randomUUID?.() ?? `batch-${Date.now().toString(36)}`;
         extremeMlBatchId = batchId;
+        const enhancementJobs = jobs.map((job, index) => ({
+          key: job.inputName,
+          job,
+          source: job.file,
+          contentType: "audio/wav",
+          idempotencyKey: `enhance:${batchId}:${index + 1}`,
+        }));
+        appendLog(
+          `[ExtremeML] RNNoise candidate enhancement started for ${enhancementJobs.length} file(s). Successful candidates feed the normal browser pipeline; unavailable candidates keep the original source.`,
+        );
+        const enhancedFilesByInputName = new Map<string, File>();
+        for (const enhancementJob of enhancementJobs) {
+          try {
+            const outcome = await enhanceSourceWithExtremeWorker({
+              source: enhancementJob.source,
+              contentType: enhancementJob.contentType,
+              idempotencyKey: enhancementJob.idempotencyKey,
+            });
+            if (outcome.status === "succeeded") {
+              const enhancedFile = new File(
+                [outcome.candidate],
+                enhancementJob.job.file.name,
+                {
+                  type: "audio/wav",
+                  lastModified: enhancementJob.job.file.lastModified,
+                },
+              );
+              enhancedFilesByInputName.set(enhancementJob.key, enhancedFile);
+              appendLog(
+                `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate accepted as source cleanup candidate (${(outcome.candidate.size / 1024 / 1024).toFixed(2)} MB). gainPlanner still owns all volume moves.`,
+              );
+            } else {
+              appendLog(
+                `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate unavailable (${outcome.reason}); original source stays active.`,
+              );
+            }
+          } catch {
+            appendLog(
+              `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate unavailable; original source stays active.`,
+            );
+          }
+        }
+        if (enhancedFilesByInputName.size > 0) {
+          extremeMlEnhancedJobs = jobs.map((job) => {
+            const enhancedFile = enhancedFilesByInputName.get(job.inputName);
+            return enhancedFile ? { ...job, file: enhancedFile } : job;
+          });
+        }
+        const renderJobs = extremeMlEnhancedJobs ?? jobs;
+        jobs = renderJobs;
         appendLog(
           `[ExtremeML] Opt-in source analysis started for ${jobs.length} file(s), with at most two direct uploads at once. Evidence is advisory and cannot block delivery.`,
         );
@@ -10605,12 +10662,13 @@ const summarizeFailureReason = (error: unknown) => {
           </label>
           <label className={styles.toggleRow}>
             <div>
-              <strong>Extreme ML speech protection (optional)</strong>
+              <strong>Extreme ML cleanup and speech protection (optional)</strong>
               <div className={styles.label}>
-                Source and one final clean rendered WAV are uploaded directly to the isolated Extreme worker
-                for advisory speech-tail evidence and source-relative quality measurement. It can only protect
-                short, source-attached weak speech; energy detection and gainPlanner still make every leveling
-                decision. If the worker is unavailable or late, the browser pipeline runs unchanged.
+                Source, RNNoise candidate, and one final clean rendered WAV are uploaded directly to the isolated
+                Extreme worker for optional source cleanup, advisory speech-tail evidence, and source-relative
+                quality measurement. It can only clean the source or protect short, source-attached weak speech;
+                energy detection and gainPlanner still make every leveling decision. If the worker is unavailable
+                or late, the browser pipeline runs unchanged.
               </div>
             </div>
             <input

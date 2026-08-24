@@ -85,6 +85,19 @@ def validate_source_report(payload: object, *, expected_source_sha256: str | Non
     if not isinstance(source.get("channels"), int) or isinstance(source.get("channels"), bool) or source["channels"] <= 0:
         raise ReportValidationError("invalid source channels")
 
+    candidate = payload.get("candidate")
+    if candidate is not None:
+        if not isinstance(candidate, dict):
+            raise ReportValidationError("invalid candidate")
+        if candidate.get("role") != "enhancement_candidate":
+            raise ReportValidationError("invalid candidate role")
+        if not isinstance(candidate.get("sha256"), str) or not HEX_64.fullmatch(candidate["sha256"]):
+            raise ReportValidationError("invalid candidate identity")
+        if not _finite_number(candidate.get("durationMs")) or float(candidate["durationMs"]) < 0:
+            raise ReportValidationError("invalid candidate duration")
+        if candidate.get("sampleRate") != source["sampleRate"] or candidate.get("channels") != source["channels"]:
+            raise ReportValidationError("candidate facts disagree with source contract")
+
     vad = payload.get("vad")
     if not isinstance(vad, dict) or not _finite_number(vad.get("frameMs")) or float(vad["frameMs"]) <= 0:
         raise ReportValidationError("invalid VAD frame duration")
@@ -133,6 +146,11 @@ def validate_source_report(payload: object, *, expected_source_sha256: str | Non
             raise ReportValidationError("invalid model revision")
         if not isinstance(model.get("sha256"), str) or not HEX_64.fullmatch(model["sha256"]):
             raise ReportValidationError("invalid model checksum")
+    telemetry = payload.get("telemetry")
+    if not isinstance(telemetry, dict):
+        raise ReportValidationError("invalid telemetry")
+    if telemetry.get("candidateSelected") is True and candidate is None:
+        raise ReportValidationError("selected candidate requires candidate identity")
     _assert_no_gain_authority(payload)
     return json.loads(encoded.decode("utf-8"))
 

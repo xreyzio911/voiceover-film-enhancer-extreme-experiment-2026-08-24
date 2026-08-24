@@ -17,7 +17,14 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type TicketErrorCode = "auth" | "bad_request" | "config" | "rate_limit" | "worker";
-type AnalysisScope = "source_analysis" | "render_analysis";
+type AnalysisScope = "source_analysis" | "render_analysis" | "enhancement_candidate";
+type TicketRequest = Readonly<{
+  sizeBytes: number;
+  contentType: "audio/wav" | "audio/x-wav";
+  idempotencyKey: string;
+  scope: AnalysisScope;
+  sha256: string;
+}>;
 
 const MAX_METADATA_BYTES = 8 * 1024;
 const DEFAULT_MAX_AUDIO_BYTES = 1024 * 1024 * 1024;
@@ -43,7 +50,10 @@ const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const isAnalysisScope = (value: unknown): value is AnalysisScope =>
-  value === "source_analysis" || value === "render_analysis";
+  value === "source_analysis" || value === "render_analysis" || value === "enhancement_candidate";
+
+const isSha256Hex = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 
 const readIdentity = async (request: NextRequest) => {
   if (isLocalHost(request.nextUrl.hostname)) return "local-development";
@@ -65,9 +75,9 @@ const consumeRateLimit = (identity: string) => {
   return result.allowed;
 };
 
-const normalizeTicketRequest = (value: unknown) => {
+const normalizeTicketRequest = (value: unknown): TicketRequest | null => {
   if (!isPlainRecord(value)) return null;
-  const { sizeBytes, contentType, idempotencyKey, scope } = value;
+  const { sizeBytes, contentType, idempotencyKey, scope, sha256 } = value;
   const maxBytes = parsePositiveInteger(process.env.EXTREME_ML_MAX_AUDIO_BYTES, DEFAULT_MAX_AUDIO_BYTES);
   if (
     !Number.isSafeInteger(sizeBytes)
@@ -79,12 +89,14 @@ const normalizeTicketRequest = (value: unknown) => {
     || idempotencyKey.length > 128
     || !/^[A-Za-z0-9._:@+-]+$/.test(idempotencyKey)
     || !isAnalysisScope(scope)
+    || !isSha256Hex(sha256)
   ) return null;
   return Object.freeze({
     sizeBytes: sizeBytes as number,
     contentType,
     idempotencyKey,
     scope,
+    sha256,
   });
 };
 

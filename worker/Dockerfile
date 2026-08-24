@@ -18,6 +18,10 @@ RUN groupadd --gid 10001 extreme \
     && mkdir -p /app /opt/extreme/models /opt/extreme/licenses /var/data/cache /var/data/home \
     && chown -R extreme:extreme /var/data
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg=7:5.1.9-0+deb12u1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements-production.txt /app/requirements-production.txt
@@ -35,6 +39,9 @@ ADD --checksum=sha256:9246480c58567bc6affd4200938e77eef49468c8bc7ed3776d109c0745
 ADD --checksum=sha256:f939dcc1945055a435565b4369e27dafd0f87df3cea4e2ff6eb81225e52cc53b \
     https://huggingface.co/TigreGotico/sigmos-onnx/resolve/33ccd4fca5b8ffe03828530753f0b35769b8e880/model-sigmos_1697718653_41d092e8-epo-200.onnx \
     /opt/extreme/models/sigmos_p804.onnx
+ADD --checksum=sha256:ae3f7411e1e6a884f839a4a145c394408398f09854dbc1216ee02faafc98a17b \
+    https://raw.githubusercontent.com/GregorR/rnnoise-models/3eee541a283fd3b8f81b85b1748e3b9ccbefa04d/beguiling-drafter-2018-08-30/bd.rnnn \
+    /opt/extreme/models/bd.rnnn
 ADD --checksum=sha256:2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b \
     https://raw.githubusercontent.com/snakers4/silero-vad/7e30209a3e901f9842f81b225f3e93d8199902b1/LICENSE \
     /opt/extreme/licenses/silero-vad-LICENSE
@@ -47,7 +54,7 @@ ADD --checksum=sha256:c075a7fdbcff0157cf50a2c2b54c7190e36e0215ec5b9145988fdd1f9e
 
 COPY extreme_worker /app/extreme_worker
 
-RUN chmod 0444 /opt/extreme/models/*.onnx /opt/extreme/licenses/* \
+RUN chmod 0444 /opt/extreme/models/*.onnx /opt/extreme/models/*.rnnn /opt/extreme/licenses/* \
     && chmod -R a-w /app /opt/extreme
 
 USER extreme

@@ -605,6 +605,20 @@ test("speech-only spectrum and continuous event evidence drive de-essing without
   assert.match(adaptiveProfileBlock, /bandSpectrumDb: deEsserSpectrumDb/);
 });
 
+test("learned discontinuity evidence reaches gainPlanner-owned spike taming", () => {
+  const plannerBlock = sourceBetween(
+    "const planGainForInput = async",
+    "const applyPlannerToFullInput = async",
+  );
+
+  assert.match(
+    plannerBlock,
+    /const mlSpeechSpikeTamingBoost =[\s\S]*?mlSourceQualityPolicy\.speechSpikeTamingBoost/,
+  );
+  assert.match(plannerBlock, /const speechSpikeTaming = clamp\([\s\S]*?mlSpeechSpikeTamingBoost/);
+  assert.match(plannerBlock, /speechSpikeTaming,/);
+});
+
 test("distributed speech spectra retain recurring event authority without a binary engagement gate", () => {
   const aggregationBlock = sourceBetween(
     "const aggregateWindowAnalyses = (",

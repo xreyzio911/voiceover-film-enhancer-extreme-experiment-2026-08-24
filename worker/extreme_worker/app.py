@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.requests import ClientDisconnect
 
 from .api_support import LazyRuntimeAnalyzer, LocalFallbackAnalyzer, RateLimiter
 from .capabilities import build_capabilities
+from .enhancement import ArnndnEnhancer, LocalPassthroughEnhancer
 from .model_runtime import sha256_file
 from .job_store import (
     ActiveJobLimitExceeded,
@@ -56,7 +57,7 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
 _AUDIO_TYPES = frozenset({"audio/wav", "audio/x-wav"})
 _UPLOAD_TYPES = frozenset({"audio/wav", "audio/x-wav", "application/offset+octet-stream"})
-_ANALYSIS_SCOPES = frozenset({"source_analysis", "render_analysis"})
+_ANALYSIS_SCOPES = frozenset({"source_analysis", "render_analysis", "enhancement_candidate"})
 _LOGGER = logging.getLogger("extreme_worker")
 _TICKET_MAX_TTL_SECONDS = 300
 _TICKET_REPLAY_RETENTION_SAFETY_SECONDS = 60.0
@@ -532,6 +533,42 @@ def _run_analysis(app: FastAPI, job_id: str) -> None:
             or abs(float(source["durationMs"]) - info.duration_seconds * 1000.0) > 1.0
         ):
             raise ReportValidationError("report source facts disagree with the WAV header")
+        current_scope = store.get_job(job_id).scope
+        if current_scope == "enhancement_candidate":
+            enhancement = app.state.enhancer.enhance(
+                paths.source_wav,
+                paths.candidate_wav,
+                limits=_wav_limits(app),
+                source_report=clean_report,
+                job_id=job_id,
+            )
+            if sha256_file(paths.source_wav) != source_sha256:
+                raise RuntimeError("enhancement mutated the immutable source")
+            clean_report = {
+                **clean_report,
+                "telemetry": {
+                    **clean_report["telemetry"],
+                    **enhancement.telemetry,
+                },
+            }
+            if enhancement.model is not None:
+                existing_models = [
+                    model for model in clean_report["models"]
+                    if model.get("id") != enhancement.model["id"]
+                ]
+                clean_report["models"] = [*existing_models, enhancement.model]
+            if enhancement.candidate_path is not None:
+                candidate_info = inspect_wav_file(enhancement.candidate_path, _wav_limits(app))
+                clean_report["candidate"] = {
+                    "role": "enhancement_candidate",
+                    "sha256": sha256_file(enhancement.candidate_path),
+                    "durationMs": round(candidate_info.duration_seconds * 1000.0, 3),
+                    "sampleRate": candidate_info.sample_rate,
+                    "channels": candidate_info.channels,
+                }
+            if sha256_file(paths.source_wav) != source_sha256:
+                raise ReportValidationError("source changed during enhancement")
+            clean_report = validate_source_report(clean_report, expected_source_sha256=source_sha256)
         _atomic_json(paths.report_json, clean_report)
         _transition_if_current(store, job_id, JobState.RUNNING, JobState.SUCCEEDED)
         if _acknowledge_cancel(app, job_id):
@@ -757,6 +794,16 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     )
     if not callable(getattr(app.state.analyzer, "analyze_wav", None)):
         raise ValueError("analyzer must provide analyze_wav")
+    app.state.enhancer = settings.get("enhancer") or (
+        LocalPassthroughEnhancer()
+        if explicit_config
+        else ArnndnEnhancer(
+            model_dir=os.environ.get("EXTREME_ML_MODEL_DIR", "/opt/extreme/models"),
+            analyzer=app.state.analyzer,
+        )
+    )
+    if not callable(getattr(app.state.enhancer, "enhance", None)):
+        raise ValueError("enhancer must provide enhance")
     app.state.admission_authority = None
     app.state.admission_lock = threading.Lock()
     app.state.ticket_replay_maintenance_lock = threading.Lock()
@@ -909,6 +956,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 access_token_hash=app.state.token_hasher.hash(access_token),
                 idempotency_key=payload["idempotencyKey"],
                 request_fingerprint=request_fingerprint,
+                scope=payload["scope"],
                 max_active_jobs_per_owner=max_active_jobs_per_owner,
             )
             if not created and job.state == JobState.SUCCEEDED:
@@ -1085,6 +1133,39 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         except (OSError, json.JSONDecodeError, JobNotFound, ReportValidationError):
             return _json(500, {"error": "stored report failed integrity validation"}, request)
         return _json(200, report, request)
+
+    @app.get("/v1/jobs/{job_id}/candidate")
+    async def get_candidate(request: Request, job_id: str):
+        try:
+            job = _job_for_token(request, job_id)
+        except JobNotFound:
+            return _json(404, {"error": "not found"}, request)
+        if job.state != JobState.SUCCEEDED or job.scope != "enhancement_candidate":
+            return _json(409, {"error": "candidate unavailable"}, request)
+        paths = JobPaths(app.state.upload_root).for_job(job_id)
+        try:
+            upload = app.state.job_store.get_upload(job_id)
+            if paths.report_json.stat().st_size > 16 * 1024 * 1024:
+                raise ReportValidationError("report exceeds size limit")
+            report = validate_source_report(
+                json.loads(paths.report_json.read_text(encoding="utf-8")),
+                expected_source_sha256=upload.actual_sha256,
+            )
+            candidate = report.get("candidate")
+            if not isinstance(candidate, dict) or candidate.get("sha256") != sha256_file(paths.candidate_wav):
+                raise ReportValidationError("candidate identity mismatch")
+            inspect_wav_file(paths.candidate_wav, _wav_limits(app))
+        except (OSError, json.JSONDecodeError, JobNotFound, ReportValidationError, WavValidationError):
+            return _json(500, {"error": "stored candidate failed integrity validation"}, request)
+        return FileResponse(
+            paths.candidate_wav,
+            media_type="audio/wav",
+            filename="candidate.wav",
+            headers={
+                "Cache-Control": "no-store",
+                **build_cors_headers(request.headers.get("origin"), request.app.state.allowed_origins),
+            },
+        )
 
     return app
 

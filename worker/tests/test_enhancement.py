@@ -118,6 +118,17 @@ class EnhancementCandidateTests(unittest.TestCase):
                 speech_fraction=0.02,
             )
         )
+        silence_heavy_noisy = resolve_policy(
+            self._report(
+                {
+                    "dnsmos.bak": 2.4,
+                    "dnsmos.sig": 3.45,
+                    "sigmos.noise": 2.5,
+                    "sigmos.sig": 3.55,
+                },
+                speech_fraction=0.09,
+            )
+        )
 
         self.assertFalse(clean_but_quiet.eligible)
         self.assertEqual(clean_but_quiet.reason, "source-not-noise-limited")
@@ -128,6 +139,8 @@ class EnhancementCandidateTests(unittest.TestCase):
         self.assertLessEqual(noisy.mix, 0.42)
         self.assertFalse(sparse_noisy.eligible)
         self.assertEqual(sparse_noisy.reason, "insufficient-speech-support")
+        self.assertFalse(silence_heavy_noisy.eligible)
+        self.assertEqual(silence_heavy_noisy.reason, "insufficient-speech-support")
 
     def test_candidate_quality_gate_requires_noise_gain_without_speech_or_overall_regression(self) -> None:
         assess_candidate, = require_symbols(

@@ -4,6 +4,7 @@ import test from "node:test";
 
 import type {
   ExtremeAnalysisOutcome,
+  ExtremeEnhancementOutcome,
   ExtremeRenderedAnalysisOutcome,
   ExtremeRenderedReport,
   ExtremeSourceReport,
@@ -14,6 +15,7 @@ import {
   EXTREME_ML_MAX_CONCURRENT_ANALYSES,
   analyzeExtremeRenderedOutputsBounded,
   analyzeExtremeSourcesBounded,
+  enhanceExtremeSourcesBounded,
   buildPlannerMlProtection,
   compareExtremeQualityMetrics,
   getExtremeMlSnapshotGraceMs,
@@ -224,6 +226,41 @@ test("rendered-deliverable analysis has its own bounded fail-open lane", async (
   assert.equal(JSON.stringify(outcomes).includes("private-worker-detail"), false);
 });
 
+test("source enhancement uses the same bounded fail-open lane instead of serial pre-render gating", async () => {
+  const jobs = Array.from({ length: 5 }, (_, index) => ({
+    key: `enhance-${index}`,
+    source: new Blob([String(index)], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: `enhance:batch:${index}`,
+  }));
+  let active = 0;
+  let maximumActive = 0;
+  const outcomes: ExtremeEnhancementOutcome[] = [];
+
+  await enhanceExtremeSourcesBounded({
+    jobs,
+    enhance: async ({ idempotencyKey }): Promise<ExtremeEnhancementOutcome> => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      if (idempotencyKey.endsWith(":0")) throw new Error("private-enhancer-detail");
+      return { status: "unavailable", reason: "poll-timeout" };
+    },
+    onOutcome: ({ outcome }) => outcomes.push(outcome),
+  });
+
+  assert.equal(outcomes.length, jobs.length);
+  assert.ok(maximumActive <= EXTREME_ML_MAX_CONCURRENT_ANALYSES);
+  assert.equal(
+    outcomes.some(
+      (outcome) => outcome.status === "unavailable" && outcome.reason === "worker-unavailable",
+    ),
+    true,
+  );
+  assert.equal(JSON.stringify(outcomes).includes("private-enhancer-detail"), false);
+});
+
 test("ML snapshot grace scales for real WAV uploads but remains a bounded fail-open wait", () => {
   assert.equal(getExtremeMlSnapshotGraceMs([]), EXTREME_ML_MIN_SNAPSHOT_GRACE_MS);
   assert.equal(getExtremeMlSnapshotGraceMs([384_044]), 12_046);
@@ -287,14 +324,28 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
     source,
     /const \[extremeMlEnabled, setExtremeMlEnabled\] = useState\(false\)/,
   );
-  assert.match(source, /<strong>Extreme ML speech protection \(optional\)<\/strong>/);
-  assert.match(source, /source and rendered WAVs? (?:are |will be )?uploaded directly to (?:the )?isolated Extreme worker/i);
+  assert.match(source, /<strong>Extreme ML cleanup and speech protection \(optional\)<\/strong>/);
+  assert.match(
+    source,
+    /Source, RNNoise candidate, and one final clean rendered WAV are uploaded directly to the isolated\s+Extreme worker/i,
+  );
+  assert.match(source, /enhanceSourceWithExtremeWorker/);
+  assert.match(source, /enhanceExtremeSourcesBounded/);
+  assert.match(source, /const enhancementJobs = jobs\.map/);
+  assert.match(source, /const renderJobs = extremeMlEnhancedJobs \?\? jobs/);
+  assert.doesNotMatch(source, /for\s*\(\s*const enhancementJob of enhancementJobs\s*\)[\s\S]{0,400}await enhanceSourceWithExtremeWorker/);
+  assert.match(source, /Promise\.race\(\[[\s\S]{0,600}extremeMlEnhancementPromise/);
+  assert.match(source, /RNNoise candidate/i);
   assert.match(source, /analyzeRenderedWithExtremeWorker/);
-  assert.match(source, /If (?:the )?worker (?:is )?unavailable or late[\s\S]{0,120}browser pipeline/i);
+  assert.match(source, /If the worker is unavailable\s+or late, the browser pipeline runs unchanged/i);
   assert.match(source, /const mask = buildSpeechMask\(/);
   assert.match(source, /speechRunsFromMask\(mask\)/);
   assert.match(source, /buildPlannerMlProtection\(/);
   assert.match(source, /protectedSpeechFrameMask:\s*mlProtection\.protectedSpeechFrameMask \?\? undefined/);
+  assert.match(source, /speechSpikeTamingBoost: mlSourceQualityPolicy\.speechSpikeTamingBoost/);
+  assert.match(source, /const mlSpeechSpikeTamingBoost =\s+profile\?\.speechSpikeTamingBoost \?\? mlSourceQualityPolicy\.speechSpikeTamingBoost/);
+  assert.match(source, /\+\s+mlSpeechSpikeTamingBoost/);
+  assert.doesNotMatch(source, /profile\?\.speechSpikeTamingBoost[\s\S]{0,160}\+\s+mlSourceQualityPolicy\.speechSpikeTamingBoost/);
   assert.match(
     source,
     /acceptingExtremeMlEvidence = false;[\s\S]{0,500}let hadErrors = false/,
@@ -312,4 +363,5 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
     /await\s+analyzeExtremeRenderedOutputsBounded/,
   );
   assert.doesNotMatch(source, /mlProtection\.(?:gainDb|eq|compressor|limiter|selectedCandidate)/i);
+  assert.doesNotMatch(source, /enhanceSourceWithExtremeWorker[\s\S]{0,1200}(?:gainDb|targetLufs|loudnorm|dynaudnorm)/i);
 });

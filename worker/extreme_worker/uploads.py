@@ -142,7 +142,7 @@ class UploadManager:
             paths = self.paths.for_job(job_id)
             targets = [paths.upload_part, paths.source_wav]
             if not keep_report:
-                targets.append(paths.report_json)
+                targets.extend((paths.report_json, paths.candidate_wav))
             for target in targets:
                 try:
                     target.unlink(missing_ok=True)

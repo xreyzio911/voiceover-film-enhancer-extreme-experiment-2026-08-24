@@ -56,6 +56,7 @@ class JobArtifactPaths:
     upload_part: Path
     source_wav: Path
     report_json: Path
+    candidate_wav: Path
 
 
 class JobPaths:
@@ -70,6 +71,7 @@ class JobPaths:
             upload_part=resolve_under(self.root, safe_job_id, "source.upload.part"),
             source_wav=resolve_under(self.root, safe_job_id, "source.wav"),
             report_json=resolve_under(self.root, safe_job_id, "report.json"),
+            candidate_wav=resolve_under(self.root, safe_job_id, "candidate.wav"),
         )
 
 

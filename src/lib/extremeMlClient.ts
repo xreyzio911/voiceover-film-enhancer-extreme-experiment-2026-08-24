@@ -1,3 +1,5 @@
+import { sha256Blob } from "./sha256Blob.ts";
+
 export type ExtremeSourceReport = Readonly<{
   schemaVersion: 1;
   advisoryOnly: true;
@@ -6,6 +8,13 @@ export type ExtremeSourceReport = Readonly<{
   levelAuthority: "gainPlanner";
   modelSetId: string;
   source: Readonly<{
+    sha256: string;
+    durationMs: number;
+    sampleRate: number;
+    channels: number;
+  }>;
+  candidate?: Readonly<{
+    role: "enhancement_candidate";
     sha256: string;
     durationMs: number;
     sampleRate: number;
@@ -34,7 +43,7 @@ export type ExtremeSourceReport = Readonly<{
     runtimeStatus: "ready" | "degraded";
     reason: string;
     audioMutation: false;
-    candidateSelected: false;
+    candidateSelected: boolean;
     gainDbChanged: false;
   }>;
 }>;
@@ -50,6 +59,10 @@ export type ExtremeRenderedReport = Readonly<{
 
 export type ExtremeRenderedAnalysisOutcome =
   | Readonly<{ status: "succeeded"; renderedReport: ExtremeRenderedReport }>
+  | Readonly<{ status: "unavailable"; reason: string }>;
+
+export type ExtremeEnhancementOutcome =
+  | Readonly<{ status: "succeeded"; report: ExtremeSourceReport; candidate: Blob }>
   | Readonly<{ status: "unavailable"; reason: string }>;
 
 type AnalyzeAudioInput = Readonly<{
@@ -164,6 +177,7 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
     levelAuthority?: unknown;
     modelSetId?: unknown;
     source?: { sha256?: unknown; durationMs?: unknown; sampleRate?: unknown; channels?: unknown };
+    candidate?: { role?: unknown; sha256?: unknown; durationMs?: unknown; sampleRate?: unknown; channels?: unknown };
     vad?: { frameMs?: unknown; frames?: unknown };
     metrics?: unknown;
     models?: unknown;
@@ -202,6 +216,34 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
     sampleRate <= 0 ||
     channels <= 0
   ) return null;
+  let normalizedCandidate: ExtremeSourceReport["candidate"] | undefined;
+  if (report.candidate !== undefined) {
+    const candidate = report.candidate;
+    if (
+      !candidate ||
+      typeof candidate !== "object" ||
+      candidate.role !== "enhancement_candidate" ||
+      typeof candidate.sha256 !== "string" ||
+      !isHex(candidate.sha256, 64) ||
+      !isFiniteNumber(candidate.durationMs) ||
+      !isFiniteNumber(candidate.sampleRate) ||
+      !isFiniteNumber(candidate.channels) ||
+      !Number.isInteger(candidate.sampleRate) ||
+      !Number.isInteger(candidate.channels) ||
+      candidate.durationMs < 0 ||
+      candidate.sampleRate !== sampleRate ||
+      candidate.channels !== channels
+    ) {
+      return null;
+    }
+    normalizedCandidate = Object.freeze({
+      role: "enhancement_candidate",
+      sha256: candidate.sha256,
+      durationMs: candidate.durationMs,
+      sampleRate: candidate.sampleRate,
+      channels: candidate.channels,
+    });
+  }
   const vad = report.vad;
   if (
     !vad ||
@@ -281,11 +323,12 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
     typeof telemetry.reason !== "string" ||
     !/^[A-Za-z0-9._-]{1,80}$/.test(telemetry.reason) ||
     telemetry.audioMutation !== false ||
-    telemetry.candidateSelected !== false ||
+    typeof telemetry.candidateSelected !== "boolean" ||
     telemetry.gainDbChanged !== false
   ) {
     return null;
   }
+  if (telemetry.candidateSelected && !normalizedCandidate) return null;
   return Object.freeze({
     schemaVersion: 1,
     advisoryOnly: true,
@@ -299,6 +342,7 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
       sampleRate,
       channels,
     }),
+    ...(normalizedCandidate ? { candidate: normalizedCandidate } : {}),
     vad: Object.freeze({ frameMs: vad.frameMs, frames: Object.freeze(frames) }),
     metrics: Object.freeze(metrics as Record<string, NonNullable<ReturnType<typeof freezeMetric>>>),
     models: Object.freeze(models),
@@ -306,7 +350,7 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
       runtimeStatus: telemetry.runtimeStatus,
       reason: telemetry.reason,
       audioMutation: false,
-      candidateSelected: false,
+      candidateSelected: telemetry.candidateSelected,
       gainDbChanged: false,
     }),
   });
@@ -320,7 +364,23 @@ const postJson = async (fetchImpl: typeof fetch, url: string, body: unknown, hea
     body: JSON.stringify(body),
   });
 
-const unavailable = (reason: string): ExtremeAnalysisOutcome => Object.freeze({ status: "unavailable", reason });
+const unavailable = (reason: string): Readonly<{ status: "unavailable"; reason: string }> =>
+  Object.freeze({ status: "unavailable", reason });
+
+const unavailableEnhancement = (reason: string): ExtremeEnhancementOutcome =>
+  Object.freeze({ status: "unavailable", reason });
+
+type ExtremeWorkerJobSuccess = Readonly<{
+  status: "succeeded";
+  report: ExtremeSourceReport;
+  workerBaseUrl: string;
+  jobId: string;
+  accessToken: string;
+}>;
+
+type ExtremeWorkerJobOutcome =
+  | ExtremeWorkerJobSuccess
+  | Readonly<{ status: "unavailable"; reason: string }>;
 
 const analyzeAudioWithExtremeWorker = async ({
   source,
@@ -331,14 +391,17 @@ const analyzeAudioWithExtremeWorker = async ({
   sleep = (milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
   chunkBytes = DEFAULT_CHUNK_BYTES,
   maxPolls = DEFAULT_MAX_POLLS,
-}: AnalyzeAudioInput, scope: "source_analysis" | "render_analysis"): Promise<ExtremeAnalysisOutcome> => {
+}: AnalyzeAudioInput, scope: "source_analysis" | "render_analysis" | "enhancement_candidate"): Promise<ExtremeWorkerJobOutcome> => {
   let cancelWorkerJob: (() => Promise<void>) | null = null;
   try {
+    const sourceSha256 = await sha256Blob(source);
+    if (!sourceSha256) return unavailable("source-hash-unavailable");
     const ticketResponse = await postJson(fetchImpl, "/api/extreme-ml/ticket", {
       sizeBytes: source.size,
       contentType,
       idempotencyKey,
       scope,
+      sha256: sourceSha256,
     });
     if (!ticketResponse.ok) return unavailable("ticket-unavailable");
     const ticket = (await ticketResponse.json()) as {
@@ -357,7 +420,7 @@ const analyzeAudioWithExtremeWorker = async ({
     const jobResponse = await postJson(
       fetchImpl,
       `${workerBaseUrl}/v1/jobs`,
-      { idempotencyKey, sizeBytes: source.size, contentType, scope },
+      { idempotencyKey, sizeBytes: source.size, contentType, scope, sha256: sourceSha256 },
       { Authorization: `Bearer ${ticket.ticket}` },
     );
     if (!jobResponse.ok) return unavailable("worker-job-unavailable");
@@ -435,7 +498,18 @@ const analyzeAudioWithExtremeWorker = async ({
         });
         if (!reportResponse.ok) return unavailableAfterCleanup("report-unavailable");
         const report = normalizeExtremeSourceReport(await reportResponse.json());
-        return report ? Object.freeze({ status: "succeeded", report }) : unavailable("report-invalid");
+        if (report?.source.sha256 !== sourceSha256) {
+          return unavailableAfterCleanup("report-invalid");
+        }
+        return report
+          ? Object.freeze({
+              status: "succeeded",
+              report,
+              workerBaseUrl,
+              jobId: job.jobId,
+              accessToken: job.accessToken,
+            })
+          : unavailable("report-invalid");
       }
       await sleep(POLL_INTERVAL_MS);
     }
@@ -449,7 +523,11 @@ const analyzeAudioWithExtremeWorker = async ({
 export const analyzeSourceWithExtremeWorker = (
   input: AnalyzeAudioInput,
 ): Promise<ExtremeAnalysisOutcome> =>
-  analyzeAudioWithExtremeWorker(input, "source_analysis");
+  analyzeAudioWithExtremeWorker(input, "source_analysis").then((outcome) => (
+    outcome.status === "unavailable"
+      ? outcome
+      : Object.freeze({ status: "succeeded", report: outcome.report })
+  ));
 
 export const analyzeRenderedWithExtremeWorker = async (
   input: AnalyzeAudioInput,
@@ -463,4 +541,50 @@ export const analyzeRenderedWithExtremeWorker = async (
       report: outcome.report,
     }),
   });
+};
+
+export const enhanceSourceWithExtremeWorker = async (
+  input: AnalyzeAudioInput,
+): Promise<ExtremeEnhancementOutcome> => {
+  const outcome = await analyzeAudioWithExtremeWorker(input, "enhancement_candidate");
+  if (outcome.status === "unavailable") return outcome;
+  if (
+    outcome.report.canChangeGainDb ||
+    outcome.report.levelAuthority !== "gainPlanner" ||
+    !outcome.report.candidate ||
+    outcome.report.telemetry.candidateSelected !== true
+  ) {
+    return unavailableEnhancement(
+      outcome.report.telemetry.candidateSelected === false
+        ? outcome.report.telemetry.reason
+        : "report-invalid",
+    );
+  }
+  try {
+    const candidateResponse = await (input.fetchImpl ?? fetch)(
+      `${outcome.workerBaseUrl}/v1/jobs/${encodeURIComponent(outcome.jobId)}/candidate`,
+      {
+        redirect: "error",
+        headers: { Authorization: `Bearer ${outcome.accessToken}` },
+      },
+    );
+    if (!candidateResponse.ok) return unavailableEnhancement("candidate-unavailable");
+    const responseType = candidateResponse.headers
+      .get("Content-Type")
+      ?.split(";", 1)[0]
+      ?.trim()
+      .toLowerCase();
+    if (responseType !== "audio/wav" && responseType !== "audio/x-wav") {
+      return unavailableEnhancement("candidate-unavailable");
+    }
+    const candidate = await candidateResponse.blob();
+    if (candidate.size <= 0) return unavailableEnhancement("candidate-unavailable");
+    const candidateSha256 = await sha256Blob(candidate);
+    if (!candidateSha256 || candidateSha256 !== outcome.report.candidate.sha256) {
+      return unavailableEnhancement("candidate-unavailable");
+    }
+    return Object.freeze({ status: "succeeded", report: outcome.report, candidate });
+  } catch {
+    return unavailableEnhancement("candidate-unavailable");
+  }
 };
