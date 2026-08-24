@@ -56,6 +56,7 @@ type AnalyzeAudioInput = Readonly<{
   source: Blob;
   contentType: string;
   idempotencyKey: string;
+  allowedWorkerOrigins?: readonly string[];
   fetchImpl?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
   chunkBytes?: number;
@@ -76,7 +77,10 @@ const isHex = (value: string, length: number) =>
 const isPinnedRevision = (value: string) =>
   /^pypi:[0-9]+(?:\.[0-9A-Za-z]+){1,3}$/.test(value) || isHex(value, 40);
 
-export const normalizeExtremeWorkerBaseUrl = (value: string | null | undefined) => {
+const normalizeExtremeWorkerOriginSyntax = (
+  value: string | null | undefined,
+  allowLocalDevelopment: boolean,
+) => {
   if (!value) return null;
   try {
     const url = new URL(value);
@@ -85,11 +89,49 @@ export const normalizeExtremeWorkerBaseUrl = (value: string | null | undefined) 
     const hostname = url.hostname.toLowerCase();
     const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
     if (url.protocol === "https:") return url.origin;
-    if (url.protocol === "http:" && local) return url.origin;
+    if (url.protocol === "http:" && local && allowLocalDevelopment) return url.origin;
     return null;
   } catch {
     return null;
   }
+};
+
+export const normalizeExtremeWorkerAllowedOrigins = (
+  value: string | null | undefined,
+  allowLocalDevelopment = false,
+): readonly string[] | null => {
+  if (!value?.trim()) return Object.freeze([]);
+  if (value.length > 2_048) return null;
+  const entries = value.split(",").map((entry) => entry.trim());
+  if (entries.length > 16 || entries.some((entry) => !entry)) return null;
+  const origins = new Set<string>();
+  for (const entry of entries) {
+    const origin = normalizeExtremeWorkerOriginSyntax(entry, allowLocalDevelopment);
+    if (!origin) return null;
+    origins.add(origin);
+  }
+  return Object.freeze([...origins]);
+};
+
+export const normalizeExtremeWorkerBaseUrl = (
+  value: string | null | undefined,
+  allowedOrigins: readonly string[] = [],
+  allowLocalDevelopment = false,
+) => {
+  const origin = normalizeExtremeWorkerOriginSyntax(value, allowLocalDevelopment);
+  if (!origin) return null;
+  const hostname = new URL(origin).hostname.toLowerCase();
+  const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  if (local && allowLocalDevelopment) return origin;
+  return allowedOrigins.includes(origin) ? origin : null;
+};
+
+const getBrowserAllowedWorkerOrigins = () => {
+  const allowLocalDevelopment = process.env.NODE_ENV !== "production";
+  return normalizeExtremeWorkerAllowedOrigins(
+    process.env.NEXT_PUBLIC_EXTREME_ML_ALLOWED_WORKER_ORIGINS,
+    allowLocalDevelopment,
+  ) ?? Object.freeze([]);
 };
 
 const freezeMetric = (value: unknown) => {
@@ -264,6 +306,7 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
 const postJson = async (fetchImpl: typeof fetch, url: string, body: unknown, headers: HeadersInit = {}) =>
   fetchImpl(url, {
     method: "POST",
+    redirect: "error",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
@@ -274,6 +317,7 @@ const analyzeAudioWithExtremeWorker = async ({
   source,
   contentType,
   idempotencyKey,
+  allowedWorkerOrigins = getBrowserAllowedWorkerOrigins(),
   fetchImpl = fetch,
   sleep = (milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
   chunkBytes = DEFAULT_CHUNK_BYTES,
@@ -294,6 +338,8 @@ const analyzeAudioWithExtremeWorker = async ({
     };
     const workerBaseUrl = normalizeExtremeWorkerBaseUrl(
       typeof ticket.workerBaseUrl === "string" ? ticket.workerBaseUrl : "",
+      allowedWorkerOrigins,
+      process.env.NODE_ENV !== "production",
     );
     if (!workerBaseUrl || typeof ticket.ticket !== "string" || !ticket.ticket) {
       return unavailable("ticket-unavailable");
@@ -319,6 +365,7 @@ const analyzeAudioWithExtremeWorker = async ({
       try {
         await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId as string)}`, {
           method: "DELETE",
+          redirect: "error",
           headers: { Authorization: `Bearer ${job.accessToken as string}` },
         });
       } catch {
@@ -341,6 +388,7 @@ const analyzeAudioWithExtremeWorker = async ({
       const chunk = source.slice(offset, Math.min(source.size, offset + effectiveChunkBytes), contentType);
       const uploadResponse = await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId)}/input`, {
         method: "PATCH",
+        redirect: "error",
         headers: {
           Authorization: `Bearer ${job.accessToken}`,
           "Content-Type": contentType,
@@ -365,6 +413,7 @@ const analyzeAudioWithExtremeWorker = async ({
 
     for (let poll = 0; poll < maxPolls; poll += 1) {
       const statusResponse = await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId)}`, {
+        redirect: "error",
         headers: { Authorization: `Bearer ${job.accessToken}` },
       });
       if (!statusResponse.ok) return unavailableAfterCleanup("status-unavailable");
@@ -372,6 +421,7 @@ const analyzeAudioWithExtremeWorker = async ({
       if (status.state === "failed" || status.state === "cancelled") return unavailable("worker-failed");
       if (status.state === "succeeded") {
         const reportResponse = await fetchImpl(`${workerBaseUrl}/v1/jobs/${encodeURIComponent(job.jobId)}/report`, {
+          redirect: "error",
           headers: { Authorization: `Bearer ${job.accessToken}` },
         });
         if (!reportResponse.ok) return unavailableAfterCleanup("report-unavailable");

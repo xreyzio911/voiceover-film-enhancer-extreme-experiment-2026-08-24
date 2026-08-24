@@ -3,7 +3,10 @@ import { NextResponse, type NextRequest } from "next/server";
 import { getServerAuthSession } from "@/auth";
 import { isAllowedEmail } from "@/lib/authAllowlist";
 import { readBoundedJson } from "@/lib/boundedRequestJson";
-import { normalizeExtremeWorkerBaseUrl } from "@/lib/extremeMlClient";
+import {
+  normalizeExtremeWorkerAllowedOrigins,
+  normalizeExtremeWorkerBaseUrl,
+} from "@/lib/extremeMlClient";
 import {
   consumeFixedWindowRateLimit,
   type FixedWindowRateLimitState,
@@ -117,7 +120,18 @@ export async function POST(request: NextRequest) {
   const payload = normalizeTicketRequest(rawPayload.value);
   if (!payload) return jsonError("Invalid analysis metadata.", 400, "bad_request");
 
-  const workerBaseUrl = normalizeExtremeWorkerBaseUrl(process.env.EXTREME_ML_WORKER_URL);
+  const allowLocalDevelopment = process.env.NODE_ENV !== "production";
+  const allowedWorkerOrigins = normalizeExtremeWorkerAllowedOrigins(
+    process.env.EXTREME_ML_ALLOWED_WORKER_ORIGINS,
+    allowLocalDevelopment,
+  );
+  const workerBaseUrl = allowedWorkerOrigins
+    ? normalizeExtremeWorkerBaseUrl(
+        process.env.EXTREME_ML_WORKER_URL,
+        allowedWorkerOrigins,
+        allowLocalDevelopment,
+      )
+    : null;
   const internalSecret = process.env.EXTREME_ML_INTERNAL_SECRET ?? "";
   if (!workerBaseUrl || internalSecret.length < 32) {
     return jsonError("Extreme ML worker is not configured.", 503, "config");
@@ -132,6 +146,7 @@ export async function POST(request: NextRequest) {
   try {
     const workerResponse = await fetch(`${workerBaseUrl}/internal/v1/tickets`, {
       method: "POST",
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${internalSecret}`,
         "Content-Type": "application/json",
