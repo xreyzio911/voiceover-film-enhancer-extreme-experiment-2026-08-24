@@ -254,7 +254,80 @@ def _valid_metric_value(value: object) -> float | None:
     return rendered if math.isfinite(rendered) and 0.0 <= rendered <= 5.0 else None
 
 
-def _metric_window_plan(audio: Any, sample_rate: int) -> tuple[int, tuple[int, ...]]:
+def _speech_metric_window_starts(
+    *,
+    sample_count: int,
+    sample_rate: int,
+    window_samples: int,
+    vad_probabilities: tuple[float, ...] | list[float],
+) -> tuple[int, ...]:
+    probabilities = tuple(
+        min(1.0, max(0.0, float(value))) if math.isfinite(float(value)) else 0.0
+        for value in vad_probabilities
+    )
+    if not probabilities:
+        return ()
+
+    high_speech = tuple(1 if value >= 0.5 else 0 for value in probabilities)
+    if not any(high_speech):
+        return ()
+    if sample_count <= window_samples:
+        return (0,)
+
+    max_start = sample_count - window_samples
+    source_seconds = sample_count / sample_rate
+    chunk_seconds = 512.0 / 16_000.0
+    window_chunks = max(1, math.ceil((window_samples / sample_rate) / chunk_seconds))
+    minimum_speech_seconds = min(0.75, max(chunk_seconds, source_seconds * 0.1))
+    minimum_speech_chunks = max(1, math.ceil(minimum_speech_seconds / chunk_seconds))
+    mass_prefix = [0.0]
+    support_prefix = [0]
+    for probability, is_speech in zip(probabilities, high_speech):
+        mass_prefix.append(mass_prefix[-1] + max(0.0, probability - 0.25))
+        support_prefix.append(support_prefix[-1] + is_speech)
+
+    max_chunk_start = max(0, len(probabilities) - window_chunks)
+    stride_chunks = max(1, round(0.25 / chunk_seconds))
+    chunk_starts = list(range(0, max_chunk_start + 1, stride_chunks))
+    if not chunk_starts or chunk_starts[-1] != max_chunk_start:
+        chunk_starts.append(max_chunk_start)
+
+    ranked: list[tuple[int, float, int]] = []
+    seen_sample_starts: set[int] = set()
+    for chunk_start in chunk_starts:
+        chunk_stop = min(len(probabilities), chunk_start + window_chunks)
+        speech_chunks = support_prefix[chunk_stop] - support_prefix[chunk_start]
+        if speech_chunks < minimum_speech_chunks:
+            continue
+        speech_mass = mass_prefix[chunk_stop] - mass_prefix[chunk_start]
+        sample_start = min(
+            max_start,
+            max(0, round(chunk_start * 512 * sample_rate / 16_000)),
+        )
+        if sample_start in seen_sample_starts:
+            continue
+        seen_sample_starts.add(sample_start)
+        ranked.append((speech_chunks, speech_mass, sample_start))
+
+    selected: list[int] = []
+    for _support, _mass, sample_start in sorted(
+        ranked,
+        key=lambda item: (-item[0], -item[1], item[2]),
+    ):
+        if any(abs(sample_start - prior) < window_samples for prior in selected):
+            continue
+        selected.append(sample_start)
+        if len(selected) >= _METRIC_WINDOW_COUNT_CAP:
+            break
+    return tuple(sorted(selected))
+
+
+def _metric_window_plan(
+    audio: Any,
+    sample_rate: int,
+    *,
+    vad_probabilities: tuple[float, ...] | list[float] | None = None,
+) -> tuple[int, tuple[int, ...]]:
     if sample_rate <= 0:
         raise ValueError("invalid-metric-sample-rate")
     sample_count = len(audio)
@@ -263,6 +336,13 @@ def _metric_window_plan(audio: Any, sample_rate: int) -> tuple[int, tuple[int, .
     duration_sample_cap = max(1, math.floor(sample_rate * _METRIC_WINDOW_SECONDS))
     memory_sample_cap = _METRIC_WINDOW_BYTE_CAP // _METRIC_SAMPLE_BYTES
     window_samples = min(duration_sample_cap, memory_sample_cap)
+    if vad_probabilities is not None:
+        return window_samples, _speech_metric_window_starts(
+            sample_count=sample_count,
+            sample_rate=sample_rate,
+            window_samples=window_samples,
+            vad_probabilities=vad_probabilities,
+        )
     if sample_count <= window_samples:
         return window_samples, (0,)
 
@@ -464,6 +544,7 @@ class AdvisoryInferenceRuntime:
         assert isinstance(vad, dict)
         components: dict[str, dict[str, str]] = {}
         verified: list[ArtifactSpec] = []
+        metric_vad_probabilities: tuple[float, ...] | list[float] = ()
 
         vad_entry = self._verified_artifact("silero-vad")
         if vad_entry is None:
@@ -476,6 +557,7 @@ class AdvisoryInferenceRuntime:
                     self._vad = self._vad_factory(vad_path)
                     self._models_loaded = True
                 probabilities = self._vad.score_chunks(_resample_for_vad(audio, sample_rate))
+                metric_vad_probabilities = probabilities
                 frames = _vad_frames(probabilities, duration_seconds * 1000.0)
                 if frames:
                     vad["frames"] = frames
@@ -504,7 +586,14 @@ class AdvisoryInferenceRuntime:
                 for metric_id in self.config.metric_ids:
                     if metric_id not in verified_metric_paths:
                         continue
-                    self._score_metric(metric_id, metrics, components, audio, sample_rate)
+                    self._score_metric(
+                        metric_id,
+                        metrics,
+                        components,
+                        audio,
+                        sample_rate,
+                        vad_probabilities=metric_vad_probabilities,
+                    )
             except Exception:
                 self._metrics = None
                 for metric_id in verified_metric_paths:
@@ -530,14 +619,27 @@ class AdvisoryInferenceRuntime:
         components: dict[str, dict[str, str]],
         audio: Any,
         sample_rate: int,
+        *,
+        vad_probabilities: tuple[float, ...] | list[float] | None = None,
     ) -> None:
         assert self._metrics is not None
         output_ids = _METRIC_OUTPUTS[metric_id]
         valid_values: dict[str, list[float]] = {output_id: [] for output_id in output_ids}
         try:
-            window_samples, starts = _metric_window_plan(audio, sample_rate)
+            window_samples, starts = _metric_window_plan(
+                audio,
+                sample_rate,
+                vad_probabilities=vad_probabilities,
+            )
         except Exception:
             components[metric_id] = {"status": "unavailable", "code": "metric-inference-error"}
+            return
+
+        if not starts:
+            components[metric_id] = {
+                "status": "unavailable",
+                "code": "no-speech-metric-windows",
+            }
             return
 
         successful_windows = 0
