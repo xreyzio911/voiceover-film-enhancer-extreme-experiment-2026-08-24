@@ -581,7 +581,7 @@ test("speech-only spectrum and continuous event evidence drive de-essing without
     "const parseSilencedetectSpans =",
   );
   const adaptiveProfileBlock = sourceBetween(
-    "const buildAdaptiveProfile = (analysis: FileAnalysis | undefined, reference: BatchReference | null)",
+    "const buildAdaptiveProfile = (",
     "const buildOnsetTamerFilter =",
   );
 
@@ -600,6 +600,7 @@ test("speech-only spectrum and continuous event evidence drive de-essing without
     /Math\.max\(computeSibilanceScore\(spectralDecisionDb\), eventSibilanceAuthority\)/,
   );
   assert.match(adaptiveProfileBlock, /deriveSpectrumTiltsDb\(analysis\.speechBandSpectrumDb \?\? \[\]\)/);
+  assert.match(adaptiveProfileBlock, /buildExtremeMlSourceQualityPolicy\(/);
   assert.match(adaptiveProfileBlock, /const deEsserSpectrumDb = analysis\.speechBandSpectrumDb \?\? analysis\.bandSpectrumDb/);
   assert.match(adaptiveProfileBlock, /bandSpectrumDb: deEsserSpectrumDb/);
 });

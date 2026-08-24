@@ -190,6 +190,10 @@ import {
   compareExtremeQualityMetrics,
   getExtremeMlSnapshotGraceMs,
 } from "../lib/extremeMlVoPolicy";
+import {
+  buildExtremeMlSourceQualityPolicy,
+  type ExtremeMlSourceQualityPolicy,
+} from "../lib/extremeMlSourceQualityPolicy";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -703,6 +707,8 @@ type AdaptiveProfile = {
   blendOutdoorGain: number;
   blendIndoorDelayMs: number;
   blendOutdoorDelayMs: number;
+  mlSourceQualityReason: ExtremeMlSourceQualityPolicy["reason"];
+  mlSourceQualityMetrics: readonly string[];
 };
 
 type JobEntry = {
@@ -2146,8 +2152,15 @@ const summarizeFailureReason = (error: unknown) => {
         1,
       );
       const sparseSpeech = (analysis?.speechDutyCyclePct ?? 100) < 10 || (analysis?.speechSegmentCount ?? 999) <= 6;
-      const plannerMaxGainDb = 14 + cleanBoostHeadroom * (sparseSpeech ? 4 : 2);
       const directives = getActiveAudioReviewAdaptiveDirectives();
+      const mlSourceQualityPolicy = buildExtremeMlSourceQualityPolicy(
+        extremeSourceReportsByInputNameRef.current.get(inputName) ?? null,
+      );
+      const plannerMaxGainDb = clamp(
+        14 + cleanBoostHeadroom * (sparseSpeech ? 4 : 2) - mlSourceQualityPolicy.plannerMaxGainPenaltyDb,
+        12,
+        18,
+      );
       const headGuardBoost = clamp(directives.headGuardBoost, 0, 1);
       const plannerTargetDb = clamp(
         -22 + directives.targetLoudnessBiasDb + (PLANNER_K_WEIGHTING ? PLANNER_K_TARGET_OFFSET_DB : 0),
@@ -3623,7 +3636,29 @@ const summarizeFailureReason = (error: unknown) => {
     (noiseFloorDb !== null && noiseFloorDb > -58) ||
     (noiseRisk === "high" && ((noiseFloorDb ?? -70) > -62 || pauseNoiseRisk >= 0.18));
 
-  const buildAdaptiveProfile = (analysis: FileAnalysis | undefined, reference: BatchReference | null) => {
+  const raiseNoiseRisk = (
+    current: NoiseRisk,
+    floor: ExtremeMlSourceQualityPolicy["noiseRiskFloor"],
+  ): NoiseRisk => {
+    if (floor === "high") return "high";
+    if (floor === "medium" && current === "low") return "medium";
+    return current;
+  };
+
+  const raiseRoomRisk = (
+    current: RoomRisk,
+    floor: ExtremeMlSourceQualityPolicy["roomRiskFloor"],
+  ): RoomRisk => {
+    if (floor === "high") return "high";
+    if (floor === "medium" && current === "low") return "medium";
+    return current;
+  };
+
+  const buildAdaptiveProfile = (
+    analysis: FileAnalysis | undefined,
+    reference: BatchReference | null,
+    inputName?: string,
+  ) => {
     const controls = getActiveAudioReviewControls();
     const directives = getActiveAudioReviewAdaptiveDirectives();
     const activeSmartMatchConfig = getSmartMatchConfigForControls(controls);
@@ -3636,6 +3671,9 @@ const summarizeFailureReason = (error: unknown) => {
 
     const smartToneEnabled = activeSmartMatchConfig.tone > 0;
     const smartDynamicsEnabled = activeSmartMatchConfig.dynamics > 0;
+    const mlSourceQualityPolicy = buildExtremeMlSourceQualityPolicy(
+      inputName ? extremeSourceReportsByInputNameRef.current.get(inputName) ?? null : null,
+    );
 
     const referenceLowTilt = reference?.lowTilt ?? -11;
     const referenceHighTilt = reference?.highTilt ?? -13;
@@ -3706,6 +3744,7 @@ const summarizeFailureReason = (error: unknown) => {
     if (noiseRisk === "medium" && measuredSpeechThreshold > -40) {
       noiseRisk = "high";
     }
+    noiseRisk = raiseNoiseRisk(noiseRisk, mlSourceQualityPolicy.noiseRiskFloor);
 
     const inputTP = analysis.inputTP ?? -9;
     const hotPeakFactor = clamp((inputTP + 9) / 7, 0, 1);
@@ -3735,6 +3774,7 @@ const summarizeFailureReason = (error: unknown) => {
     if (analysisConfidence < 0.35) {
       roomRisk = downgradeRoomRisk(roomRisk);
     }
+    roomRisk = raiseRoomRisk(roomRisk, mlSourceQualityPolicy.roomRiskFloor);
 
     if (noiseRisk !== "low" || roomRisk !== "low") {
       const positiveTrim =
@@ -3745,23 +3785,34 @@ const summarizeFailureReason = (error: unknown) => {
 
     const echoScore = analysis.echoScore ?? 0;
     const roomCleanupEnabled =
-      controls.roomCleanup && (analysisConfidence >= 0.4 || echoScore >= 0.58 || roomRisk !== "low");
-    const instabilityScore = clamp(analysis.instabilityScore ?? 0, 0, 1);
+      controls.roomCleanup &&
+      (analysisConfidence >= 0.4 ||
+        echoScore >= 0.58 ||
+        roomRisk !== "low" ||
+        mlSourceQualityPolicy.roomCleanupBias > 0);
+    const instabilityScore = clamp(
+      (analysis.instabilityScore ?? 0) + mlSourceQualityPolicy.instabilityHintBoost,
+      0,
+      1,
+    );
     const clickScore = clamp(analysis.clickScore ?? 0, 0, 1);
     const lineSwingScore = clamp(analysis.lineSwingScore ?? 0, 0, 1);
     const sentenceJumpScore = clamp(analysis.sentenceJumpScore ?? 0, 0, 1);
     const breathSpikeRisk = clamp(analysis.breathSpikeRisk ?? 0, 0, 1);
-    const pauseNoiseRisk = clamp(
-      analysis.pauseNoiseRisk ??
-        (analysis.pauseNoiseFloorDb !== null
-          ? clamp((analysis.pauseNoiseFloorDb + 62) / 18, 0, 1)
-          : noiseRisk === "high"
-            ? 0.85
-            : noiseRisk === "medium"
-              ? 0.45
-              : 0.12),
-      0,
-      1
+    const pauseNoiseRisk = Math.max(
+      mlSourceQualityPolicy.pauseNoiseRiskFloor,
+      clamp(
+        analysis.pauseNoiseRisk ??
+          (analysis.pauseNoiseFloorDb !== null
+            ? clamp((analysis.pauseNoiseFloorDb + 62) / 18, 0, 1)
+            : noiseRisk === "high"
+              ? 0.85
+              : noiseRisk === "medium"
+                ? 0.45
+                : 0.12),
+        0,
+        1
+      ),
     );
     const onsetOvershootScore = clamp(analysis.onsetOvershootScore ?? 0, 0, 1);
     const midLineSagScore = clamp(analysis.midLineSagScore ?? 0, 0, 1);
@@ -3834,7 +3885,8 @@ const summarizeFailureReason = (error: unknown) => {
           echoScore *
             (roomRisk === "high" && echoScore >= 0.68 ? 1.35 : roomRisk === "high" ? 1.02 : roomRisk === "medium" ? 0.68 : 0.42) +
             (roomRisk === "high" ? (echoScore >= 0.72 ? 0.27 : 0.12) : 0) +
-            directives.roomCleanupBias * 0.55,
+            directives.roomCleanupBias * 0.55 +
+            mlSourceQualityPolicy.roomCleanupBias,
           0,
           1.95
         )
@@ -3896,8 +3948,15 @@ const summarizeFailureReason = (error: unknown) => {
       0,
       1,
     );
-    const directedDenoiseStrength = clamp(denoiseStrength + directives.denoiseBias, 0, 1);
-    const useDenoise = controls.noiseGuard && (measuredNoiseNeedsNr || directives.denoiseBias > 0.18) && directedDenoiseStrength >= 0.22;
+    const directedDenoiseStrength = clamp(
+      denoiseStrength + directives.denoiseBias + mlSourceQualityPolicy.denoiseBias,
+      0,
+      1,
+    );
+    const useDenoise =
+      controls.noiseGuard &&
+      (measuredNoiseNeedsNr || directives.denoiseBias > 0.18 || mlSourceQualityPolicy.denoiseBias > 0.12) &&
+      directedDenoiseStrength >= 0.22;
     const tailGateStrength = !useTailGate
       ? 0
       : roomRisk === "high"
@@ -4010,6 +4069,8 @@ const summarizeFailureReason = (error: unknown) => {
       blendOutdoorGain: voicingDecision.syntheticReflectionOutdoorGain,
       blendIndoorDelayMs: voicingDecision.syntheticReflectionIndoorDelayMs,
       blendOutdoorDelayMs: voicingDecision.syntheticReflectionOutdoorDelayMs,
+      mlSourceQualityReason: mlSourceQualityPolicy.reason,
+      mlSourceQualityMetrics: mlSourceQualityPolicy.usedMetricKeys,
     } satisfies AdaptiveProfile;
   };
 
@@ -8206,7 +8267,7 @@ const summarizeFailureReason = (error: unknown) => {
 
         const sourceReviewFiles = jobs.map((job) => {
           const sourceAnalysis = analysisByBase.get(job.base);
-          const initialProfile = buildAdaptiveProfile(sourceAnalysis, batchReference);
+          const initialProfile = buildAdaptiveProfile(sourceAnalysis, batchReference, job.inputName);
           return buildAudioReviewFileInput(
             job,
             sourceAnalysis,
@@ -8321,7 +8382,7 @@ const summarizeFailureReason = (error: unknown) => {
             appendLog(`[AIReview] ${job.base}: ${sourceFirstPlan.summary}`);
           }
           await writeJobInput(ffmpeg, job);
-          const profile = buildAdaptiveProfile(fileAnalysis, batchReference);
+          const profile = buildAdaptiveProfile(fileAnalysis, batchReference, job.inputName);
           const roomScore = profile ? (fileAnalysis?.roomScore ?? 0) : null;
           const adaptiveNoiseReductionFilter = profile ? resolveAdaptiveNoiseReductionFilter(profile) : null;
           const plannerPreviewEligible =
@@ -8384,7 +8445,11 @@ const summarizeFailureReason = (error: unknown) => {
                 fileAnalysis?.echoDelayMs ?? 0
               } ms, blend ${
                 (profile.blendIndoorGain * 100).toFixed(1)
-              }/${(profile.blendOutdoorGain * 100).toFixed(1)}%.`
+              }/${(profile.blendOutdoorGain * 100).toFixed(1)}%${
+                profile.mlSourceQualityReason === "ml-source-quality"
+                  ? `, ML source policy ${profile.mlSourceQualityMetrics.join("/")}`
+                  : ""
+              }.`
             );
           }
 
@@ -9393,7 +9458,7 @@ const summarizeFailureReason = (error: unknown) => {
                     await writeJobInput(ffmpeg, job);
                   }
                   aiAdaptiveDirectivesOverrideRef.current = correctiveDirectives;
-                  const correctiveProfile = buildAdaptiveProfile(fileAnalysis, batchReference);
+                  const correctiveProfile = buildAdaptiveProfile(fileAnalysis, batchReference, job.inputName);
                   const correctivePlannerContext = await preparePlannerRenderContext(
                     ffmpeg,
                     job,
