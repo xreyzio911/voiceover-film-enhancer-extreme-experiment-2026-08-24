@@ -233,6 +233,12 @@ huggingface-hub==0.34.4 \
     # via
     #   -r requirements-production.in
     #   speechonnxmetrics
+hf-xet==1.6.0 \
+    --hash=sha256:d62671bb130879cef0ee4c9ebe47a14af6c66ec53e6d84dc15936e5ffdfac82f \
+    --hash=sha256:fb4fadde1b2b70bf4c0c14a6dccbe7194b1c28947fefd5bbe3fed9d940676c3b
+    # via
+    #   -r requirements-production.in
+    #   huggingface-hub
 humanfriendly==10.0 \
     --hash=sha256:1697e1a8a8f550fd43c2865cd84542fc175a61dcb779b6fee18cf6b6ccba1477 \
     --hash=sha256:6b0b831ce8f15f7300721aa49829fc4e83921a9a301cc7f606be6686a2288ddc
