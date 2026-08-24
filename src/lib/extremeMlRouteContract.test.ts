@@ -51,11 +51,9 @@ test("Extreme worker config documents one exact HTTPS origin for server and brow
   assert.equal(values.NEXT_PUBLIC_EXTREME_ML_ALLOWED_WORKER_ORIGINS, workerUrl);
 });
 
-test("Next config publishes only the non-secret Extreme worker origin to browser code", () => {
+test("Next config never derives the public worker allowlist from a server-only setting", () => {
   const source = readFileSync(nextConfigPath, "utf8");
-  assert.match(source, /NEXT_PUBLIC_EXTREME_ML_ALLOWED_WORKER_ORIGINS/);
-  assert.match(source, /EXTREME_ML_ALLOWED_WORKER_ORIGINS/);
-  assert.match(source, /env:\s*{/);
+  assert.doesNotMatch(source, /process\.env\.EXTREME_ML_ALLOWED_WORKER_ORIGINS/);
   assert.doesNotMatch(source, /EXTREME_ML_INTERNAL_SECRET/);
   assert.doesNotMatch(source, /GOOGLE_CLIENT_SECRET/);
   assert.doesNotMatch(source, /AUTH_SECRET/);
