@@ -105,17 +105,18 @@ export const buildExtremeMlSourceQualityPolicy = (
   const sigmosLoud = metricValue(report, "sigmos.loud", usedMetricKeys);
   const sigmosDiscontinuity = metricValue(report, "sigmos.disc", usedMetricKeys);
   const utmos = metricValue(report, "utmos", usedMetricKeys);
+  const speechAuthority = speechCoverageAuthority(report);
 
   const broadQualityEvidence = Math.max(
     deficit(dnsmosOverall, 3.55, 2.25),
     deficit(dnsmosP808, 3.65, 2.45),
     deficit(sigmosOverall, 3.55, 2.2),
     deficit(utmos, 3.55, 2.35),
-  ) * speechCoverageAuthority(report);
+  ) * speechAuthority;
   const speechFragilityEvidence = Math.max(
     deficit(dnsmosSignal, 3.25, 1.85),
     deficit(sigmosSignal, 3.25, 1.85),
-  );
+  ) * speechAuthority;
   const cleanupConfidence = clamp(1 - speechFragilityEvidence * 0.38, 0.62, 1);
   const rawNoiseEvidence = Math.max(
     deficit(dnsmosBackground, 3.55, 2.15),
@@ -127,9 +128,9 @@ export const buildExtremeMlSourceQualityPolicy = (
     deficit(sigmosDiscontinuity, 3.5, 2.2),
     broadQualityEvidence * 0.58,
   );
-  const noiseEvidence = rawNoiseEvidence * cleanupConfidence;
-  const roomEvidence = rawRoomEvidence * cleanupConfidence;
-  const stabilityEvidence = rawStabilityEvidence * cleanupConfidence;
+  const noiseEvidence = rawNoiseEvidence * cleanupConfidence * speechAuthority;
+  const roomEvidence = rawRoomEvidence * cleanupConfidence * speechAuthority;
+  const stabilityEvidence = rawStabilityEvidence * cleanupConfidence * speechAuthority;
   const strongestEvidence = Math.max(
     noiseEvidence,
     roomEvidence,
