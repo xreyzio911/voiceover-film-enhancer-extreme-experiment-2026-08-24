@@ -51,13 +51,30 @@ const validReport = (): unknown => ({
   },
 });
 
-test("worker URL accepts HTTPS and local development only", () => {
+test("worker URL accepts only an exact configured HTTPS origin or explicit local development", () => {
+  const trustedOrigins = ["https://extreme-worker.onrender.com"];
   assert.equal(
-    normalizeExtremeWorkerBaseUrl("https://extreme-worker.onrender.com/"),
+    normalizeExtremeWorkerBaseUrl(
+      "https://extreme-worker.onrender.com/",
+      trustedOrigins,
+    ),
     "https://extreme-worker.onrender.com",
   );
-  assert.equal(normalizeExtremeWorkerBaseUrl("http://localhost:8787"), "http://localhost:8787");
-  assert.equal(normalizeExtremeWorkerBaseUrl("http://127.0.0.1:8787/"), "http://127.0.0.1:8787");
+  assert.equal(
+    normalizeExtremeWorkerBaseUrl(
+      "https://attacker.example",
+      trustedOrigins,
+    ),
+    null,
+  );
+  assert.equal(
+    normalizeExtremeWorkerBaseUrl("http://localhost:8787", [], true),
+    "http://localhost:8787",
+  );
+  assert.equal(
+    normalizeExtremeWorkerBaseUrl("http://127.0.0.1:8787/", [], false),
+    null,
+  );
   for (const value of [
     "http://extreme-worker.onrender.com",
     "https://user:password@example.com",
@@ -66,8 +83,42 @@ test("worker URL accepts HTTPS and local development only", () => {
     "javascript:alert(1)",
     "",
   ]) {
-    assert.equal(normalizeExtremeWorkerBaseUrl(value), null, value);
+    assert.equal(normalizeExtremeWorkerBaseUrl(value, trustedOrigins, false), null, value);
   }
+});
+
+test("a forged ticket cannot send job credentials or audio to an arbitrary HTTPS origin", async () => {
+  const source = new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" });
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const outcome = await analyzeSourceWithExtremeWorker({
+    source,
+    contentType: "audio/wav",
+    idempotencyKey: "forged-worker-origin",
+    allowedWorkerOrigins: ["https://trusted-worker.example"],
+    fetchImpl: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/extreme-ml/ticket") {
+        return Response.json({
+          workerBaseUrl: "https://attacker.example",
+          ticket: "stolen-if-forwarded",
+          expiresAt: "2026-08-24T01:00:00.000Z",
+        });
+      }
+      return Response.json({
+        jobId: "attacker-job",
+        accessToken: "attacker-token",
+        uploadOffset: 0,
+        maxChunkBytes: 16,
+      });
+    },
+    sleep: async () => undefined,
+  });
+
+  assert.deepEqual(outcome, { status: "unavailable", reason: "ticket-unavailable" });
+  assert.deepEqual(calls.map((call) => call.url), ["/api/extreme-ml/ticket"]);
+  assert.equal(calls.some((call) => call.init.body instanceof Blob), false);
+  assert.equal(calls.some((call) => new Headers(call.init.headers).has("Authorization")), false);
 });
 
 test("untrusted worker reports cannot gain authority, gate delivery, or smuggle invalid frames", () => {
@@ -159,6 +210,7 @@ test("source analysis sends only metadata through Vercel and WAV bytes directly 
     sleep: async () => undefined,
     chunkBytes: 4,
     maxPolls: 4,
+    allowedWorkerOrigins: ["https://extreme-worker.onrender.com"],
   });
 
   assert.equal(outcome.status, "succeeded");
@@ -179,6 +231,12 @@ test("source analysis sends only metadata through Vercel and WAV bytes directly 
   assert.deepEqual(uploadCalls.map((call) => (call.init.body as Blob).size), [4, 4, 2]);
   assert.equal(uploadCalls.every((call) => call.url.startsWith("https://extreme-worker.onrender.com/")), true);
   assert.equal(uploadCalls.every((call) => new Headers(call.init.headers).get("Authorization") === "Bearer job_secret"), true);
+  assert.equal(
+    calls
+      .filter((call) => call.url.startsWith("https://extreme-worker.onrender.com/"))
+      .every((call) => call.init.redirect === "error"),
+    true,
+  );
 });
 
 test("render analysis keeps its distinct least-privilege scope through ticket and job admission", async () => {
@@ -214,6 +272,7 @@ test("render analysis keeps its distinct least-privilege scope through ticket an
       throw new Error(`Unexpected request: ${url}`);
     },
     sleep: async () => undefined,
+    allowedWorkerOrigins: ["https://worker.example"],
   });
 
   assert.equal(outcome.status, "succeeded");
@@ -256,6 +315,7 @@ test("worker failures and exhausted polling fail open without throwing", async (
       if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
       return Response.json({ state: "running", progress: 0.1 });
     },
+    allowedWorkerOrigins: ["https://worker.example"],
   });
   assert.deepEqual(timedOut, { status: "unavailable", reason: "poll-timeout" });
 });
@@ -285,6 +345,7 @@ test("poll timeout requests best-effort worker cancellation without changing fai
       if (init.method === "DELETE") return Response.json({ state: "cancel_requested" }, { status: 202 });
       return Response.json({ state: "running" });
     },
+    allowedWorkerOrigins: ["https://worker.example"],
   });
 
   assert.deepEqual(outcome, { status: "unavailable", reason: "poll-timeout" });

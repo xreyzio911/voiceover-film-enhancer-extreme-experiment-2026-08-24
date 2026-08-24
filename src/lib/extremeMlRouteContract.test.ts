@@ -14,6 +14,7 @@ test("Extreme ML ticket route authenticates metadata-only direct-to-Render uploa
   assert.match(source, /isAllowedEmail/);
   assert.match(source, /isLocalHost\(request\.nextUrl\.hostname\)/);
   assert.match(source, /EXTREME_ML_WORKER_URL/);
+  assert.match(source, /EXTREME_ML_ALLOWED_WORKER_ORIGINS/);
   assert.match(source, /EXTREME_ML_INTERNAL_SECRET/);
   assert.match(source, /internal\/v1\/tickets/);
   assert.match(source, /sizeBytes/);
@@ -22,6 +23,8 @@ test("Extreme ML ticket route authenticates metadata-only direct-to-Render uploa
   assert.match(source, /render_analysis/);
   assert.match(source, /readBoundedJson/);
   assert.match(source, /consumeFixedWindowRateLimit/);
+  assert.match(source, /normalizeExtremeWorkerAllowedOrigins/);
+  assert.match(source, /redirect:\s*["']error["']/);
   assert.doesNotMatch(source, /formData\s*\(/);
   assert.doesNotMatch(source, /arrayBuffer\s*\(/);
   assert.doesNotMatch(source, /request\.json\s*\(/);
