@@ -36,6 +36,13 @@ const reportWithMetrics = (
   ...overrides,
 });
 
+const vadFrames = (probabilities: readonly number[]) =>
+  probabilities.map((speechProbability, frame) => ({
+    startMs: frame * 10,
+    endMs: (frame + 1) * 10,
+    speechProbability,
+  }));
+
 test("poor neural source metrics produce bounded cleanup and stability hints", () => {
   const policy = buildExtremeMlSourceQualityPolicy(
     reportWithMetrics({
@@ -89,14 +96,17 @@ test("moderately poor perceptual noise and room evidence is promoted to a decisi
 
 test("optional naturalness and overall MOS widen cleanup when artifact scores are incomplete", () => {
   const policy = buildExtremeMlSourceQualityPolicy(
-    reportWithMetrics({
-      "dnsmos.ovrl": { value: 2.7, available: true, higherIsBetter: true },
-      "dnsmos.sig": { value: 3.55, available: true, higherIsBetter: true },
-      "dnsmos_p808": { value: 2.85, available: true, higherIsBetter: true },
-      "sigmos.ovrl": { value: 2.8, available: true, higherIsBetter: true },
-      "sigmos.sig": { value: 3.6, available: true, higherIsBetter: true },
-      "utmos": { value: 2.9, available: true, higherIsBetter: true },
-    }),
+    reportWithMetrics(
+      {
+        "dnsmos.ovrl": { value: 2.7, available: true, higherIsBetter: true },
+        "dnsmos.sig": { value: 3.55, available: true, higherIsBetter: true },
+        "dnsmos_p808": { value: 2.85, available: true, higherIsBetter: true },
+        "sigmos.ovrl": { value: 2.8, available: true, higherIsBetter: true },
+        "sigmos.sig": { value: 3.6, available: true, higherIsBetter: true },
+        "utmos": { value: 2.9, available: true, higherIsBetter: true },
+      },
+      { vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.88)) } },
+    ),
   );
 
   assert.equal(policy.reason, "ml-source-quality");
@@ -113,6 +123,36 @@ test("optional naturalness and overall MOS widen cleanup when artifact scores ar
     "sigmos.sig",
     "utmos",
   ]);
+});
+
+test("broad MOS-only evidence is ignored when VAD shows a silence-heavy editorial timeline", () => {
+  const policy = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics(
+      {
+        "dnsmos.ovrl": { value: 2.6, available: true, higherIsBetter: true },
+        "dnsmos.sig": { value: 3.6, available: true, higherIsBetter: true },
+        "dnsmos_p808": { value: 2.7, available: true, higherIsBetter: true },
+        "sigmos.ovrl": { value: 2.75, available: true, higherIsBetter: true },
+        "sigmos.sig": { value: 3.65, available: true, higherIsBetter: true },
+        "utmos": { value: 2.8, available: true, higherIsBetter: true },
+      },
+      {
+        vad: {
+          frameMs: 10,
+          frames: vadFrames([
+            ...new Array(4).fill(0.9),
+            ...new Array(96).fill(0.03),
+          ]),
+        },
+      },
+    ),
+  );
+
+  assert.equal(policy.reason, "legacy-fallback");
+  assert.equal(policy.noiseRiskFloor, null);
+  assert.equal(policy.denoiseBias, 0);
+  assert.equal(policy.roomCleanupBias, 0);
+  assert.equal(policy.plannerMaxGainPenaltyDb, 0);
 });
 
 test("poor speech/signal MOS damps cleanup authority instead of authorizing overprocessing", () => {
