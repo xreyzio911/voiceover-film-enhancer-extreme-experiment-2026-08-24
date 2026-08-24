@@ -74,6 +74,85 @@ test("ML speech protection can bridge a short speech-supported gap but never rem
   assert.equal(result.isolatedMlFrameCount, 0);
 });
 
+test("ML speech protection can preserve a longer speech-supported breath gap between energy runs", () => {
+  const energySpeechMask = [
+    false,
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false,
+  ];
+
+  const result = buildMlSpeechProtectionMask({
+    frameCount: energySpeechMask.length,
+    frameMs: 10,
+    energySpeechMask,
+    vadFrames: vad(energySpeechMask.map((active, frame) => {
+      if (active) return 0.91;
+      if (frame >= 4 && frame < 30) return 0.63;
+      return 0.08;
+    })),
+  });
+
+  assert.equal(result.reason, "ml-protection");
+  assert.equal(result.addedFrameCount, 26);
+  assert.equal(result.isolatedMlFrameCount, 0);
+  assert.deepEqual(
+    result.protectedSpeechMask.slice(4, 30),
+    new Array<boolean>(26).fill(true),
+  );
+});
+
+test("ML speech protection keeps one-sided tails shorter and higher-confidence than breath gaps", () => {
+  const energySpeechMask = new Array<boolean>(36).fill(false);
+  for (let frame = 4; frame < 12; frame += 1) energySpeechMask[frame] = true;
+
+  const result = buildMlSpeechProtectionMask({
+    frameCount: energySpeechMask.length,
+    frameMs: 10,
+    energySpeechMask,
+    vadFrames: vad(energySpeechMask.map((active, frame) => {
+      if (active) return 0.92;
+      if (frame >= 12 && frame < 32) return 0.66;
+      return 0.05;
+    })),
+  });
+
+  assert.equal(result.reason, "ml-protection");
+  assert.equal(result.addedFrameCount, 0);
+  assert.equal(result.isolatedMlFrameCount, 20);
+  assert.deepEqual(result.protectedSpeechMask, energySpeechMask);
+});
+
 test("ML speech protection ignores isolated VAD islands instead of creating speech runs", () => {
   const result = buildMlSpeechProtectionMask({
     frameCount: 12,
