@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const routePath = resolve(ROOT, "src/app/api/extreme-ml/ticket/route.ts");
 const envExamplePath = resolve(ROOT, ".env.example");
+const nextConfigPath = resolve(ROOT, "next.config.js");
 
 test("Extreme ML ticket route authenticates metadata-only direct-to-Render uploads", () => {
   assert.equal(existsSync(routePath), true);
@@ -48,4 +49,14 @@ test("Extreme worker config documents one exact HTTPS origin for server and brow
   assert.match(workerUrl, /^https:\/\//);
   assert.equal(values.EXTREME_ML_ALLOWED_WORKER_ORIGINS, workerUrl);
   assert.equal(values.NEXT_PUBLIC_EXTREME_ML_ALLOWED_WORKER_ORIGINS, workerUrl);
+});
+
+test("Next config publishes only the non-secret Extreme worker origin to browser code", () => {
+  const source = readFileSync(nextConfigPath, "utf8");
+  assert.match(source, /NEXT_PUBLIC_EXTREME_ML_ALLOWED_WORKER_ORIGINS/);
+  assert.match(source, /EXTREME_ML_ALLOWED_WORKER_ORIGINS/);
+  assert.match(source, /env:\s*{/);
+  assert.doesNotMatch(source, /EXTREME_ML_INTERNAL_SECRET/);
+  assert.doesNotMatch(source, /GOOGLE_CLIENT_SECRET/);
+  assert.doesNotMatch(source, /AUTH_SECRET/);
 });
