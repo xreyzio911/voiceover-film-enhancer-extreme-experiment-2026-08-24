@@ -745,11 +745,12 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(status.status_code, 404)
 
-    def test_ticket_replay_maintenance_uses_ttl_plus_safety_margin(self) -> None:
-        maintain_replays, safety_seconds = require_symbols(
+    def test_ticket_replay_maintenance_uses_max_ttl_plus_safety_margin(self) -> None:
+        maintain_replays, max_ttl_seconds, safety_seconds = require_symbols(
             self,
             "extreme_worker.app",
             "_prune_expired_ticket_replays",
+            "_TICKET_MAX_TTL_SECONDS",
             "_TICKET_REPLAY_RETENTION_SAFETY_SECONDS",
         )
         replay_store_type, replay_error = require_symbols(
@@ -759,7 +760,7 @@ class WorkerHttpApiContractTests(unittest.TestCase):
             "TicketReplayError",
         )
         replay_store = replay_store_type(self.storage_root / "tickets.sqlite3")
-        cutoff = self.clock() - (self.app.state.ticket_ttl_seconds + safety_seconds)
+        cutoff = self.clock() - (max_ttl_seconds + safety_seconds)
         old_nonce = "old-maintenance-nonce-0001"
         recent_nonce = "recent-maintenance-nonce-0002"
         with closing(sqlite3.connect(self.storage_root / "tickets.sqlite3")) as connection, connection:
@@ -774,6 +775,113 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         deleted = maintain_replays(self.app, now=self.clock())
 
         self.assertEqual(deleted, 1)
+        replay_store.consume(old_nonce)
+        with self.assertRaises(replay_error):
+            replay_store.consume(recent_nonce)
+
+    def test_ticket_replay_retention_survives_ticket_ttl_downgrade(self) -> None:
+        maintain_replays, = require_symbols(
+            self,
+            "extreme_worker.app",
+            "_prune_expired_ticket_replays",
+        )
+        downgrade_root = self.storage_root / "ttl-downgrade"
+        downgrade_clock = MutableClock(time.time())
+        base_config = {
+            "storage_root": downgrade_root,
+            "allowed_origins": [self.ORIGIN],
+            "internal_secret": self.INTERNAL_SECRET,
+            "ticket_secret": self.TICKET_SECRET,
+            "max_audio_bytes": 1_000_000,
+            "max_chunk_bytes": 1_024,
+            "max_duration_seconds": 30.0,
+            "clock": downgrade_clock,
+            "analyzer": FakeAnalyzer(),
+            "worker_poll_seconds": 0.01,
+        }
+        old_app = self.create_app({**base_config, "ticket_ttl_seconds": 300})
+        metadata = self._metadata(idempotencyKey="ttl-downgrade-replay")
+        with TestClient(old_app) as old_client:
+            issued = old_client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={"ownerHash": "a" * 64, **metadata},
+            )
+            self.assertEqual(issued.status_code, 200, issued.text)
+            ticket = issued.json()["ticket"]
+            consumed = old_client.post(
+                "/v1/jobs",
+                headers={"Authorization": f"Bearer {ticket}"},
+                json=metadata,
+            )
+            self.assertEqual(consumed.status_code, 200, consumed.text)
+
+        downgrade_clock.advance(121.0)
+        new_app = self.create_app({**base_config, "ticket_ttl_seconds": 60})
+        self.assertEqual(maintain_replays(new_app, now=downgrade_clock()), 0)
+        with TestClient(new_app) as new_client:
+            replay = new_client.post(
+                "/v1/jobs",
+                headers={"Authorization": f"Bearer {ticket}"},
+                json=metadata,
+            )
+        self.assertEqual(replay.status_code, 401, replay.text)
+
+        downgrade_clock.advance(240.0)
+        self.assertEqual(maintain_replays(new_app, now=downgrade_clock()), 1)
+
+    def test_inline_analysis_admission_triggers_replay_maintenance(self) -> None:
+        max_ttl_seconds, safety_seconds = require_symbols(
+            self,
+            "extreme_worker.app",
+            "_TICKET_MAX_TTL_SECONDS",
+            "_TICKET_REPLAY_RETENTION_SAFETY_SECONDS",
+        )
+        replay_store_type, replay_error = require_symbols(
+            self,
+            "extreme_worker.security",
+            "SQLiteReplayStore",
+            "TicketReplayError",
+        )
+        inline_root = self.storage_root / "inline-replay-maintenance"
+        inline_clock = MutableClock(time.time())
+        inline_app = self.create_app(
+            {
+                "storage_root": inline_root,
+                "allowed_origins": [self.ORIGIN],
+                "internal_secret": self.INTERNAL_SECRET,
+                "ticket_secret": self.TICKET_SECRET,
+                "ticket_ttl_seconds": 60,
+                "maintenance_interval_seconds": 300,
+                "max_audio_bytes": 1_000_000,
+                "clock": inline_clock,
+                "analyzer": FakeAnalyzer(),
+                "inline_analysis": True,
+            }
+        )
+        replay_store = replay_store_type(inline_root / "tickets.sqlite3")
+        cutoff = inline_clock() - (max_ttl_seconds + safety_seconds)
+        old_nonce = "old-inline-maintenance-0001"
+        recent_nonce = "recent-inline-maintenance-0002"
+        with closing(sqlite3.connect(inline_root / "tickets.sqlite3")) as connection, connection:
+            connection.executemany(
+                "INSERT INTO consumed_ticket_nonces(nonce_sha256, consumed_at) VALUES (?, ?)",
+                (
+                    (hashlib.sha256(old_nonce.encode("utf-8")).hexdigest(), cutoff - 0.001),
+                    (hashlib.sha256(recent_nonce.encode("utf-8")).hexdigest(), cutoff),
+                ),
+            )
+
+        with TestClient(inline_app) as inline_client:
+            issued = inline_client.post(
+                "/internal/v1/tickets",
+                headers={"Authorization": f"Bearer {self.INTERNAL_SECRET}"},
+                json={
+                    "ownerHash": "b" * 64,
+                    **self._metadata(idempotencyKey="inline-maintenance-trigger"),
+                },
+            )
+        self.assertEqual(issued.status_code, 200, issued.text)
         replay_store.consume(old_nonce)
         with self.assertRaises(replay_error):
             replay_store.consume(recent_nonce)
