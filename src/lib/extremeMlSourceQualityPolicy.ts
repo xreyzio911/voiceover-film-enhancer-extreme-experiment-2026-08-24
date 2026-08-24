@@ -111,8 +111,8 @@ export const buildExtremeMlSourceQualityPolicy = (
     noiseRiskFloor: floorFromEvidence(noiseEvidence),
     roomRiskFloor: floorFromEvidence(roomEvidence),
     pauseNoiseRiskFloor: clamp(0.22 + noiseEvidence * 0.62 + roomEvidence * 0.18 + stabilityEvidence * 0.12, 0, 0.84),
-    denoiseBias: clamp(noiseEvidence * 0.34 + roomEvidence * 0.08, 0, 0.32),
-    roomCleanupBias: clamp(roomEvidence * 0.44 + stabilityEvidence * 0.08, 0, 0.3),
+    denoiseBias: clamp(noiseEvidence * 0.34 + roomEvidence * 0.08, 0, 0.4),
+    roomCleanupBias: clamp(roomEvidence * 0.44 + stabilityEvidence * 0.08, 0, 0.42),
     instabilityHintBoost: clamp(stabilityEvidence * 0.18 + roomEvidence * 0.06, 0, 0.24),
     speechSpikeTamingBoost: clamp(stabilityEvidence * 0.14, 0, 0.16),
     plannerMaxGainPenaltyDb: clamp(
