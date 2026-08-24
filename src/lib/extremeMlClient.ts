@@ -87,9 +87,15 @@ const normalizeExtremeWorkerOriginSyntax = (
     if (url.username || url.password || url.search || url.hash) return null;
     if (url.pathname !== "/" && url.pathname !== "") return null;
     const hostname = url.hostname.toLowerCase();
-    const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    const local = hostname === "localhost"
+      || hostname === "127.0.0.1"
+      || hostname === "::1"
+      || hostname === "[::1]";
+    if (local) {
+      if (!allowLocalDevelopment) return null;
+      return url.protocol === "https:" || url.protocol === "http:" ? url.origin : null;
+    }
     if (url.protocol === "https:") return url.origin;
-    if (url.protocol === "http:" && local && allowLocalDevelopment) return url.origin;
     return null;
   } catch {
     return null;
@@ -121,7 +127,10 @@ export const normalizeExtremeWorkerBaseUrl = (
   const origin = normalizeExtremeWorkerOriginSyntax(value, allowLocalDevelopment);
   if (!origin) return null;
   const hostname = new URL(origin).hostname.toLowerCase();
-  const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  const local = hostname === "localhost"
+    || hostname === "127.0.0.1"
+    || hostname === "::1"
+    || hostname === "[::1]";
   if (local && allowLocalDevelopment) return origin;
   return allowedOrigins.includes(origin) ? origin : null;
 };
