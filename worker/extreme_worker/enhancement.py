@@ -92,12 +92,13 @@ def _deficit(value: float | None, caution_at: float, severe_at: float) -> float:
 
 def resolve_rnnoise_candidate_policy(report: Mapping[str, Any]) -> RnnoiseCandidatePolicy:
     speech_fraction = _speech_fraction(report)
-    if speech_fraction < 0.08:
+    if speech_fraction < 0.12:
         return RnnoiseCandidatePolicy(False, "insufficient-speech-support", 0.0, 0.0, speech_fraction)
+    speech_authority = min(1.0, max(0.0, (speech_fraction - 0.12) / 0.18))
     noise_evidence = max(
         _deficit(_metric_value(report, "dnsmos.bak"), 3.65, 2.4),
         _deficit(_metric_value(report, "sigmos.noise"), 3.7, 2.3),
-    )
+    ) * speech_authority
     if noise_evidence < 0.18:
         return RnnoiseCandidatePolicy(False, "source-not-noise-limited", 0.0, noise_evidence, speech_fraction)
     signal_values = tuple(

@@ -189,6 +189,7 @@ import {
   analyzeExtremeSourcesBounded,
   buildPlannerMlProtection,
   compareExtremeQualityMetrics,
+  enhanceExtremeSourcesBounded,
   getExtremeMlSnapshotGraceMs,
 } from "../lib/extremeMlVoPolicy";
 import {
@@ -8110,6 +8111,7 @@ const summarizeFailureReason = (error: unknown) => {
     const nextReviewBundles: PendingReviewBundleEntry[] = [];
     let finalConsonantPassStarted = false;
     let acceptingExtremeMlEvidence = false;
+    let acceptingExtremeMlEnhancements = false;
     let extremeMlAnalysisPromise: Promise<void> | null = null;
     let extremeMlBatchId: string | null = null;
     try {
@@ -8118,6 +8120,7 @@ const summarizeFailureReason = (error: unknown) => {
       let extremeMlEnhancedJobs: JobEntry[] | null = null;
       if (extremeMlEnabled) {
         acceptingExtremeMlEvidence = true;
+        acceptingExtremeMlEnhancements = true;
         const batchId = globalThis.crypto?.randomUUID?.() ?? `batch-${Date.now().toString(36)}`;
         extremeMlBatchId = batchId;
         const enhancementJobs = jobs.map((job, index) => ({
@@ -8131,13 +8134,14 @@ const summarizeFailureReason = (error: unknown) => {
           `[ExtremeML] RNNoise candidate enhancement started for ${enhancementJobs.length} file(s). Successful candidates feed the normal browser pipeline; unavailable candidates keep the original source.`,
         );
         const enhancedFilesByInputName = new Map<string, File>();
-        for (const enhancementJob of enhancementJobs) {
-          try {
-            const outcome = await enhanceSourceWithExtremeWorker({
-              source: enhancementJob.source,
-              contentType: enhancementJob.contentType,
-              idempotencyKey: enhancementJob.idempotencyKey,
-            });
+        const jobsBeforeEnhancement = jobs;
+        const extremeMlEnhancementPromise = enhanceExtremeSourcesBounded({
+          jobs: enhancementJobs,
+          enhance: enhanceSourceWithExtremeWorker,
+          onOutcome: ({ key, outcome }) => {
+            if (!acceptingExtremeMlEnhancements) return;
+            const enhancementJob = enhancementJobs.find((candidate) => candidate.key === key);
+            if (!enhancementJob) return;
             if (outcome.status === "succeeded") {
               const enhancedFile = new File(
                 [outcome.candidate],
@@ -8156,19 +8160,25 @@ const summarizeFailureReason = (error: unknown) => {
                 `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate unavailable (${outcome.reason}); original source stays active.`,
               );
             }
-          } catch {
-            appendLog(
-              `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate unavailable; original source stays active.`,
-            );
-          }
-        }
+          },
+        });
+        await Promise.race([
+          extremeMlEnhancementPromise,
+          new Promise<void>((resolve) =>
+            window.setTimeout(
+              resolve,
+              getExtremeMlSnapshotGraceMs(jobsBeforeEnhancement.map((job) => job.file.size)),
+            ),
+          ),
+        ]);
+        acceptingExtremeMlEnhancements = false;
         if (enhancedFilesByInputName.size > 0) {
-          extremeMlEnhancedJobs = jobs.map((job) => {
+          extremeMlEnhancedJobs = jobsBeforeEnhancement.map((job) => {
             const enhancedFile = enhancedFilesByInputName.get(job.inputName);
             return enhancedFile ? { ...job, file: enhancedFile } : job;
           });
         }
-        const renderJobs = extremeMlEnhancedJobs ?? jobs;
+        const renderJobs = extremeMlEnhancedJobs ?? jobsBeforeEnhancement;
         jobs = renderJobs;
         appendLog(
           `[ExtremeML] Opt-in source analysis started for ${jobs.length} file(s), with at most two direct uploads at once. Evidence is advisory and cannot block delivery.`,
@@ -10208,6 +10218,7 @@ const summarizeFailureReason = (error: unknown) => {
       }
     } finally {
       acceptingExtremeMlEvidence = false;
+      acceptingExtremeMlEnhancements = false;
       processingControlsOverrideRef.current = null;
       aiAdaptiveDirectivesOverrideRef.current = null;
       sourceFirstCandidateVariantRef.current = null;

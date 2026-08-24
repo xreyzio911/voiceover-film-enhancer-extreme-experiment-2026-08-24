@@ -45,13 +45,16 @@ const vadFrames = (probabilities: readonly number[]) =>
 
 test("poor neural source metrics produce bounded cleanup and stability hints", () => {
   const policy = buildExtremeMlSourceQualityPolicy(
-    reportWithMetrics({
-      "dnsmos.bak": { value: 2.35, available: true, higherIsBetter: true },
-      "sigmos.noise": { value: 2.55, available: true, higherIsBetter: true },
-      "sigmos.reverb": { value: 2.4, available: true, higherIsBetter: true },
-      "sigmos.loud": { value: 2.6, available: true, higherIsBetter: true },
-      "sigmos.disc": { value: 2.75, available: true, higherIsBetter: true },
-    }),
+    reportWithMetrics(
+      {
+        "dnsmos.bak": { value: 2.35, available: true, higherIsBetter: true },
+        "sigmos.noise": { value: 2.55, available: true, higherIsBetter: true },
+        "sigmos.reverb": { value: 2.4, available: true, higherIsBetter: true },
+        "sigmos.loud": { value: 2.6, available: true, higherIsBetter: true },
+        "sigmos.disc": { value: 2.75, available: true, higherIsBetter: true },
+      },
+      { vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.9)) } },
+    ),
   );
 
   assert.equal(policy.reason, "ml-source-quality");
@@ -76,13 +79,16 @@ test("poor neural source metrics produce bounded cleanup and stability hints", (
 
 test("moderately poor perceptual noise and room evidence is promoted to a decisive cleanup hint", () => {
   const policy = buildExtremeMlSourceQualityPolicy(
-    reportWithMetrics({
-      "dnsmos.bak": { value: 3.0, available: true, higherIsBetter: true },
-      "sigmos.noise": { value: 3.15, available: true, higherIsBetter: true },
-      "sigmos.reverb": { value: 3.0, available: true, higherIsBetter: true },
-      "sigmos.loud": { value: 3.25, available: true, higherIsBetter: true },
-      "sigmos.disc": { value: 3.35, available: true, higherIsBetter: true },
-    }),
+    reportWithMetrics(
+      {
+        "dnsmos.bak": { value: 3.0, available: true, higherIsBetter: true },
+        "sigmos.noise": { value: 3.15, available: true, higherIsBetter: true },
+        "sigmos.reverb": { value: 3.0, available: true, higherIsBetter: true },
+        "sigmos.loud": { value: 3.25, available: true, higherIsBetter: true },
+        "sigmos.disc": { value: 3.35, available: true, higherIsBetter: true },
+      },
+      { vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.9)) } },
+    ),
   );
 
   assert.equal(policy.reason, "ml-source-quality");
@@ -225,12 +231,18 @@ test("poor speech/signal MOS damps cleanup authority instead of authorizing over
     "sigmos.sig": { value: 1.7, available: true, higherIsBetter: true },
     "sigmos.reverb": { value: 2.3, available: true, higherIsBetter: true },
   } satisfies ExtremeSourceReport["metrics"];
-  const damagedSpeech = buildExtremeMlSourceQualityPolicy(reportWithMetrics(report));
+  const damagedSpeech = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics(report, {
+      vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.9)) },
+    }),
+  );
   const intactSpeech = buildExtremeMlSourceQualityPolicy(
     reportWithMetrics({
       ...report,
       "dnsmos.sig": { value: 3.65, available: true, higherIsBetter: true },
       "sigmos.sig": { value: 3.7, available: true, higherIsBetter: true },
+    }, {
+      vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.9)) },
     }),
   );
 
@@ -279,13 +291,16 @@ test("good, unavailable, or unsafe source reports are ignored", () => {
 
 test("policy clamps hostile metric magnitudes and never exposes worker authority", () => {
   const policy = buildExtremeMlSourceQualityPolicy(
-    reportWithMetrics({
-      "dnsmos.bak": { value: -999 as number, available: true, higherIsBetter: true },
-      "sigmos.noise": { value: 999 as number, available: true, higherIsBetter: true },
-      "sigmos.reverb": { value: 1.0, available: true, higherIsBetter: true },
-      "sigmos.loud": { value: 0.5, available: true, higherIsBetter: true },
-      "sigmos.disc": { value: 0.25, available: true, higherIsBetter: true },
-    }),
+    reportWithMetrics(
+      {
+        "dnsmos.bak": { value: -999 as number, available: true, higherIsBetter: true },
+        "sigmos.noise": { value: 999 as number, available: true, higherIsBetter: true },
+        "sigmos.reverb": { value: 1.0, available: true, higherIsBetter: true },
+        "sigmos.loud": { value: 0.5, available: true, higherIsBetter: true },
+        "sigmos.disc": { value: 0.25, available: true, higherIsBetter: true },
+      },
+      { vad: { frameMs: 10, frames: vadFrames(new Array(100).fill(0.9)) } },
+    ),
   );
 
   assert.equal(policy.reason, "ml-source-quality");

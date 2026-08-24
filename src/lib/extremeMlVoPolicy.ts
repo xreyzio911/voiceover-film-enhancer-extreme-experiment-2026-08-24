@@ -1,5 +1,6 @@
 import type {
   ExtremeAnalysisOutcome,
+  ExtremeEnhancementOutcome,
   ExtremeRenderedAnalysisOutcome,
   ExtremeRenderedReport,
   ExtremeSourceReport,
@@ -66,6 +67,17 @@ type ExtremeMlSourceOutcome = Readonly<{
   outcome: ExtremeAnalysisOutcome;
 }>;
 
+type EnhanceExtremeSource = (input: Readonly<{
+  source: Blob;
+  contentType: string;
+  idempotencyKey: string;
+}>) => Promise<ExtremeEnhancementOutcome>;
+
+type ExtremeMlEnhancementOutcome = Readonly<{
+  key: string;
+  outcome: ExtremeEnhancementOutcome;
+}>;
+
 type AnalyzeExtremeRendered = (input: Readonly<{
   source: Blob;
   contentType: string;
@@ -81,6 +93,9 @@ const unavailableOutcome = (): ExtremeAnalysisOutcome =>
   Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
 
 const unavailableRenderedOutcome = (): ExtremeRenderedAnalysisOutcome =>
+  Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
+
+const unavailableEnhancementOutcome = (): ExtremeEnhancementOutcome =>
   Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
 
 /**
@@ -112,6 +127,42 @@ export const analyzeExtremeSourcesBounded = async ({
       // Never expose thrown provider details because they can contain access
       // tokens or infrastructure metadata.
       outcome = unavailableOutcome();
+    }
+    onOutcome(Object.freeze({ key: job.key, outcome }));
+    await runLane(index + laneCount);
+  };
+
+  await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
+};
+
+/**
+ * Runs optional waveform cleanup candidates through the same bounded lane as
+ * advisory source analysis. Late or failed candidates are ignored by callers,
+ * so enhancement cannot become a serial pre-render gate.
+ */
+export const enhanceExtremeSourcesBounded = async ({
+  jobs,
+  enhance,
+  onOutcome,
+}: Readonly<{
+  jobs: readonly ExtremeMlSourceJob[];
+  enhance: EnhanceExtremeSource;
+  onOutcome: (result: ExtremeMlEnhancementOutcome) => void;
+}>): Promise<void> => {
+  const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
+
+  const runLane = async (index: number): Promise<void> => {
+    if (index >= jobs.length) return;
+    const job = jobs[index];
+    let outcome: ExtremeEnhancementOutcome;
+    try {
+      outcome = await enhance({
+        source: job.source,
+        contentType: job.contentType,
+        idempotencyKey: job.idempotencyKey,
+      });
+    } catch {
+      outcome = unavailableEnhancementOutcome();
     }
     onOutcome(Object.freeze({ key: job.key, outcome }));
     await runLane(index + laneCount);
