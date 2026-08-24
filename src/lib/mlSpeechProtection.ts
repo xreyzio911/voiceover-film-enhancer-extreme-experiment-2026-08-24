@@ -11,6 +11,8 @@ export type MlSpeechProtectionInput = Readonly<{
   vadFrames?: readonly MlVadFrame[];
   speechProbabilityThreshold?: number;
   maxAttachedIslandMs?: number;
+  maxGapBridgeMs?: number;
+  oneSidedSpeechProbabilityThreshold?: number;
 }>;
 
 export type MlSpeechProtectionResult = Readonly<{
@@ -22,8 +24,10 @@ export type MlSpeechProtectionResult = Readonly<{
   reason: "ml-protection" | "legacy-fallback";
 }>;
 
-const DEFAULT_SPEECH_PROBABILITY_THRESHOLD = 0.65;
-const DEFAULT_MAX_ATTACHED_ISLAND_MS = 120;
+const DEFAULT_SPEECH_PROBABILITY_THRESHOLD = 0.58;
+const DEFAULT_ONE_SIDED_SPEECH_PROBABILITY_THRESHOLD = 0.72;
+const DEFAULT_MAX_ONE_SIDED_ISLAND_MS = 160;
+const DEFAULT_MAX_GAP_BRIDGE_MS = 260;
 
 const isValidInputShape = (input: MlSpeechProtectionInput) =>
   Number.isInteger(input.frameCount) &&
@@ -52,6 +56,11 @@ export const buildMlSpeechProtectionMask = (
   const probabilityThreshold = Number.isFinite(input.speechProbabilityThreshold)
     ? Math.min(0.99, Math.max(0.01, input.speechProbabilityThreshold as number))
     : DEFAULT_SPEECH_PROBABILITY_THRESHOLD;
+  const oneSidedProbabilityThreshold = Number.isFinite(
+    input.oneSidedSpeechProbabilityThreshold,
+  )
+    ? Math.min(0.99, Math.max(probabilityThreshold, input.oneSidedSpeechProbabilityThreshold as number))
+    : DEFAULT_ONE_SIDED_SPEECH_PROBABILITY_THRESHOLD;
   if (!isValidInputShape(input)) return legacyResult(input, probabilityThreshold);
   if (!input.vadFrames || input.vadFrames.length !== input.frameCount) {
     return legacyResult(input, probabilityThreshold);
@@ -72,9 +81,15 @@ export const buildMlSpeechProtectionMask = (
   if (vadSpeech.length !== input.frameCount) return legacyResult(input, probabilityThreshold);
 
   const protectedSpeechMask = [...input.energySpeechMask];
-  const maxAttachedFrames = Math.max(
+  const maxOneSidedFrames = Math.max(
     1,
-    Math.round((input.maxAttachedIslandMs ?? DEFAULT_MAX_ATTACHED_ISLAND_MS) / input.frameMs),
+    Math.round(
+      (input.maxAttachedIslandMs ?? DEFAULT_MAX_ONE_SIDED_ISLAND_MS) / input.frameMs,
+    ),
+  );
+  const maxGapBridgeFrames = Math.max(
+    maxOneSidedFrames,
+    Math.round((input.maxGapBridgeMs ?? DEFAULT_MAX_GAP_BRIDGE_MS) / input.frameMs),
   );
   let addedFrameCount = 0;
   let isolatedMlFrameCount = 0;
@@ -96,8 +111,16 @@ export const buildMlSpeechProtectionMask = (
 
     const touchesPreviousEnergy = startFrame > 0 && input.energySpeechMask[startFrame - 1];
     const touchesNextEnergy = endFrame < input.frameCount && input.energySpeechMask[endFrame];
-    const attachedToEnergySpeech =
-      (touchesPreviousEnergy || touchesNextEnergy) && endFrame - startFrame <= maxAttachedFrames;
+    const bridgesEnergySpeech = touchesPreviousEnergy && touchesNextEnergy;
+    const islandFrameCount = endFrame - startFrame;
+    const allFramesMeetOneSidedConfidence = input.vadFrames
+      .slice(startFrame, endFrame)
+      .every((frame) => frame.speechProbability >= oneSidedProbabilityThreshold);
+    const attachedToEnergySpeech = bridgesEnergySpeech
+      ? islandFrameCount <= maxGapBridgeFrames
+      : (touchesPreviousEnergy || touchesNextEnergy) &&
+        islandFrameCount <= maxOneSidedFrames &&
+        allFramesMeetOneSidedConfidence;
 
     if (attachedToEnergySpeech) {
       for (let frame = startFrame; frame < endFrame; frame += 1) {
