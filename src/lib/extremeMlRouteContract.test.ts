@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const routePath = resolve(ROOT, "src/app/api/extreme-ml/ticket/route.ts");
+const envExamplePath = resolve(ROOT, ".env.example");
 
 test("Extreme ML ticket route authenticates metadata-only direct-to-Render uploads", () => {
   assert.equal(existsSync(routePath), true);
@@ -31,4 +32,20 @@ test("Extreme ML ticket route authenticates metadata-only direct-to-Render uploa
   assert.doesNotMatch(source, /request\.body/);
   assert.doesNotMatch(source, /x-forwarded-for/);
   assert.doesNotMatch(source, /x-forwarded-host/);
+});
+
+test("Extreme worker config documents one exact HTTPS origin for server and browser trust", () => {
+  const values = Object.fromEntries(
+    readFileSync(envExamplePath, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line && !line.startsWith("#"))
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+  const workerUrl = values.EXTREME_ML_WORKER_URL;
+  assert.match(workerUrl, /^https:\/\//);
+  assert.equal(values.EXTREME_ML_ALLOWED_WORKER_ORIGINS, workerUrl);
+  assert.equal(values.NEXT_PUBLIC_EXTREME_ML_ALLOWED_WORKER_ORIGINS, workerUrl);
 });

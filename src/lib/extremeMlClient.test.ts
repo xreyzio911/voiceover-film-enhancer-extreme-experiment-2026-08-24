@@ -75,6 +75,23 @@ test("worker URL accepts only an exact configured HTTPS origin or explicit local
     normalizeExtremeWorkerBaseUrl("http://127.0.0.1:8787/", [], false),
     null,
   );
+  for (const loopback of [
+    "https://localhost:8787",
+    "https://127.0.0.1:8787",
+    "https://[::1]:8787",
+  ]) {
+    const loopbackOrigin = new URL(loopback).origin;
+    assert.equal(
+      normalizeExtremeWorkerBaseUrl(loopback, [loopbackOrigin], false),
+      null,
+      `production loopback must remain denied: ${loopback}`,
+    );
+    assert.equal(
+      normalizeExtremeWorkerBaseUrl(loopback, [], true),
+      loopbackOrigin,
+      `development loopback should remain available: ${loopback}`,
+    );
+  }
   for (const value of [
     "http://extreme-worker.onrender.com",
     "https://user:password@example.com",
