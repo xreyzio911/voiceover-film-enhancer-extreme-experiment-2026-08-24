@@ -87,6 +87,59 @@ test("moderately poor perceptual noise and room evidence is promoted to a decisi
   assert.ok(policy.plannerMaxGainPenaltyDb >= 0.55);
 });
 
+test("optional naturalness and overall MOS widen cleanup when artifact scores are incomplete", () => {
+  const policy = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics({
+      "dnsmos.ovrl": { value: 2.7, available: true, higherIsBetter: true },
+      "dnsmos.sig": { value: 3.55, available: true, higherIsBetter: true },
+      "dnsmos_p808": { value: 2.85, available: true, higherIsBetter: true },
+      "sigmos.ovrl": { value: 2.8, available: true, higherIsBetter: true },
+      "sigmos.sig": { value: 3.6, available: true, higherIsBetter: true },
+      "utmos": { value: 2.9, available: true, higherIsBetter: true },
+    }),
+  );
+
+  assert.equal(policy.reason, "ml-source-quality");
+  assert.equal(policy.noiseRiskFloor, "medium");
+  assert.equal(policy.roomRiskFloor, null);
+  assert.ok(policy.pauseNoiseRiskFloor >= 0.4);
+  assert.ok(policy.denoiseBias >= 0.12);
+  assert.ok(policy.plannerMaxGainPenaltyDb >= 0.35);
+  assert.deepEqual(policy.usedMetricKeys, [
+    "dnsmos.ovrl",
+    "dnsmos.sig",
+    "dnsmos_p808",
+    "sigmos.ovrl",
+    "sigmos.sig",
+    "utmos",
+  ]);
+});
+
+test("poor speech/signal MOS damps cleanup authority instead of authorizing overprocessing", () => {
+  const report = {
+    "dnsmos.bak": { value: 2.35, available: true, higherIsBetter: true },
+    "dnsmos.sig": { value: 1.65, available: true, higherIsBetter: true },
+    "sigmos.noise": { value: 2.4, available: true, higherIsBetter: true },
+    "sigmos.sig": { value: 1.7, available: true, higherIsBetter: true },
+    "sigmos.reverb": { value: 2.3, available: true, higherIsBetter: true },
+  } satisfies ExtremeSourceReport["metrics"];
+  const damagedSpeech = buildExtremeMlSourceQualityPolicy(reportWithMetrics(report));
+  const intactSpeech = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics({
+      ...report,
+      "dnsmos.sig": { value: 3.65, available: true, higherIsBetter: true },
+      "sigmos.sig": { value: 3.7, available: true, higherIsBetter: true },
+    }),
+  );
+
+  assert.equal(damagedSpeech.reason, "ml-source-quality");
+  assert.equal(intactSpeech.reason, "ml-source-quality");
+  assert.ok(damagedSpeech.denoiseBias < intactSpeech.denoiseBias);
+  assert.ok(damagedSpeech.roomCleanupBias < intactSpeech.roomCleanupBias);
+  assert.ok(damagedSpeech.instabilityHintBoost < intactSpeech.instabilityHintBoost);
+  assert.ok(damagedSpeech.plannerMaxGainPenaltyDb >= intactSpeech.plannerMaxGainPenaltyDb);
+});
+
 test("good, unavailable, or unsafe source reports are ignored", () => {
   const good = buildExtremeMlSourceQualityPolicy(
     reportWithMetrics({
