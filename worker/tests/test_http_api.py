@@ -745,6 +745,39 @@ class WorkerHttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(status.status_code, 404)
 
+    def test_ticket_replay_maintenance_uses_ttl_plus_safety_margin(self) -> None:
+        maintain_replays, safety_seconds = require_symbols(
+            self,
+            "extreme_worker.app",
+            "_prune_expired_ticket_replays",
+            "_TICKET_REPLAY_RETENTION_SAFETY_SECONDS",
+        )
+        replay_store_type, replay_error = require_symbols(
+            self,
+            "extreme_worker.security",
+            "SQLiteReplayStore",
+            "TicketReplayError",
+        )
+        replay_store = replay_store_type(self.storage_root / "tickets.sqlite3")
+        cutoff = self.clock() - (self.app.state.ticket_ttl_seconds + safety_seconds)
+        old_nonce = "old-maintenance-nonce-0001"
+        recent_nonce = "recent-maintenance-nonce-0002"
+        with closing(sqlite3.connect(self.storage_root / "tickets.sqlite3")) as connection, connection:
+            connection.executemany(
+                "INSERT INTO consumed_ticket_nonces(nonce_sha256, consumed_at) VALUES (?, ?)",
+                (
+                    (hashlib.sha256(old_nonce.encode("utf-8")).hexdigest(), cutoff - 0.001),
+                    (hashlib.sha256(recent_nonce.encode("utf-8")).hexdigest(), cutoff),
+                ),
+            )
+
+        deleted = maintain_replays(self.app, now=self.clock())
+
+        self.assertEqual(deleted, 1)
+        replay_store.consume(old_nonce)
+        with self.assertRaises(replay_error):
+            replay_store.consume(recent_nonce)
+
     def test_stale_maintenance_cleans_exact_artifacts_but_preserves_active_lease(self) -> None:
         expire_stale_jobs, = require_symbols(self, "extreme_worker.app", "_expire_stale_jobs")
         JobState, = require_symbols(self, "extreme_worker.job_store", "JobState")

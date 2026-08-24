@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import sqlite3
+import tempfile
 import unittest
+from contextlib import closing
+from pathlib import Path
 
 from contract_support import MutableClock, require_symbols
 
@@ -115,6 +120,64 @@ class UploadTicketContractTests(unittest.TestCase):
             authority.verify_and_consume(token, expected_scope=download_scope, observed_bytes=10)
 
 
+class SQLiteReplayStoreRetentionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.temp_dir.name) / "tickets.sqlite3"
+        self.store_type, self.replay_error = require_symbols(
+            self,
+            "extreme_worker.security",
+            "SQLiteReplayStore",
+            "TicketReplayError",
+        )
+        self.store = self.store_type(self.database_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _insert(self, nonce: str, *, consumed_at: float) -> None:
+        digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO consumed_ticket_nonces(nonce_sha256, consumed_at) VALUES (?, ?)",
+                (digest, consumed_at),
+            )
+
+    def _contains(self, nonce: str) -> bool:
+        digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM consumed_ticket_nonces WHERE nonce_sha256 = ?",
+                (digest,),
+            ).fetchone()
+        return row is not None
+
+    def test_prune_before_removes_only_rows_strictly_older_than_cutoff(self) -> None:
+        cutoff = 1_800_000_000.0
+        self._insert("old-nonce-value-0001", consumed_at=cutoff - 0.001)
+        self._insert("boundary-nonce-0002", consumed_at=cutoff)
+        self._insert("recent-nonce-value-0003", consumed_at=cutoff + 0.001)
+
+        deleted = self.store.prune_before(cutoff)
+
+        self.assertEqual(deleted, 1)
+        self.assertFalse(self._contains("old-nonce-value-0001"))
+        self.assertTrue(self._contains("boundary-nonce-0002"))
+        self.assertTrue(self._contains("recent-nonce-value-0003"))
+
+    def test_pruning_expired_row_preserves_recent_nonce_replay_protection(self) -> None:
+        cutoff = 1_800_000_000.0
+        old_nonce = "old-nonce-value-0004"
+        recent_nonce = "recent-nonce-value-0005"
+        self._insert(old_nonce, consumed_at=cutoff - 1.0)
+        self._insert(recent_nonce, consumed_at=cutoff + 1.0)
+
+        self.assertEqual(self.store.prune_before(cutoff), 1)
+
+        self.store.consume(old_nonce)
+        with self.assertRaises(self.replay_error):
+            self.store.consume(recent_nonce)
+
+
 if __name__ == "__main__":
     unittest.main()
-
