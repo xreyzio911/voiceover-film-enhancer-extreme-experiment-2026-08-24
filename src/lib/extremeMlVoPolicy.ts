@@ -10,9 +10,10 @@ export const EXTREME_ML_MAX_CONCURRENT_ANALYSES = 2;
 export const EXTREME_ML_MIN_SNAPSHOT_GRACE_MS = 1_500;
 export const EXTREME_ML_MAX_SNAPSHOT_GRACE_MS = 30_000;
 
-// Measured production source and rendered jobs used the full five-second
-// POST-to-report boundary; this bounded margin absorbs polling overhead.
-const EXTREME_ML_SNAPSHOT_BASE_MS = 8_000;
+// A production source job reached its report about eight seconds after the
+// ticket request. Keep four seconds of bounded headroom so the final one-second
+// status poll and report normalization cannot race the snapshot cutoff.
+const EXTREME_ML_SNAPSHOT_BASE_MS = 12_000;
 const EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND = 8 * 1024 * 1024;
 
 /**
