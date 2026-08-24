@@ -620,6 +620,134 @@ describe("gainPlanner", () => {
     assert.ok(bodyGainDb < -1, `raw-hot body should receive a residual cut, got ${bodyGainDb.toFixed(2)} dB`);
   });
 
+  it("lets perceptual stability risk materially tame an eligible borderline-hot body run", () => {
+    const frameDb = new Array<number>(180).fill(-78);
+    const loudnessFrameDb = new Array<number>(180).fill(-78);
+    const run = { startFrame: 20, endFrame: 150 };
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      frameDb[frame] = -19.4;
+      loudnessFrameDb[frame] = -22;
+    }
+    const plan = (perceptualStabilityRisk?: number) =>
+      planGainCurve({
+        frameDb,
+        loudnessFrameDb,
+        speechRuns: [run],
+        noiseFloorDb: -78,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.05,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        instabilityHint: 1,
+        speechSpikeTaming: 0.8,
+        ...(perceptualStabilityRisk === undefined ? {} : { perceptualStabilityRisk }),
+      });
+
+    const fallback = plan();
+    const explicitZero = plan(0);
+    const learned = plan(0.66);
+    const hostileMagnitude = plan(999);
+    const fallbackGainDb = gainDbAtFrame(fallback.gainCurve, 80);
+    const learnedGainDb = gainDbAtFrame(learned.gainCurve, 80);
+
+    assert.deepEqual(
+      Array.from(explicitZero.gainCurve),
+      Array.from(fallback.gainCurve),
+      "missing and zero perceptual risk must keep the exact deterministic plan",
+    );
+    assert.equal(fallback.sustainedLoudClusterCount, 0);
+    assert.equal(learned.sustainedLoudClusterCount, 1);
+    assert.ok(
+      fallbackGainDb - learnedGainDb >= 0.35,
+      `learned risk should add a material uniform correction, fallback ${fallbackGainDb.toFixed(3)} vs learned ${learnedGainDb.toFixed(3)} dB`,
+    );
+    assert.ok(
+      fallbackGainDb - learnedGainDb <= 1.4,
+      `moderate authority should stay bounded, got ${(fallbackGainDb - learnedGainDb).toFixed(3)} dB`,
+    );
+    assert.ok(
+      hostileMagnitude.sustainedLoudMaxReductionDb <= 5,
+      `hostile risk magnitudes must retain the planner's 5 dB cap, got ${hostileMagnitude.sustainedLoudMaxReductionDb.toFixed(3)} dB`,
+    );
+
+    const severeFrameDb = new Array<number>(180).fill(-78);
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      severeFrameDb[frame] = -17.5;
+    }
+    const severe = planGainCurve({
+      frameDb: severeFrameDb,
+      loudnessFrameDb,
+      speechRuns: [run],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 1,
+      speechSpikeTaming: 0.8,
+      perceptualStabilityRisk: 0.66,
+    });
+    assert.ok(
+      severe.sustainedLoudMaxReductionDb >= 2.9,
+      `moderate evidence should spend at least 2.9 dB on a severe ordinary residual, got ${severe.sustainedLoudMaxReductionDb.toFixed(3)} dB`,
+    );
+    assert.ok(
+      severe.sustainedLoudMaxReductionDb <= 4,
+      `the severe learned correction must remain below the planner cap, got ${severe.sustainedLoudMaxReductionDb.toFixed(3)} dB`,
+    );
+  });
+
+  it("does not change a transient onomatopoeic run when perceptual stability risk rises", () => {
+    const totalFrames = 820;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const speechRuns = [
+      { startFrame: 20, endFrame: 100 },
+      { startFrame: 150, endFrame: 230 },
+      { startFrame: 280, endFrame: 360 },
+      { startFrame: 420, endFrame: 450 },
+      { startFrame: 520, endFrame: 600 },
+    ];
+    const levelsDb = [-24, -30, -19, -10, -27];
+    speechRuns.forEach((speechRun, index) => {
+      for (let frame = speechRun.startFrame; frame < speechRun.endFrame; frame += 1) {
+        frameDb[frame] = levelsDb[index];
+      }
+    });
+    const plan = (perceptualStabilityRisk: number) =>
+      planGainCurve({
+        frameDb,
+        loudnessFrameDb: [...frameDb],
+        speechBodyFrameDb: [...frameDb],
+        speechRuns,
+        noiseFloorDb: -82,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.1,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        instabilityHint: 0.98,
+        levelingConsistency: 0.35,
+        perceptualStabilityRisk,
+      });
+    const fallback = plan(0);
+    const learned = plan(1);
+    const transientIndex = learned.runs.findIndex((plannedRun) => plannedRun.runClass === "transient-breath");
+
+    assert.ok(transientIndex >= 0, "fixture must classify the short hot performance as transient");
+    assert.equal(
+      learned.runs[transientIndex].plannedGainDb,
+      fallback.runs[transientIndex].plannedGainDb,
+    );
+    assert.ok(
+      Math.abs(
+        gainDbAtFrame(learned.gainCurve, 435) - gainDbAtFrame(fallback.gainCurve, 435),
+      ) < 0.001,
+      "learned stability evidence must not change the onomatopoeic transient gain",
+    );
+  });
+
   it("adds a bounded floor lift when high-crest body speech is raw-quiet and perceptually under target", () => {
     const frameDb = new Array<number>(180).fill(-78);
     const loudnessFrameDb = new Array<number>(180).fill(-78);

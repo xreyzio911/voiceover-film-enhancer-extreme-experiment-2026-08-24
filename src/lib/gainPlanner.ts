@@ -89,6 +89,12 @@ export type GainPlannerInput = {
    */
   speechSpikeTaming?: number;
   /**
+   * 0..1 learned perceptual risk for unstable loudness or discontinuity.
+   * This is evidence, not gain authority: the planner may use it only for
+   * bounded, performance-protected body-speech residual correction.
+   */
+  perceptualStabilityRisk?: number;
+  /**
    * 0..1 authority for equalizing normal body-speech runs. Lower values
    * retain more source line-to-line contrast; very quiet speech continuously
    * earns back enough authority for audibility. Defaults to 1.
@@ -1982,6 +1988,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const maxGainDb = input.maxGainDb ?? 14;
   const minGainDb = input.minGainDb ?? -14;
   const instabilityHint = clamp(input.instabilityHint ?? 0.5, 0, 1);
+  const perceptualStabilityRisk = clamp(input.perceptualStabilityRisk ?? 0, 0, 1);
   const selectedLevelingConsistency = Number.isFinite(input.levelingConsistency)
     ? clamp(input.levelingConsistency as number, 0, 1)
     : 1;
@@ -3181,10 +3188,12 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // post-clamp residual loudness per-run and applies a uniform
   // additional attenuation (with cosine fade at run edges).
   //
-  // Only triggers when:
-  //   - body-speech run (transient-breath has its own asymmetric clamp)
-  //   - applied body exceeds target by ≥ 3 dB after planning
-  //   - speechSpikeTaming ≥ 0.3 (always true under the raised floor)
+  // The deterministic path remains byte-identical when perceptual risk is
+  // absent. Learned loudness/discontinuity evidence adds a continuous
+  // correction from 2..3 dB residual only for ordinary body speech. The
+  // existing performance authority is squared into protection so sustained
+  // expressive delivery is not treated like an ordinary level mismatch;
+  // transient-breath/onomatopoeic runs remain outside this pass entirely.
   //
   // Capped at 5 dB to stay subtle. Goal is "sit with dialogue", not
   // "duck below".
@@ -3198,10 +3207,27 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       const plannedGain = plannedRunGainDb[r] ?? 0;
       const appliedBodyDb = meta.meanDb + plannedGain;
       const residualOverDb = appliedBodyDb - targetDb;
-      if (residualOverDb < 3) continue;
-      // Scale: residual 3 dB → ~0.7 dB cut, residual 10 dB → ~4.7 dB cut.
+      const deterministicReductionDb =
+        residualOverDb >= 3
+          ? (residualOverDb - 1.5) * (0.55 + speechSpikeTaming * 0.2)
+          : 0;
+      const ordinaryBodyAuthority = (1 - (bodyPerformanceAuthority[r] ?? 0)) ** 2;
+      const learnedResidualAuthority = smoothUnitRamp(residualOverDb, 2, 3);
+      const learnedReductionScaleDb = clamp(
+        0.9 + Math.max(0, residualOverDb - 2.5) * 0.22,
+        0,
+        1.5,
+      );
+      const learnedReductionDb =
+        perceptualStabilityRisk *
+        ordinaryBodyAuthority *
+        learnedResidualAuthority *
+        learnedReductionScaleDb;
+      // The legacy correction plus the planner-owned learned advisory remain
+      // capped together at 5 dB. Goal: sit ordinary hot lines with dialogue,
+      // not erase performance contrast.
       const reductionDb = clamp(
-        (residualOverDb - 1.5) * (0.55 + speechSpikeTaming * 0.2),
+        deterministicReductionDb + learnedReductionDb,
         0,
         5,
       );

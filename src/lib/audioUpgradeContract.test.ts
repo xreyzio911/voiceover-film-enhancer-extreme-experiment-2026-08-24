@@ -617,6 +617,8 @@ test("learned discontinuity evidence reaches gainPlanner-owned spike taming", ()
   );
   assert.match(plannerBlock, /const speechSpikeTaming = clamp\([\s\S]*?mlSpeechSpikeTamingBoost/);
   assert.match(plannerBlock, /speechSpikeTaming,/);
+  assert.match(plannerBlock, /const perceptualStabilityRisk =/);
+  assert.match(plannerBlock, /perceptualStabilityRisk,/);
 });
 
 test("distributed speech spectra retain recurring event authority without a binary engagement gate", () => {

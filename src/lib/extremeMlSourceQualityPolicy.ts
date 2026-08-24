@@ -14,6 +14,8 @@ export type ExtremeMlSourceQualityPolicy = Readonly<{
   roomCleanupBias: number;
   instabilityHintBoost: number;
   speechSpikeTamingBoost: number;
+  /** 0..1 learned loudness/discontinuity risk; gainPlanner alone decides any dB movement. */
+  perceptualStabilityRisk: number;
   plannerMaxGainPenaltyDb: number;
   usedMetricKeys: readonly string[];
 }>;
@@ -31,6 +33,7 @@ const fallbackPolicy = (): ExtremeMlSourceQualityPolicy =>
     roomCleanupBias: 0,
     instabilityHintBoost: 0,
     speechSpikeTamingBoost: 0,
+    perceptualStabilityRisk: 0,
     plannerMaxGainPenaltyDb: 0,
     usedMetricKeys: Object.freeze([]),
   });
@@ -88,6 +91,15 @@ const speechCoverageAuthority = (report: ExtremeSourceReport) => {
   return clamp((speechFrames / frames.length - 0.08) / 0.22, 0, 1);
 };
 
+const speechDurationAuthority = (report: ExtremeSourceReport) => {
+  const speechFrames = report.vad.frames.reduce(
+    (count, frame) => count + (frame.speechProbability >= 0.5 ? 1 : 0),
+    0,
+  );
+  const speechSeconds = speechFrames * report.vad.frameMs / 1_000;
+  return clamp((speechSeconds - 2) / 8, 0, 1);
+};
+
 export const buildExtremeMlSourceQualityPolicy = (
   report: ExtremeSourceReport | null | undefined,
 ): ExtremeMlSourceQualityPolicy => {
@@ -105,18 +117,22 @@ export const buildExtremeMlSourceQualityPolicy = (
   const sigmosLoud = metricValue(report, "sigmos.loud", usedMetricKeys);
   const sigmosDiscontinuity = metricValue(report, "sigmos.disc", usedMetricKeys);
   const utmos = metricValue(report, "utmos", usedMetricKeys);
-  const speechAuthority = speechCoverageAuthority(report);
+  const cleanupSpeechAuthority = speechCoverageAuthority(report);
+  const stabilitySpeechAuthority = Math.max(
+    cleanupSpeechAuthority,
+    speechDurationAuthority(report),
+  );
 
   const broadQualityEvidence = Math.max(
     deficit(dnsmosOverall, 3.55, 2.25),
     deficit(dnsmosP808, 3.65, 2.45),
     deficit(sigmosOverall, 3.55, 2.2),
     deficit(utmos, 3.55, 2.35),
-  ) * speechAuthority;
+  ) * stabilitySpeechAuthority;
   const speechFragilityEvidence = Math.max(
     deficit(dnsmosSignal, 3.25, 1.85),
     deficit(sigmosSignal, 3.25, 1.85),
-  ) * speechAuthority;
+  ) * stabilitySpeechAuthority;
   const cleanupConfidence = clamp(1 - speechFragilityEvidence * 0.38, 0.62, 1);
   const rawNoiseEvidence = Math.max(
     deficit(dnsmosBackground, 3.55, 2.15),
@@ -128,9 +144,9 @@ export const buildExtremeMlSourceQualityPolicy = (
     deficit(sigmosDiscontinuity, 3.5, 2.2),
     broadQualityEvidence * 0.58,
   );
-  const noiseEvidence = rawNoiseEvidence * cleanupConfidence * speechAuthority;
-  const roomEvidence = rawRoomEvidence * cleanupConfidence * speechAuthority;
-  const stabilityEvidence = rawStabilityEvidence * cleanupConfidence * speechAuthority;
+  const noiseEvidence = rawNoiseEvidence * cleanupConfidence * cleanupSpeechAuthority;
+  const roomEvidence = rawRoomEvidence * cleanupConfidence * cleanupSpeechAuthority;
+  const stabilityEvidence = rawStabilityEvidence * cleanupConfidence * stabilitySpeechAuthority;
   const strongestEvidence = Math.max(
     noiseEvidence,
     roomEvidence,
@@ -155,6 +171,7 @@ export const buildExtremeMlSourceQualityPolicy = (
     roomCleanupBias: clamp(roomEvidence * 0.5, 0, 0.42),
     instabilityHintBoost: clamp(stabilityEvidence * 0.18 + roomEvidence * 0.06, 0, 0.24),
     speechSpikeTamingBoost: clamp(stabilityEvidence * 0.14, 0, 0.16),
+    perceptualStabilityRisk: clamp(stabilityEvidence, 0, 1),
     plannerMaxGainPenaltyDb: clamp(
       noiseEvidence * 1.05 +
         roomEvidence * 0.55 +

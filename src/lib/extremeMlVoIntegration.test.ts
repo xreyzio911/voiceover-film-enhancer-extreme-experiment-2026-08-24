@@ -368,8 +368,11 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
   assert.match(source, /buildPlannerMlProtection\(/);
   assert.match(source, /protectedSpeechFrameMask:\s*mlProtection\.protectedSpeechFrameMask \?\? undefined/);
   assert.match(source, /speechSpikeTamingBoost: mlSourceQualityPolicy\.speechSpikeTamingBoost/);
+  assert.match(source, /perceptualStabilityRisk: mlSourceQualityPolicy\.perceptualStabilityRisk/);
   assert.match(source, /const mlSpeechSpikeTamingBoost =\s+profile\?\.speechSpikeTamingBoost \?\? mlSourceQualityPolicy\.speechSpikeTamingBoost/);
+  assert.match(source, /const perceptualStabilityRisk =\s+profile\?\.perceptualStabilityRisk \?\? mlSourceQualityPolicy\.perceptualStabilityRisk/);
   assert.match(source, /\+\s+mlSpeechSpikeTamingBoost/);
+  assert.match(source, /perceptualStabilityRisk,/);
   assert.doesNotMatch(source, /profile\?\.speechSpikeTamingBoost[\s\S]{0,160}\+\s+mlSourceQualityPolicy\.speechSpikeTamingBoost/);
   assert.match(
     source,

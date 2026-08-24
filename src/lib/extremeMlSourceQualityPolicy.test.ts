@@ -191,6 +191,7 @@ test("broad MOS-only evidence is ignored when VAD shows a silence-heavy editoria
   assert.equal(policy.noiseRiskFloor, null);
   assert.equal(policy.denoiseBias, 0);
   assert.equal(policy.roomCleanupBias, 0);
+  assert.equal(policy.perceptualStabilityRisk, 0);
   assert.equal(policy.plannerMaxGainPenaltyDb, 0);
 });
 
@@ -221,6 +222,47 @@ test("noise and room MOS cannot authorize cleanup on a silence-heavy editorial t
   assert.equal(policy.denoiseBias, 0);
   assert.equal(policy.roomCleanupBias, 0);
   assert.equal(policy.plannerMaxGainPenaltyDb, 0);
+});
+
+test("long sparse timelines can use speech-window stability evidence without authorizing cleanup", () => {
+  const policy = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics(
+      {
+        "dnsmos.bak": { value: 3.87, available: true, higherIsBetter: true },
+        "dnsmos.sig": { value: 3.35, available: true, higherIsBetter: true },
+        "sigmos.noise": { value: 3.97, available: true, higherIsBetter: true },
+        "sigmos.sig": { value: 3.4, available: true, higherIsBetter: true },
+        "sigmos.reverb": { value: 4.11, available: true, higherIsBetter: true },
+        "sigmos.loud": { value: 2.63, available: true, higherIsBetter: true },
+        "sigmos.disc": { value: 3.2, available: true, higherIsBetter: true },
+      },
+      {
+        source: {
+          sha256: SHA256,
+          durationMs: 500_000,
+          sampleRate: 48_000,
+          channels: 1,
+        },
+        vad: {
+          frameMs: 10,
+          frames: vadFrames([
+            ...new Array(1_500).fill(0.9),
+            ...new Array(48_500).fill(0.02),
+          ]),
+        },
+      },
+    ),
+  );
+
+  assert.equal(policy.reason, "ml-source-quality");
+  assert.equal(policy.noiseRiskFloor, null);
+  assert.equal(policy.roomRiskFloor, null);
+  assert.equal(policy.pauseNoiseRiskFloor, 0);
+  assert.equal(policy.denoiseBias, 0);
+  assert.equal(policy.roomCleanupBias, 0);
+  assert.ok(policy.instabilityHintBoost >= 0.12);
+  assert.ok(policy.speechSpikeTamingBoost >= 0.09);
+  assert.ok(policy.perceptualStabilityRisk >= 0.6);
 });
 
 test("poor speech/signal MOS damps cleanup authority instead of authorizing overprocessing", () => {
@@ -284,6 +326,7 @@ test("good, unavailable, or unsafe source reports are ignored", () => {
     assert.equal(policy.roomRiskFloor, null);
     assert.equal(policy.denoiseBias, 0);
     assert.equal(policy.roomCleanupBias, 0);
+    assert.equal(policy.perceptualStabilityRisk, 0);
     assert.equal(policy.plannerMaxGainPenaltyDb, 0);
     assert.deepEqual(policy.usedMetricKeys, []);
   }
@@ -309,4 +352,5 @@ test("policy clamps hostile metric magnitudes and never exposes worker authority
   assert.equal(policy.plannerMaxGainPenaltyDb <= 1.5, true);
   assert.equal(policy.denoiseBias <= 0.4, true);
   assert.equal(policy.roomCleanupBias <= 0.42, true);
+  assert.equal(policy.perceptualStabilityRisk <= 1, true);
 });

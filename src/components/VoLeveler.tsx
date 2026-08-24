@@ -687,6 +687,7 @@ type AdaptiveProfile = {
   echoScore: number;
   instabilityScore: number;
   speechSpikeTamingBoost: number;
+  perceptualStabilityRisk: number;
   clickScore: number;
   clickTameStrength: number;
   lineSwingScore: number;
@@ -2141,6 +2142,8 @@ const summarizeFailureReason = (error: unknown) => {
       );
       const mlSpeechSpikeTamingBoost =
         profile?.speechSpikeTamingBoost ?? mlSourceQualityPolicy.speechSpikeTamingBoost;
+      const perceptualStabilityRisk =
+        profile?.perceptualStabilityRisk ?? mlSourceQualityPolicy.perceptualStabilityRisk;
       const speechSpikeTaming = clamp(
         instabilityHint * 0.35 +
           (profile?.lineSwingScore ?? analysis?.lineSwingScore ?? 0) * 0.35 +
@@ -2217,6 +2220,7 @@ const summarizeFailureReason = (error: unknown) => {
         peakCeilingDb: -3,
         instabilityHint,
         speechSpikeTaming,
+        perceptualStabilityRisk,
       });
       const sourceConsonantReference = buildRenderedConsonantReference(
         samples,
@@ -4053,6 +4057,7 @@ const summarizeFailureReason = (error: unknown) => {
       echoScore,
       instabilityScore,
       speechSpikeTamingBoost: mlSourceQualityPolicy.speechSpikeTamingBoost,
+      perceptualStabilityRisk: mlSourceQualityPolicy.perceptualStabilityRisk,
       clickScore,
       clickTameStrength,
       lineSwingScore,
