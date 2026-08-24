@@ -58,6 +58,7 @@ _AUDIO_TYPES = frozenset({"audio/wav", "audio/x-wav"})
 _UPLOAD_TYPES = frozenset({"audio/wav", "audio/x-wav", "application/offset+octet-stream"})
 _ANALYSIS_SCOPES = frozenset({"source_analysis", "render_analysis"})
 _LOGGER = logging.getLogger("extreme_worker")
+_TICKET_MAX_TTL_SECONDS = 300
 _TICKET_REPLAY_RETENTION_SAFETY_SECONDS = 60.0
 
 
@@ -137,7 +138,7 @@ class _EmbeddedProcessor:
                         stale_job_seconds=self.stale_job_seconds,
                     )
                     _purge_expired_jobs(self.app, retention_seconds=self.retention_seconds)
-                    _prune_expired_ticket_replays(self.app, now=now)
+                    _maybe_prune_expired_ticket_replays(self.app, now=now)
                     self.next_maintenance_at = now + self.maintenance_interval_seconds
                 self.app.state.job_store.requeue_expired_leases()
                 job = self.app.state.job_store.lease_next(
@@ -307,7 +308,7 @@ def _admission_authority(app: FastAPI) -> AdmissionTicketAuthority | None:
                 secret=app.state.ticket_secret,
                 replay_store=SQLiteReplayStore(app.state.storage_root / "tickets.sqlite3"),
                 clock=app.state.clock,
-                max_ttl_seconds=300,
+                max_ttl_seconds=_TICKET_MAX_TTL_SECONDS,
             )
         return app.state.admission_authority
 
@@ -315,10 +316,28 @@ def _admission_authority(app: FastAPI) -> AdmissionTicketAuthority | None:
 def _prune_expired_ticket_replays(app: FastAPI, *, now: float | None = None) -> int:
     current_time = float(app.state.clock() if now is None else now)
     cutoff = current_time - (
-        float(app.state.ticket_ttl_seconds) + _TICKET_REPLAY_RETENTION_SAFETY_SECONDS
+        _TICKET_MAX_TTL_SECONDS + _TICKET_REPLAY_RETENTION_SAFETY_SECONDS
     )
     replay_store = SQLiteReplayStore(app.state.storage_root / "tickets.sqlite3")
     return replay_store.prune_before(cutoff)
+
+
+def _maybe_prune_expired_ticket_replays(app: FastAPI, *, now: float | None = None) -> int:
+    current_time = float(app.state.clock() if now is None else now)
+    with app.state.ticket_replay_maintenance_lock:
+        if current_time < app.state.next_ticket_replay_maintenance_at:
+            return 0
+        app.state.next_ticket_replay_maintenance_at = (
+            current_time + float(app.state.maintenance_interval_seconds)
+        )
+        try:
+            return _prune_expired_ticket_replays(app, now=current_time)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            _LOGGER.warning(
+                "ticket_replay_prune_failed exception_type=%s",
+                type(exc).__name__,
+            )
+            return 0
 
 
 def _normalize_metadata(payload: Any, *, max_audio_bytes: int, require_owner: bool = False) -> dict[str, Any] | None:
@@ -632,7 +651,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         2_160.0,
     )
     ticket_ttl_seconds = min(
-        300,
+        _TICKET_MAX_TTL_SECONDS,
         _positive_int(
             settings.get("ticket_ttl_seconds", os.environ.get("EXTREME_ML_TICKET_TTL_SECONDS")),
             120,
@@ -740,6 +759,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         raise ValueError("analyzer must provide analyze_wav")
     app.state.admission_authority = None
     app.state.admission_lock = threading.Lock()
+    app.state.ticket_replay_maintenance_lock = threading.Lock()
+    app.state.next_ticket_replay_maintenance_at = 0.0
     app.state.inline_analysis = inline_analysis
     app.state.processor = _EmbeddedProcessor(
         app,
@@ -829,6 +850,8 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             scope=payload["scope"],
             sha256=payload["sha256"],
         )
+        if app.state.inline_analysis:
+            _maybe_prune_expired_ticket_replays(app)
         ticket, expires_at = authority.issue(scope, ttl_seconds=ticket_ttl_seconds)
         return _json(200, {"ticket": ticket, "expiresAt": _expires_at(expires_at)}, request)
 
