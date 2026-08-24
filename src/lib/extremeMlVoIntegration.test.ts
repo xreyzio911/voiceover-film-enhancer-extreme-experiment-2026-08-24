@@ -226,10 +226,11 @@ test("rendered-deliverable analysis has its own bounded fail-open lane", async (
 
 test("ML snapshot grace scales for real WAV uploads but remains a bounded fail-open wait", () => {
   assert.equal(getExtremeMlSnapshotGraceMs([]), EXTREME_ML_MIN_SNAPSHOT_GRACE_MS);
-  assert.equal(getExtremeMlSnapshotGraceMs([1 * 1024 * 1024]), 5_125);
+  assert.equal(getExtremeMlSnapshotGraceMs([384_044]), 8_046);
+  assert.equal(getExtremeMlSnapshotGraceMs([1 * 1024 * 1024]), 8_125);
   assert.equal(
     getExtremeMlSnapshotGraceMs([161_332_990]),
-    24_233,
+    27_233,
   );
   assert.equal(
     getExtremeMlSnapshotGraceMs([Number.NaN, -1, 10 * 1024 * 1024 * 1024]),
