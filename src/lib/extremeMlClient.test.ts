@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  enhanceSourceWithExtremeWorker,
   analyzeRenderedWithExtremeWorker,
   analyzeSourceWithExtremeWorker,
   normalizeExtremeSourceReport,
@@ -303,6 +304,64 @@ test("render analysis keeps its distinct least-privilege scope through ticket an
     if (call.url.endsWith("/input/complete")) continue;
     assert.equal(JSON.parse(call.init.body as string).scope, "render_analysis");
   }
+});
+
+test("enhancement candidate downloads optional WAV bytes without granting gain authority", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const enhancedBytes = new Uint8Array([82, 73, 70, 70, 1, 2, 3]);
+  const outcome = await enhanceSourceWithExtremeWorker({
+    source: new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: "enhance-1",
+    fetchImpl: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/extreme-ml/ticket") {
+        return Response.json({
+          workerBaseUrl: "https://worker.example",
+          ticket: "ticket_opaque",
+          expiresAt: "2026-08-24T01:00:00.000Z",
+        });
+      }
+      if (url.endsWith("/v1/jobs")) {
+        return Response.json({
+          jobId: "enhance_job",
+          accessToken: "enhance_secret",
+          uploadOffset: 0,
+          maxChunkBytes: 16,
+        });
+      }
+      if (url.endsWith("/input") && init.method === "PATCH") {
+        return new Response(null, { status: 204, headers: { "Upload-Offset": "3" } });
+      }
+      if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
+      if (url.endsWith("/report")) {
+        return Response.json({
+          ...(validReport() as Record<string, unknown>),
+          telemetry: {
+            ...(validReport() as { telemetry: Record<string, unknown> }).telemetry,
+            candidateSelected: true,
+          },
+        });
+      }
+      if (url.endsWith("/candidate")) return new Response(enhancedBytes, { headers: { "Content-Type": "audio/wav" } });
+      if (url.endsWith("/v1/jobs/enhance_job")) return Response.json({ state: "succeeded" });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    sleep: async () => undefined,
+    allowedWorkerOrigins: ["https://worker.example"],
+  });
+
+  assert.equal(outcome.status, "succeeded");
+  if (outcome.status === "succeeded") {
+    assert.equal(outcome.report.levelAuthority, "gainPlanner");
+    assert.equal(outcome.report.canChangeGainDb, false);
+    assert.deepEqual(new Uint8Array(await outcome.candidate.arrayBuffer()), enhancedBytes);
+  }
+  const ticketCall = calls.find((call) => call.url === "/api/extreme-ml/ticket");
+  assert.ok(ticketCall);
+  assert.equal(JSON.parse(ticketCall.init.body as string).scope, "enhancement_candidate");
+  assert.ok(calls.some((call) => call.url.endsWith("/candidate")));
 });
 
 test("worker failures and exhausted polling fail open without throwing", async () => {

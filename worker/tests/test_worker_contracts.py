@@ -20,8 +20,11 @@ class WorkerContractTests(unittest.TestCase):
         self.assertFalse(capabilities["canBlockDelivery"])
         self.assertFalse(capabilities["canChangeGainDb"])
         self.assertEqual(capabilities["levelAuthority"], "gainPlanner")
-        self.assertEqual(capabilities["supports"], ["vad_protection", "quality_metrics"])
-        self.assertNotIn("optional_repair_candidate", capabilities["supports"])
+        self.assertEqual(
+            capabilities["supports"],
+            ["vad_protection", "quality_metrics", "enhancement_candidate"],
+        )
+        self.assertNotIn("broadband_gain_authority", capabilities["supports"])
 
     def test_upload_ticket_is_short_lived_and_bound_to_job(self) -> None:
         create_upload_ticket, verify_upload_ticket = require_symbols(

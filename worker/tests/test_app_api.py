@@ -50,6 +50,9 @@ class ExtremeWorkerApiTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def _ticket(self, *, size: int, sha256: str) -> str:
+        return self._ticket_for_scope(size=size, sha256=sha256, scope="source_analysis")
+
+    def _ticket_for_scope(self, *, size: int, sha256: str, scope: str) -> str:
         response = self.client.post(
             "/internal/v1/tickets",
             headers={"Authorization": f"Bearer {self.internal_secret}"},
@@ -58,7 +61,7 @@ class ExtremeWorkerApiTests(unittest.TestCase):
                 "sizeBytes": size,
                 "contentType": "audio/wav",
                 "idempotencyKey": "batch-1-file-1",
-                "scope": "source_analysis",
+                "scope": scope,
                 "sha256": sha256,
             },
         )
@@ -112,6 +115,65 @@ class ExtremeWorkerApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_enhancement_candidate_scope_returns_report_and_authorized_candidate_wav(self) -> None:
+        wav = minimal_wav()
+        digest = hashlib.sha256(wav).hexdigest()
+        ticket = self._ticket_for_scope(size=len(wav), sha256=digest, scope="enhancement_candidate")
+        job_response = self.client.post(
+            "/v1/jobs",
+            headers={"Authorization": f"Bearer {ticket}"},
+            json={
+                "idempotencyKey": "batch-1-file-1",
+                "sizeBytes": len(wav),
+                "contentType": "audio/wav",
+                "scope": "enhancement_candidate",
+                "sha256": digest,
+            },
+        )
+        self.assertEqual(job_response.status_code, 200, job_response.text)
+        job = job_response.json()
+        access_token = job["accessToken"]
+
+        upload_response = self.client.patch(
+            f"/v1/jobs/{job['jobId']}/input",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "audio/wav",
+                "Upload-Offset": "0",
+            },
+            content=wav,
+        )
+        self.assertEqual(upload_response.status_code, 204, upload_response.text)
+        complete_response = self.client.post(
+            f"/v1/jobs/{job['jobId']}/input/complete",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={},
+        )
+        self.assertEqual(complete_response.status_code, 200, complete_response.text)
+
+        report_response = self.client.get(
+            f"/v1/jobs/{job['jobId']}/report",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(report_response.status_code, 200, report_response.text)
+        report = report_response.json()
+        self.assertTrue(report["advisoryOnly"])
+        self.assertFalse(report["canChangeGainDb"])
+        self.assertEqual(report["levelAuthority"], "gainPlanner")
+        self.assertEqual(report["source"]["sha256"], digest)
+        self.assertEqual(report["candidate"]["role"], "enhancement_candidate")
+        self.assertRegex(report["candidate"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(report["telemetry"]["candidateSelected"], True)
+        self.assertEqual(report["telemetry"]["gainDbChanged"], False)
+
+        candidate_response = self.client.get(
+            f"/v1/jobs/{job['jobId']}/candidate",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(candidate_response.status_code, 200, candidate_response.text)
+        self.assertEqual(candidate_response.headers["content-type"], "audio/wav")
+        self.assertEqual(hashlib.sha256(candidate_response.content).hexdigest(), report["candidate"]["sha256"])
 
     def test_direct_upload_job_lifecycle_returns_advisory_report(self) -> None:
         wav = minimal_wav()
