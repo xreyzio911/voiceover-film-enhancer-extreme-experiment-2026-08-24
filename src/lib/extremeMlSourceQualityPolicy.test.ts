@@ -265,6 +265,37 @@ test("long sparse timelines can use speech-window stability evidence without aut
   assert.ok(policy.perceptualStabilityRisk >= 0.6);
 });
 
+test("declared VAD frame size cannot inflate sparse speech-duration authority", () => {
+  const policy = buildExtremeMlSourceQualityPolicy(
+    reportWithMetrics(
+      {
+        "sigmos.loud": { value: 2.25, available: true, higherIsBetter: true },
+        "sigmos.disc": { value: 2.2, available: true, higherIsBetter: true },
+      },
+      {
+        source: {
+          sha256: SHA256,
+          durationMs: 500_000,
+          sampleRate: 48_000,
+          channels: 1,
+        },
+        vad: {
+          frameMs: 1_000_000_000,
+          frames: vadFrames([
+            0.9,
+            ...new Array(99).fill(0.02),
+          ]),
+        },
+      },
+    ),
+  );
+
+  assert.equal(policy.reason, "legacy-fallback");
+  assert.equal(policy.instabilityHintBoost, 0);
+  assert.equal(policy.speechSpikeTamingBoost, 0);
+  assert.equal(policy.perceptualStabilityRisk, 0);
+});
+
 test("poor speech/signal MOS damps cleanup authority instead of authorizing overprocessing", () => {
   const report = {
     "dnsmos.bak": { value: 2.35, available: true, higherIsBetter: true },

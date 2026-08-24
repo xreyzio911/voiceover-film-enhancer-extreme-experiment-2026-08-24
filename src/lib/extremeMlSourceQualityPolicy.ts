@@ -92,11 +92,26 @@ const speechCoverageAuthority = (report: ExtremeSourceReport) => {
 };
 
 const speechDurationAuthority = (report: ExtremeSourceReport) => {
-  const speechFrames = report.vad.frames.reduce(
-    (count, frame) => count + (frame.speechProbability >= 0.5 ? 1 : 0),
-    0,
-  );
-  const speechSeconds = speechFrames * report.vad.frameMs / 1_000;
+  const sourceDurationMs = Number.isFinite(report.source.durationMs)
+    ? Math.max(0, report.source.durationMs)
+    : 0;
+  let speechDurationMs = 0;
+  let coveredSpeechEndMs = 0;
+  for (const frame of report.vad.frames) {
+    if (
+      frame.speechProbability < 0.5 ||
+      !Number.isFinite(frame.startMs) ||
+      !Number.isFinite(frame.endMs)
+    ) {
+      continue;
+    }
+    const startMs = clamp(frame.startMs, 0, sourceDurationMs);
+    const endMs = clamp(frame.endMs, 0, sourceDurationMs);
+    const uncoveredStartMs = Math.max(startMs, coveredSpeechEndMs);
+    if (endMs > uncoveredStartMs) speechDurationMs += endMs - uncoveredStartMs;
+    coveredSpeechEndMs = Math.max(coveredSpeechEndMs, endMs);
+  }
+  const speechSeconds = speechDurationMs / 1_000;
   return clamp((speechSeconds - 2) / 8, 0, 1);
 };
 
