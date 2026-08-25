@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
@@ -12,7 +13,13 @@ from .model_runtime import (
     sha256_file,
     verify_artifact,
 )
-from .wav_validation import WavLimits, WavValidationError, inspect_wav_file
+from .wav_validation import (
+    WavInfo,
+    WavLimits,
+    WavValidationError,
+    inspect_wav_file,
+    validate_float_sample_values,
+)
 
 
 _METRIC_OUTPUTS: dict[str, tuple[str, ...]] = {
@@ -26,6 +33,7 @@ _METRIC_WINDOW_SECONDS = 10.0
 _METRIC_WINDOW_COUNT_CAP = 7
 _METRIC_WINDOW_BYTE_CAP = 2 * 1024 * 1024
 _METRIC_SAMPLE_BYTES = 4
+_VAD_STREAM_CHUNK_SAMPLES = 512 * 127
 
 
 class VadBackend(Protocol):
@@ -44,6 +52,45 @@ class AnalysisDurationLimit(ValueError):
         self.sample_rate = sample_rate
         self.channels = channels
         self.duration_seconds = duration_seconds
+
+
+@dataclass(frozen=True)
+class _PcmWavAudio:
+    """Seekable mono view over a WAV payload with a bounded working set."""
+
+    path: Path
+    info: WavInfo
+
+    def __len__(self) -> int:
+        return self.info.frames
+
+    def read_window(self, start: int, sample_count: int) -> Any:
+        if start < 0 or sample_count < 0 or start + sample_count > len(self):
+            raise IndexError("PCM window outside source bounds")
+        bytes_per_frame = self.info.sample_width_bytes * self.info.channels
+        byte_count = sample_count * bytes_per_frame
+        with self.path.open("rb") as source:
+            source.seek(self.info.data_offset + start * bytes_per_frame)
+            raw = source.read(byte_count)
+        if len(raw) != byte_count:
+            raise EOFError("truncated-pcm-payload")
+        return _decode_pcm_samples(
+            raw,
+            self.info.sample_width_bytes,
+            self.info.channels,
+            self.info.format_code,
+        )
+
+    def __getitem__(self, key: slice) -> Any:
+        if not isinstance(key, slice):
+            raise TypeError("PCM audio supports bounded contiguous slices only")
+        start, stop, step = key.indices(len(self))
+        if step != 1:
+            raise ValueError("PCM audio supports bounded contiguous slices only")
+        return self.read_window(start, stop - start)
+
+    def __array__(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise ValueError("full-duration PCM materialization is disabled")
 
 
 class SileroOnnxBackend:
@@ -67,18 +114,15 @@ class SileroOnnxBackend:
         if not {"input", "state", "sr"}.issubset(input_names):
             raise RuntimeError("unsupported-silero-input-contract")
 
-    def score_chunks(self, audio_16k: Any) -> tuple[float, ...]:
+    def score_stream(self, audio_chunks_16k: Any) -> tuple[float, ...]:
         np = self._np
-        audio = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
-        if audio.size == 0:
-            return ()
         state = np.zeros((2, 1, 128), dtype=np.float32)
         context = np.zeros((1, 64), dtype=np.float32)
+        pending = np.empty(0, dtype=np.float32)
         probabilities: list[float] = []
-        for offset in range(0, int(audio.size), 512):
-            chunk = audio[offset : offset + 512]
-            if chunk.size < 512:
-                chunk = np.pad(chunk, (0, 512 - chunk.size))
+
+        def score_chunk(chunk: Any) -> None:
+            nonlocal context, state
             model_input = np.concatenate((context, chunk.reshape(1, -1)), axis=1)
             output, state = self._session.run(
                 None,
@@ -91,7 +135,22 @@ class SileroOnnxBackend:
             probability = float(np.asarray(output).reshape(-1)[0])
             probabilities.append(min(1.0, max(0.0, probability)) if math.isfinite(probability) else 0.0)
             context = model_input[:, -64:]
+
+        for source_chunk in audio_chunks_16k:
+            incoming = np.asarray(source_chunk, dtype=np.float32).reshape(-1)
+            if incoming.size == 0:
+                continue
+            buffered = np.concatenate((pending, incoming)) if pending.size else incoming
+            complete_samples = (int(buffered.size) // 512) * 512
+            for offset in range(0, complete_samples, 512):
+                score_chunk(buffered[offset : offset + 512])
+            pending = buffered[complete_samples:].copy()
+        if pending.size:
+            score_chunk(np.pad(pending, (0, 512 - pending.size)))
         return tuple(probabilities)
+
+    def score_chunks(self, audio_16k: Any) -> tuple[float, ...]:
+        return self.score_stream((audio_16k,))
 
 
 class SpeechOnnxMetricsBackend:
@@ -198,6 +257,14 @@ def _read_pcm_wav(
             channels=info.channels,
             duration_seconds=info.duration_seconds,
         )
+    validate_float_sample_values(source_path, info)
+    if info.frames * _METRIC_SAMPLE_BYTES > _METRIC_WINDOW_BYTE_CAP:
+        return (
+            _PcmWavAudio(source_path, info),
+            info.sample_rate,
+            info.channels,
+            info.duration_seconds,
+        )
     import numpy as np
 
     bytes_per_frame = info.sample_width_bytes * info.channels
@@ -226,16 +293,62 @@ def _read_pcm_wav(
     )
 
 
+def _bounded_audio_slice(audio: Any, start: int, stop: int) -> Any:
+    import numpy as np
+
+    if start < 0 or stop < start or stop > len(audio):
+        raise IndexError("audio slice outside source bounds")
+    if hasattr(audio, "read_window"):
+        candidate = audio.read_window(start, stop - start)
+    else:
+        candidate = audio[start:stop]
+    rendered = np.asarray(candidate, dtype=np.float32).reshape(-1)
+    if rendered.size != stop - start:
+        raise ValueError("audio slice length mismatch")
+    if not np.isfinite(rendered).all():
+        raise ValueError("non-finite-float-samples")
+    return rendered
+
+
+def _iter_resampled_for_vad(audio: Any, sample_rate: int) -> Any:
+    """Yield an exact 16 kHz timeline without full-source position arrays."""
+    import numpy as np
+
+    if sample_rate <= 0:
+        raise ValueError("invalid-vad-sample-rate")
+    source_samples = len(audio)
+    if source_samples <= 0:
+        return
+    output_samples = max(1, round(source_samples * 16_000 / sample_rate))
+    for output_start in range(0, output_samples, _VAD_STREAM_CHUNK_SAMPLES):
+        output_stop = min(output_samples, output_start + _VAD_STREAM_CHUNK_SAMPLES)
+        if sample_rate == 16_000:
+            yield _bounded_audio_slice(audio, output_start, output_stop)
+            continue
+
+        output_indices = np.arange(output_start, output_stop, dtype=np.float64)
+        source_positions = output_indices * (sample_rate / 16_000.0)
+        left_indices = np.floor(source_positions).astype(np.int64)
+        np.clip(left_indices, 0, source_samples - 1, out=left_indices)
+        source_start = int(left_indices[0])
+        source_stop = min(source_samples, int(left_indices[-1]) + 2)
+        source_window = _bounded_audio_slice(audio, source_start, source_stop)
+        local_left = left_indices - source_start
+        local_right = np.minimum(local_left + 1, source_window.size - 1)
+        fractions = (source_positions - left_indices).astype(np.float32)
+        yield (
+            source_window[local_left]
+            + (source_window[local_right] - source_window[local_left]) * fractions
+        ).astype(np.float32, copy=False)
+
+
 def _resample_for_vad(audio: Any, sample_rate: int) -> Any:
     import numpy as np
 
-    source = np.asarray(audio, dtype=np.float32).reshape(-1)
-    if sample_rate == 16_000 or source.size == 0:
-        return source
-    output_count = max(1, round(source.size * 16_000 / sample_rate))
-    source_positions = np.arange(source.size, dtype=np.float64) / sample_rate
-    output_positions = np.arange(output_count, dtype=np.float64) / 16_000
-    return np.interp(output_positions, source_positions, source).astype(np.float32)
+    chunks = tuple(_iter_resampled_for_vad(audio, sample_rate))
+    if not chunks:
+        return np.empty(0, dtype=np.float32)
+    return chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
 
 
 def _empty_metrics(metric_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
@@ -366,7 +479,11 @@ def _bounded_metric_window(
 ) -> Any:
     import numpy as np
 
-    candidate = audio if use_full_source else audio[start : start + window_samples]
+    sample_count = len(audio) if use_full_source else min(window_samples, len(audio) - start)
+    if hasattr(audio, "read_window"):
+        candidate = audio.read_window(0 if use_full_source else start, sample_count)
+    else:
+        candidate = audio if use_full_source else audio[start : start + window_samples]
     window = np.asarray(candidate, dtype=np.float32)
     if window.ndim != 1:
         window = window.reshape(-1)
@@ -556,7 +673,15 @@ class AdvisoryInferenceRuntime:
                 if self._vad is None:
                     self._vad = self._vad_factory(vad_path)
                     self._models_loaded = True
-                probabilities = self._vad.score_chunks(_resample_for_vad(audio, sample_rate))
+                vad_stream = _iter_resampled_for_vad(audio, sample_rate)
+                score_stream = getattr(self._vad, "score_stream", None)
+                if callable(score_stream):
+                    probabilities = score_stream(vad_stream)
+                else:
+                    streamed_probabilities: list[float] = []
+                    for vad_chunk in vad_stream:
+                        streamed_probabilities.extend(self._vad.score_chunks(vad_chunk))
+                    probabilities = tuple(streamed_probabilities)
                 metric_vad_probabilities = probabilities
                 frames = _vad_frames(probabilities, duration_seconds * 1000.0)
                 if frames:
@@ -649,7 +774,7 @@ class AdvisoryInferenceRuntime:
                     audio,
                     start=start,
                     window_samples=window_samples,
-                    use_full_source=len(starts) == 1,
+                    use_full_source=len(starts) == 1 and len(audio) <= window_samples,
                 )
                 result = self._metrics.score(metric_id, window, sample_rate)
                 values = result if isinstance(result, Mapping) else {"value": result}

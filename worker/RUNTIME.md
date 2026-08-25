@@ -52,9 +52,13 @@ and its valid-bit width matches the container. Other float widths, compressed
 subformats, non-finite float samples, and float values outside `[-1, 1]` are rejected
 instead of being silently clipped. The runtime parses that header
 itself so the Python 3.11 container can handle both the app's 24-bit source files and
-its 48 kHz float32 final deliverables, and decodes long payloads in fixed
-65,536-frame chunks to bound temporary allocation before the mono analysis buffer is
-populated.
+its 48 kHz float32 final deliverables. Small payloads are decoded in fixed
+65,536-frame chunks into a mono analysis buffer. Longer payloads expose a seekable
+mono PCM view instead: Silero consumes a full-duration 16 kHz stream with recurrent
+state and 64-sample context preserved across chunks, and DNSMOS/SIGMOS read at most
+seven distributed, speech-active 10-second windows. Float validation is also
+chunked. This removes the former full mono, float64 resampling-position, and full
+16 kHz timeline allocations while keeping all ML active across the whole source.
 
 For every `enhancement_candidate` job, the worker first validates and analyzes the
 exact uploaded source with Silero VAD plus the available DNSMOS and SIGMOS models.
@@ -75,11 +79,13 @@ This is a unity dry/wet blend: it never changes target level or gains authority 
 
 The filter graph resamples internally to 48 kHz for RNNoise, restores the source
 sample rate and channel count, and blends back into the original WAV sample format.
-Only technical integrity can reject the result: unreadable or non-finite samples,
-sample-rate/channel/frame/sample-format mismatch, introduced clipping, or gross
-speech erasure. DNSMOS and SIGMOS candidate deltas are advisory and never select or
-reject audio. The worker also rechecks the source SHA-256 after enhancement so the
-uploaded source remains immutable.
+If FFmpeg's RNNoise filter emits trailing padding, the adaptive blend trims only that
+tail so the final candidate has the exact source frame count; a short wet file still
+fails technical integrity. Only technical integrity can reject the result: unreadable
+or non-finite samples, sample-rate/channel/sample-format mismatch, short candidate
+audio, introduced clipping, or gross speech erasure. DNSMOS and SIGMOS candidate
+deltas are advisory and never select or reject audio. The worker also rechecks the
+source SHA-256 after enhancement so the uploaded source remains immutable.
 
 ## Immutable model set
 
@@ -134,6 +140,9 @@ Non-secret runtime defaults (the deployment may override them explicitly):
 - `EXTREME_STORAGE_ROOT=/var/data`
 - `EXTREME_ML_MODEL_DIR=/opt/extreme/models`
 - `EXTREME_ML_METRICS=dnsmos,dnsmos_p808,sigmos`
+- `EXTREME_ML_MAX_AUDIO_BYTES=1073741824` (bounded 1 GiB, aligned with the
+  browser ticket route and large enough for the exact 30-minute float32 mono corpus
+  fixture)
 - `EXTREME_ML_MAX_ANALYSIS_SECONDS=2160`
 - `EXTREME_ML_RETENTION_SECONDS=86400`
 - `EXTREME_ML_STALE_JOB_SECONDS=7200`

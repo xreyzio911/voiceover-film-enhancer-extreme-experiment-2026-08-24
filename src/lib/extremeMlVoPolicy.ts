@@ -12,11 +12,11 @@ const EXTREME_ML_PER_FILE_WAIT_BASE_MS = 4_000;
 const EXTREME_ML_PER_FILE_WAIT_MAX_MS = 45_000;
 const EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND = 8 * 1024 * 1024;
 const EXTREME_ML_POLL_BASE_SECONDS = 120;
-const EXTREME_ML_MAX_POLL_COUNT = 2_400;
-// Assume the compact 48 kHz mono PCM16 layout so float, 24-bit, and stereo WAVs
-// receive an equal or longer background inference window rather than being
-// mistaken for a shorter recording from byte size alone.
-const EXTREME_ML_ESTIMATED_AUDIO_BYTES_PER_SECOND = 48_000 * 2;
+const EXTREME_ML_MAX_POLL_COUNT = 3_000;
+// Use the smallest supported lossless layout (16 kHz mono PCM16). Every other
+// accepted PCM layout therefore receives an equal or longer inference window
+// instead of a long low-rate source being mistaken for a short recording.
+const EXTREME_ML_ESTIMATED_AUDIO_BYTES_PER_SECOND = 16_000 * 2;
 const EXTREME_ML_LONG_FILE_RUNTIME_FACTOR = 1.25;
 
 const normalizeSourceSizeBytes = (sourceSizeBytes: number) =>
@@ -42,8 +42,8 @@ export const getExtremeMlPerFileWaitMs = (sourceSizeBytes: number) => {
 /**
  * Keeps polling alive for long-file inference instead of applying the old
  * short-file fixed count. At one poll per second this gives roughly 11 minutes
- * to a seven-minute mono PCM16 WAV and about 35 minutes to a 26-minute WAV;
- * larger lossless layouts receive more time up to the 40-minute cap.
+ * to a seven-minute 16 kHz mono PCM16 WAV and about 35 minutes to a 26-minute
+ * WAV; larger lossless layouts receive more time up to the 50-minute cap.
  */
 export const getExtremeMlMaxPollsForSourceBytes = (sourceSizeBytes: number) => {
   const normalizedBytes = normalizeSourceSizeBytes(sourceSizeBytes);

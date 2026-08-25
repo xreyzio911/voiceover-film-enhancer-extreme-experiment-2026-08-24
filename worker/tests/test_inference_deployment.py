@@ -51,6 +51,8 @@ class InferenceDeploymentContractTests(unittest.TestCase):
             "mountPath: /var/data",
             "sizeGB: 20",
             "maxShutdownDelaySeconds: 300",
+            "key: EXTREME_ML_MAX_AUDIO_BYTES",
+            "value: \"1073741824\"",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):

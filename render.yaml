@@ -24,6 +24,8 @@ services:
         value: dnsmos,dnsmos_p808,sigmos
       - key: EXTREME_ML_MAX_ANALYSIS_SECONDS
         value: "2160"
+      - key: EXTREME_ML_MAX_AUDIO_BYTES
+        value: "1073741824"
       - key: EXTREME_ML_RETENTION_SECONDS
         value: "86400"
       - key: EXTREME_ML_MAINTENANCE_INTERVAL_SECONDS

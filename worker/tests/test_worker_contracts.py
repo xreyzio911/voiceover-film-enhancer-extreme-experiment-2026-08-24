@@ -195,6 +195,16 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(capabilities.status_code, 200)
         self.assertTrue(capabilities.json()["advisoryOnly"])
 
+    def test_default_upload_budget_accepts_the_exact_long_corpus_float32_geometry(self) -> None:
+        (create_app,) = require_symbols(self, "extreme_worker.app", "create_app")
+        exact_tony_bytes = 44 + 87_777_600 * 4
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = create_app({"storage_root": temp_dir, "allowed_origins": ["https://extreme.example"]})
+            try:
+                self.assertGreaterEqual(app.state.max_audio_bytes, exact_tony_bytes)
+            finally:
+                app.state.job_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

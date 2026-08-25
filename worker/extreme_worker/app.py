@@ -664,7 +664,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 os.environ.get("EXTREME_ML_MAX_AUDIO_BYTES") or os.environ.get("EXTREME_MAX_AUDIO_BYTES"),
             ),
         ),
-        256 * 1024 * 1024,
+        1024 * 1024 * 1024,
     )
     max_chunk_bytes = min(
         max_audio_bytes,

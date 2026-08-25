@@ -364,6 +364,385 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(first[3]["dnsmos"]["status"], "available")
         self.assertEqual(first[3]["dnsmos"]["code"], "ok-partial-windows")
 
+    def test_long_pcm_reader_exposes_bounded_slices_without_a_full_duration_float_allocation(self) -> None:
+        import numpy as np
+
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        sample_rate = 48_000
+        channels = 2
+        duration_seconds = 1_158
+        frame_count = sample_rate * duration_seconds
+        bytes_per_frame = channels * 2
+        bounded_float_samples = module._METRIC_WINDOW_BYTE_CAP // np.dtype(np.float32).itemsize
+        read_sizes: list[int] = []
+
+        class VirtualPcmReader:
+            def __init__(self) -> None:
+                self.position = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def seek(self, offset: int, whence: int = 0) -> int:
+                if whence == 0:
+                    self.position = offset
+                elif whence == 1:
+                    self.position += offset
+                else:
+                    raise AssertionError("virtual long WAV does not require end-relative seeks")
+                return self.position
+
+            def tell(self) -> int:
+                return self.position
+
+            def read(self, byte_count: int = -1) -> bytes:
+                if byte_count < 0:
+                    raise AssertionError("long WAV reads must always be explicitly bounded")
+                if byte_count > module._METRIC_WINDOW_BYTE_CAP:
+                    raise AssertionError("long WAV read exceeded the bounded transient working set")
+                read_sizes.append(byte_count)
+                self.position += byte_count
+                return bytes(byte_count)
+
+        info = SimpleNamespace(
+            format_code=1,
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_width_bytes=2,
+            frames=frame_count,
+            duration_seconds=float(duration_seconds),
+            upload_bytes=44 + frame_count * bytes_per_frame,
+            data_offset=44,
+            data_bytes=frame_count * bytes_per_frame,
+        )
+
+        original_empty = np.empty
+
+        def bounded_empty(shape, *args, **kwargs):
+            item_count = math.prod(shape) if isinstance(shape, tuple) else int(shape)
+            dtype = np.dtype(kwargs.get("dtype", np.float64))
+            if dtype == np.dtype(np.float32) and item_count > bounded_float_samples:
+                raise AssertionError("long WAV analysis allocated a full-duration float mono array")
+            return original_empty(shape, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "virtual-long.wav")
+            source_path.write_bytes(b"virtual header placeholder")
+            original_open = Path.open
+
+            def virtual_open(path: Path, mode: str = "r", *args, **kwargs):
+                if Path(path) == source_path and mode == "rb":
+                    return VirtualPcmReader()
+                return original_open(path, mode, *args, **kwargs)
+
+            with (
+                patch.object(module, "inspect_wav_file", return_value=info),
+                patch.object(Path, "open", new=virtual_open),
+                patch.object(np, "empty", side_effect=bounded_empty),
+            ):
+                audio, actual_rate, actual_channels, actual_duration = module._read_pcm_wav(
+                    source_path,
+                    max_duration_seconds=duration_seconds,
+                )
+                preview = np.asarray(audio[: module._PCM_DECODE_CHUNK_FRAMES], dtype=np.float32)
+
+        self.assertEqual(len(audio), frame_count)
+        self.assertEqual(actual_rate, sample_rate)
+        self.assertEqual(actual_channels, channels)
+        self.assertEqual(actual_duration, float(duration_seconds))
+        self.assertEqual(preview.shape, (module._PCM_DECODE_CHUNK_FRAMES,))
+        self.assertTrue(read_sizes)
+        self.assertLessEqual(max(read_sizes), module._METRIC_WINDOW_BYTE_CAP)
+        if isinstance(audio, np.ndarray) and not isinstance(audio, np.memmap):
+            self.assertLessEqual(audio.nbytes, module._METRIC_WINDOW_BYTE_CAP)
+
+    def test_long_runtime_streams_all_ml_over_the_full_timeline_with_bounded_working_audio(self) -> None:
+        import numpy as np
+
+        _, RuntimeConfig, _, _, _, _ = self._model_symbols()
+        AdvisoryInferenceRuntime, _ = self._inference_symbols()
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        sample_rate = 48_000
+        channels = 2
+        duration_seconds = 1_158
+        source_samples = sample_rate * duration_seconds
+        vad_sample_rate = 16_000
+        expected_vad_samples = vad_sample_rate * duration_seconds
+        max_source_slice_samples = sample_rate * 10
+        max_vad_call_samples = vad_sample_rate * 10
+        speech_ranges = (
+            (12.0, 20.0),
+            (duration_seconds / 2 - 4.0, duration_seconds / 2 + 4.0),
+            (duration_seconds - 22.0, duration_seconds - 14.0),
+        )
+
+        class VirtualLongMono:
+            dtype = np.dtype(np.float32)
+
+            def __init__(self) -> None:
+                self.slices: list[tuple[int, int]] = []
+                self.full_array_requests = 0
+                self.max_materialized_samples = 0
+
+            def __len__(self) -> int:
+                return source_samples
+
+            def __array__(self, *_args, **_kwargs):
+                self.full_array_requests += 1
+                raise AssertionError("long ML analysis must not materialize the full mono timeline")
+
+            def __getitem__(self, key):
+                if not isinstance(key, slice) or key.step not in (None, 1):
+                    raise AssertionError("long ML analysis must use contiguous bounded slices")
+                start = 0 if key.start is None else max(0, int(key.start))
+                stop = len(self) if key.stop is None else min(len(self), int(key.stop))
+                sample_count = max(0, stop - start)
+                if sample_count > max_source_slice_samples:
+                    raise AssertionError("long ML source slice exceeded the ten-second memory cap")
+                self.slices.append((start, stop))
+                self.max_materialized_samples = max(self.max_materialized_samples, sample_count)
+                window = np.zeros(sample_count, dtype=np.float32)
+                for speech_start, speech_stop in speech_ranges:
+                    overlap_start = max(start, round(speech_start * sample_rate))
+                    overlap_stop = min(stop, round(speech_stop * sample_rate))
+                    if overlap_stop > overlap_start:
+                        window[overlap_start - start : overlap_stop - start] = 0.18
+                if sample_count:
+                    window[0] = start / source_samples
+                return window
+
+        class StreamingTimelineVad:
+            def __init__(self) -> None:
+                self.call_sizes: list[int] = []
+                self.samples_seen = 0
+
+            def score_chunks(self, audio_16k):
+                bounded = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
+                if bounded.size > max_vad_call_samples:
+                    raise AssertionError("Silero received an unbounded long-duration array")
+                start_sample = self.samples_seen
+                self.call_sizes.append(int(bounded.size))
+                self.samples_seen += int(bounded.size)
+                probabilities: list[float] = []
+                for local_start in range(0, int(bounded.size), 512):
+                    midpoint_seconds = (start_sample + local_start + 256) / vad_sample_rate
+                    is_speech = any(start <= midpoint_seconds < stop for start, stop in speech_ranges)
+                    probabilities.append(0.95 if is_speech else 0.02)
+                return tuple(probabilities)
+
+        class RecordingMetrics:
+            def __init__(self) -> None:
+                self.calls: dict[str, list[tuple[int, float, float]]] = {
+                    "dnsmos": [],
+                    "sigmos": [],
+                }
+
+            def score(self, metric_id: str, audio, received_sample_rate: int):
+                if metric_id not in self.calls or received_sample_rate != sample_rate:
+                    raise AssertionError("unexpected long-audio metric request")
+                bounded = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if bounded.nbytes > module._METRIC_WINDOW_BYTE_CAP:
+                    raise AssertionError("MOS backend received an unbounded long-duration array")
+                start_seconds = float(bounded[0]) * duration_seconds if bounded.size else 0.0
+                rms = float(np.sqrt(np.mean(np.square(bounded)))) if bounded.size else 0.0
+                self.calls[metric_id].append((int(bounded.size), start_seconds, rms))
+                if metric_id == "dnsmos":
+                    return {"sig": 4.1, "bak": 3.7, "ovrl": 3.8}
+                return {
+                    "col": 3.7,
+                    "disc": 3.8,
+                    "loud": 3.6,
+                    "noise": 3.5,
+                    "reverb": 3.7,
+                    "sig": 3.9,
+                    "ovrl": 3.7,
+                }
+
+        vad_payload = b"streaming-long-vad"
+        dnsmos_payload = b"streaming-long-dnsmos"
+        sigmos_payload = b"streaming-long-sigmos"
+        source = VirtualLongMono()
+        vad_backend = StreamingTimelineVad()
+        metrics_backend = RecordingMetrics()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            (model_dir / "vad.onnx").write_bytes(vad_payload)
+            (model_dir / "dnsmos.onnx").write_bytes(dnsmos_payload)
+            (model_dir / "sigmos.onnx").write_bytes(sigmos_payload)
+            source_path = model_dir / "source.wav"
+            source_bytes = _pcm16_wav(source_path)
+            source_hash = hashlib.sha256(source_bytes).hexdigest()
+            runtime = AdvisoryInferenceRuntime(
+                RuntimeConfig(
+                    model_dir=model_dir,
+                    metric_ids=("dnsmos", "sigmos"),
+                    artifacts=(
+                        self._spec("silero-vad", "silero_vad", "vad.onnx", vad_payload),
+                        self._spec("dnsmos", "dnsmos", "dnsmos.onnx", dnsmos_payload),
+                        self._spec("sigmos", "sigmos", "sigmos.onnx", sigmos_payload),
+                    ),
+                    max_analysis_seconds=duration_seconds,
+                ),
+                vad_factory=lambda _: vad_backend,
+                metrics_factory=lambda _: metrics_backend,
+            )
+
+            with patch.object(
+                module,
+                "_read_pcm_wav",
+                return_value=(source, sample_rate, channels, float(duration_seconds)),
+            ):
+                report = runtime.analyze_wav(
+                    source_path,
+                    job_id="long_render_batch_06",
+                    source_sha256=source_hash,
+                )
+
+        self.assertEqual(source.full_array_requests, 0)
+        self.assertTrue(source.slices)
+        self.assertLessEqual(source.max_materialized_samples, max_source_slice_samples)
+        self.assertGreater(len(vad_backend.call_sizes), 1)
+        self.assertEqual(vad_backend.samples_seen, expected_vad_samples)
+        self.assertLessEqual(max(vad_backend.call_sizes), max_vad_call_samples)
+        self.assertEqual(report["source"]["durationMs"], duration_seconds * 1000)
+        self.assertEqual(report["source"]["sampleRate"], sample_rate)
+        self.assertEqual(report["source"]["channels"], channels)
+        self.assertEqual(report["vad"]["frameMs"], 10)
+        self.assertEqual(len(report["vad"]["frames"]), duration_seconds * 100)
+        for speech_start, speech_stop in speech_ranges:
+            probe_index = round(((speech_start + speech_stop) / 2) * 100)
+            self.assertGreaterEqual(
+                report["vad"]["frames"][probe_index]["speechProbability"],
+                0.9,
+            )
+        for metric_id in ("dnsmos", "sigmos"):
+            calls = metrics_backend.calls[metric_id]
+            self.assertGreaterEqual(len(calls), 3)
+            self.assertLessEqual(len(calls), 7)
+            self.assertTrue(all(count <= max_source_slice_samples for count, _, _ in calls))
+            self.assertTrue(all(rms > 0.02 for _, _, rms in calls), calls)
+            starts = [start for _, start, _ in calls]
+            self.assertLess(min(starts), 30.0)
+            self.assertTrue(any(duration_seconds * 0.4 < start < duration_seconds * 0.6 for start in starts))
+            self.assertGreater(max(starts), duration_seconds - 40.0)
+        self.assertTrue(report["metrics"]["dnsmos.ovrl"]["available"])
+        self.assertTrue(report["metrics"]["sigmos.ovrl"]["available"])
+        self.assertEqual(report["telemetry"]["components"]["silero-vad"]["status"], "available")
+        self.assertEqual(report["telemetry"]["components"]["dnsmos"]["status"], "available")
+        self.assertEqual(report["telemetry"]["components"]["sigmos"]["status"], "available")
+        self.assertTrue(report["advisoryOnly"])
+        self.assertFalse(report["canBlockDelivery"])
+        self.assertFalse(report["canChangeGainDb"])
+        self.assertEqual(report["levelAuthority"], "gainPlanner")
+
+    def test_long_runtime_uses_bounded_metric_window_when_only_one_speech_window_is_selected(self) -> None:
+        import numpy as np
+
+        _, RuntimeConfig, _, _, _, _ = self._model_symbols()
+        AdvisoryInferenceRuntime, _ = self._inference_symbols()
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        sample_rate = 48_000
+        duration_seconds = 600
+        source_samples = sample_rate * duration_seconds
+        speech_start_seconds = 30.0
+        speech_stop_seconds = 36.0
+
+        class VirtualSparseSpeech:
+            def __init__(self) -> None:
+                self.full_array_requests = 0
+                self.max_slice_samples = 0
+
+            def __len__(self) -> int:
+                return source_samples
+
+            def __array__(self, *_args, **_kwargs):
+                self.full_array_requests += 1
+                raise AssertionError("single speech metric window must not materialize the full long source")
+
+            def __getitem__(self, key):
+                if not isinstance(key, slice) or key.step not in (None, 1):
+                    raise AssertionError("long metric input must use contiguous bounded slices")
+                start = 0 if key.start is None else max(0, int(key.start))
+                stop = len(self) if key.stop is None else min(len(self), int(key.stop))
+                sample_count = max(0, stop - start)
+                self.max_slice_samples = max(self.max_slice_samples, sample_count)
+                window = np.zeros(sample_count, dtype=np.float32)
+                overlap_start = max(start, round(speech_start_seconds * sample_rate))
+                overlap_stop = min(stop, round(speech_stop_seconds * sample_rate))
+                if overlap_stop > overlap_start:
+                    window[overlap_start - start : overlap_stop - start] = 0.2
+                return window
+
+        class SingleSpeechVad:
+            def score_stream(self, audio_chunks_16k):
+                probabilities: list[float] = []
+                samples_seen = 0
+                for chunk in audio_chunks_16k:
+                    bounded = np.asarray(chunk, dtype=np.float32).reshape(-1)
+                    for local_start in range(0, int(bounded.size), 512):
+                        midpoint_seconds = (samples_seen + local_start + 256) / 16_000
+                        probabilities.append(
+                            0.95 if speech_start_seconds <= midpoint_seconds < speech_stop_seconds else 0.02
+                        )
+                    samples_seen += int(bounded.size)
+                return tuple(probabilities)
+
+        class RecordingMetrics:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def score(self, metric_id: str, audio, received_sample_rate: int):
+                if metric_id != "dnsmos" or received_sample_rate != sample_rate:
+                    raise AssertionError("unexpected metric request")
+                bounded = np.asarray(audio, dtype=np.float32).reshape(-1)
+                self.calls.append(int(bounded.size))
+                if not np.any(np.abs(bounded) > 0.01):
+                    raise AssertionError("selected metric window missed sparse speech")
+                return {"sig": 4.0, "bak": 3.8, "ovrl": 3.9}
+
+        vad_payload = b"single-speech-vad"
+        dnsmos_payload = b"single-speech-dnsmos"
+        source = VirtualSparseSpeech()
+        metrics_backend = RecordingMetrics()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            (model_dir / "vad.onnx").write_bytes(vad_payload)
+            (model_dir / "dnsmos.onnx").write_bytes(dnsmos_payload)
+            source_path = model_dir / "source.wav"
+            source_bytes = _pcm16_wav(source_path)
+            runtime = AdvisoryInferenceRuntime(
+                RuntimeConfig(
+                    model_dir=model_dir,
+                    metric_ids=("dnsmos",),
+                    artifacts=(
+                        self._spec("silero-vad", "silero_vad", "vad.onnx", vad_payload),
+                        self._spec("dnsmos", "dnsmos", "dnsmos.onnx", dnsmos_payload),
+                    ),
+                    max_analysis_seconds=duration_seconds,
+                ),
+                vad_factory=lambda _: SingleSpeechVad(),
+                metrics_factory=lambda _: metrics_backend,
+            )
+            with patch.object(
+                module,
+                "_read_pcm_wav",
+                return_value=(source, sample_rate, 1, float(duration_seconds)),
+            ):
+                report = runtime.analyze_wav(
+                    source_path,
+                    job_id="single_sparse_speech",
+                    source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+                )
+
+        self.assertEqual(source.full_array_requests, 0)
+        self.assertTrue(metrics_backend.calls)
+        self.assertLessEqual(source.max_slice_samples, sample_rate * 10)
+        self.assertTrue(report["metrics"]["dnsmos.ovrl"]["available"])
+        self.assertEqual(report["telemetry"]["components"]["dnsmos"]["status"], "available")
+
     def test_runtime_scores_sparse_editorial_timeline_from_speech_active_windows_only(self) -> None:
         import numpy as np
 
@@ -693,6 +1072,100 @@ class RuntimeModelContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "out-of-range-float-samples"):
                 module._read_pcm_wav(source_path, max_duration_seconds=10.0)
 
+    def test_long_float32_validation_reaches_an_invalid_tail_with_bounded_reads_and_no_full_allocation(self) -> None:
+        import numpy as np
+
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
+        validation_module = __import__(
+            "extreme_worker.wav_validation",
+            fromlist=["_FLOAT_SCAN_CHUNK_SAMPLES"],
+        )
+        sample_rate = 48_000
+        frame_count = (
+            module._METRIC_WINDOW_BYTE_CAP // np.dtype(np.float32).itemsize
+            + validation_module._FLOAT_SCAN_CHUNK_SAMPLES
+            + 3
+        )
+        data_bytes = frame_count * np.dtype(np.float32).itemsize
+        scan_byte_cap = validation_module._FLOAT_SCAN_CHUNK_SAMPLES * 4
+        fmt = struct.pack(
+            "<HHIIHH",
+            3,
+            1,
+            sample_rate,
+            sample_rate * 4,
+            4,
+            32,
+        )
+        header = (
+            b"RIFF"
+            + struct.pack("<I", 36 + data_bytes)
+            + b"WAVE"
+            + b"fmt "
+            + struct.pack("<I", len(fmt))
+            + fmt
+            + b"data"
+            + struct.pack("<I", data_bytes)
+        )
+        read_ranges: list[tuple[int, int]] = []
+
+        class RecordingReader:
+            def __init__(self, handle) -> None:
+                self._handle = handle
+
+            def __enter__(self):
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._handle.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+            def read(self, byte_count: int = -1) -> bytes:
+                if byte_count < 0 or byte_count > scan_byte_cap:
+                    raise AssertionError("float validation read exceeded its bounded scan chunk")
+                start = self._handle.tell()
+                payload = self._handle.read(byte_count)
+                read_ranges.append((start, start + len(payload)))
+                return payload
+
+        original_empty = np.empty
+
+        def reject_full_duration_empty(shape, *args, **kwargs):
+            item_count = math.prod(shape) if isinstance(shape, tuple) else int(shape)
+            dtype_arg = kwargs.get("dtype", args[0] if args else np.float64)
+            if np.dtype(dtype_arg) == np.dtype(np.float32) and item_count >= frame_count:
+                raise AssertionError("long float validation allocated the full source timeline")
+            return original_empty(shape, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir, "long-invalid-tail-float32.wav")
+            with source_path.open("wb") as source:
+                source.write(header)
+                source.seek(len(header) + data_bytes - 4)
+                source.write(struct.pack("<f", math.nan))
+
+            original_open = Path.open
+
+            def recording_open(path: Path, mode: str = "r", *args, **kwargs):
+                handle = original_open(path, mode, *args, **kwargs)
+                if Path(path) == source_path and mode == "rb":
+                    return RecordingReader(handle)
+                return handle
+
+            with (
+                patch.object(Path, "open", new=recording_open),
+                patch.object(np, "empty", side_effect=reject_full_duration_empty),
+                self.assertRaisesRegex(ValueError, "non-finite-float-samples"),
+            ):
+                module._read_pcm_wav(source_path, max_duration_seconds=60.0)
+
+        self.assertTrue(read_ranges)
+        self.assertLessEqual(max(stop - start for start, stop in read_ranges), scan_byte_cap)
+        self.assertGreaterEqual(max(stop for _, stop in read_ranges), len(header) + data_bytes)
+
     def test_runtime_decodes_large_pcm_payload_in_bounded_chunks(self) -> None:
         module = __import__(self.INFERENCE_MODULE, fromlist=["_read_pcm_wav"])
         chunk_frames = module._PCM_DECODE_CHUNK_FRAMES
@@ -852,6 +1325,69 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(np.asarray(sessions[0].feeds[0]["state"]).sum(), 0)
         self.assertEqual(np.asarray(sessions[0].feeds[2]["state"]).sum(), 0)
 
+    def test_silero_stream_preserves_recurrent_state_and_context_across_input_boundaries(self) -> None:
+        import numpy as np
+
+        module = __import__(self.INFERENCE_MODULE, fromlist=["SileroOnnxBackend"])
+        sessions: list[object] = []
+
+        class FakeOptions:
+            pass
+
+        class FakeSession:
+            def __init__(self, _path, *, sess_options, providers) -> None:
+                self.options = sess_options
+                self.providers = providers
+                self.feeds: list[dict[str, object]] = []
+                sessions.append(self)
+
+            def get_inputs(self):
+                return [SimpleNamespace(name=name) for name in ("input", "state", "sr")]
+
+            def run(self, _outputs, feed):
+                copied_feed = {
+                    name: np.asarray(value).copy()
+                    for name, value in feed.items()
+                }
+                self.feeds.append(copied_feed)
+                call_number = len(self.feeds)
+                return (
+                    np.asarray([[call_number / 10]], dtype=np.float32),
+                    np.full((2, 1, 128), call_number, dtype=np.float32),
+                )
+
+        fake_ort = types.ModuleType("onnxruntime")
+        fake_ort.SessionOptions = FakeOptions
+        fake_ort.ExecutionMode = SimpleNamespace(ORT_SEQUENTIAL="sequential")
+        fake_ort.InferenceSession = FakeSession
+        source_chunks = (
+            np.full(300, 1.0, dtype=np.float32),
+            np.full(400, 2.0, dtype=np.float32),
+            np.full(500, 3.0, dtype=np.float32),
+        )
+
+        with patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+            backend = module.SileroOnnxBackend(Path("pinned.onnx"))
+            probabilities = backend.score_stream(iter(source_chunks))
+
+        self.assertTrue(np.allclose(probabilities, (0.1, 0.2, 0.3)))
+        self.assertEqual(len(sessions), 1)
+        feeds = sessions[0].feeds
+        self.assertEqual(len(feeds), 3)
+        self.assertTrue(all(feed["input"].shape == (1, 576) for feed in feeds))
+        self.assertTrue(np.all(feeds[0]["state"] == 0))
+        self.assertTrue(np.all(feeds[1]["state"] == 1))
+        self.assertTrue(np.all(feeds[2]["state"] == 2))
+        self.assertTrue(np.all(feeds[0]["input"][0, :64] == 0))
+        self.assertTrue(np.all(feeds[1]["input"][0, :64] == 2))
+        self.assertTrue(np.all(feeds[2]["input"][0, :64] == 3))
+        self.assertTrue(np.all(feeds[0]["input"][0, 64:364] == 1))
+        self.assertTrue(np.all(feeds[0]["input"][0, 364:] == 2))
+        self.assertTrue(np.all(feeds[1]["input"][0, 64:252] == 2))
+        self.assertTrue(np.all(feeds[1]["input"][0, 252:] == 3))
+        self.assertTrue(np.all(feeds[2]["input"][0, 64:240] == 3))
+        self.assertTrue(np.all(feeds[2]["input"][0, 240:] == 0))
+
     def test_speech_metrics_backend_forces_verified_local_paths_and_never_resolves_remote_models(self) -> None:
         module = __import__(self.INFERENCE_MODULE, fromlist=["SpeechOnnxMetricsBackend"])
 
@@ -908,6 +1444,61 @@ class RuntimeModelContractTests(unittest.TestCase):
         self.assertEqual(len(resampled), 1_600)
         with self.assertRaises(ValueError):
             module._decode_pcm_samples(b"\x00", 1, 1)
+
+    def test_streaming_vad_resample_has_exact_timeline_length_and_bounded_chunks_at_every_allowed_rate(self) -> None:
+        import numpy as np
+
+        module = __import__(self.INFERENCE_MODULE, fromlist=["_iter_resampled_for_vad"])
+
+        for sample_rate in (16_000, 24_000, 44_100, 48_000):
+            with self.subTest(sample_rate=sample_rate):
+                source_samples = sample_rate * 9 + 137
+                expected_output_samples = round(source_samples * 16_000 / sample_rate)
+                max_source_window = (
+                    math.ceil(module._VAD_STREAM_CHUNK_SAMPLES * sample_rate / 16_000)
+                    + 2
+                )
+
+                class VirtualAudio:
+                    def __init__(self) -> None:
+                        self.requests: list[tuple[int, int]] = []
+                        self.full_array_requests = 0
+
+                    def __len__(self) -> int:
+                        return source_samples
+
+                    def __array__(self, *_args, **_kwargs):
+                        self.full_array_requests += 1
+                        raise AssertionError("streaming resample materialized the full source")
+
+                    def __getitem__(self, key):
+                        if not isinstance(key, slice) or key.step not in (None, 1):
+                            raise AssertionError("streaming resample must use contiguous slices")
+                        start, stop, step = key.indices(source_samples)
+                        if step != 1 or stop - start > max_source_window:
+                            raise AssertionError("streaming resample exceeded its source-window cap")
+                        self.requests.append((start, stop))
+                        return np.linspace(-0.25, 0.25, stop - start, dtype=np.float32)
+
+                source = VirtualAudio()
+                chunks = tuple(module._iter_resampled_for_vad(source, sample_rate))
+                chunk_sizes = [int(np.asarray(chunk).size) for chunk in chunks]
+
+                self.assertEqual(source.full_array_requests, 0)
+                self.assertTrue(source.requests)
+                self.assertGreater(len(chunks), 1)
+                self.assertEqual(sum(chunk_sizes), expected_output_samples)
+                self.assertEqual(
+                    chunk_sizes[:-1],
+                    [module._VAD_STREAM_CHUNK_SAMPLES] * (len(chunk_sizes) - 1),
+                )
+                self.assertGreater(chunk_sizes[-1], 0)
+                self.assertLessEqual(chunk_sizes[-1], module._VAD_STREAM_CHUNK_SAMPLES)
+                self.assertTrue(all(np.asarray(chunk).dtype == np.float32 for chunk in chunks))
+                self.assertLessEqual(
+                    max(stop - start for start, stop in source.requests),
+                    max_source_window,
+                )
 
 
 if __name__ == "__main__":

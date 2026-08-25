@@ -379,6 +379,52 @@ class EnhancementCandidateTests(unittest.TestCase):
         self.assertTrue(assessment.safe_to_use)
         self.assertEqual(assessment.reason, "technical-integrity-passed")
 
+    def test_adaptive_render_trims_only_rnnoise_tail_padding_to_exact_source_frames(self) -> None:
+        render_candidate, WavLimits = require_symbols(
+            self,
+            "extreme_worker.enhancement",
+            "_render_adaptive_rnnoise_candidate",
+            "WavLimits",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = root / "source.wav"
+            padded_wet_path = root / "padded-wet.wav"
+            short_wet_path = root / "short-wet.wav"
+            candidate_path = root / "candidate.wav"
+            self._write_pcm16_voice(source_path, frames=4_800, amplitude=0.25)
+            self._write_pcm16_voice(padded_wet_path, frames=4_926, amplitude=0.20)
+            self._write_pcm16_voice(short_wet_path, frames=4_799, amplitude=0.20)
+            limits = WavLimits(
+                max_upload_bytes=2 * 1024 * 1024,
+                allowed_sample_rates=frozenset({48_000}),
+                allowed_channels=frozenset({1}),
+                allowed_sample_width_bytes=frozenset({2}),
+                max_duration_seconds=2,
+                max_decoded_frames=96_000,
+            )
+
+            render_candidate(
+                source_path,
+                padded_wet_path,
+                candidate_path,
+                limits=limits,
+                mix_curve=(0.05,) * 10,
+            )
+            with wave.open(str(candidate_path), "rb") as candidate:
+                candidate_frames = candidate.getnframes()
+
+            with self.assertRaisesRegex(RuntimeError, "candidate-integrity-mismatch"):
+                render_candidate(
+                    source_path,
+                    short_wet_path,
+                    candidate_path,
+                    limits=limits,
+                    mix_curve=(0.05,) * 10,
+                )
+
+        self.assertEqual(candidate_frames, 4_800)
+
     def test_candidate_integrity_fails_open_on_any_geometry_mismatch(self) -> None:
         assess_integrity, WavLimits = require_symbols(
             self,

@@ -10217,6 +10217,9 @@ const summarizeFailureReason = (error: unknown) => {
         setStatus("Failed");
       }
     } finally {
+      if (activeExtremeMlSourceBatchRef.current === extremeMlBatchId) {
+        activeExtremeMlSourceBatchRef.current = null;
+      }
       extremeMlBatchId = null;
       extremeMlEnhancementBatch = null;
       processingControlsOverrideRef.current = null;

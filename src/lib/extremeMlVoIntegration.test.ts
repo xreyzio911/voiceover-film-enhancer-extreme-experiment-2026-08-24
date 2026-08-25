@@ -459,6 +459,17 @@ test("per-file render waits and worker polls expand for long sources", () => {
   assert.ok(Number.isInteger(getMaxPolls(longSourceBytes)));
 });
 
+test("poll budget does not underestimate a thirty-minute 16 kHz mono PCM16 source", () => {
+  const { getMaxPolls } = requireProgressiveEnhancementPolicy();
+  const durationSeconds = 30 * 60;
+  const sourceBytes = durationSeconds * 16_000 * 2;
+
+  assert.ok(
+    getMaxPolls(sourceBytes) >= durationSeconds,
+    "the smallest supported lossless layout must not be mistaken for a short file",
+  );
+});
+
 test("render/source quality comparison exposes only finite paired advisory deltas", () => {
   const source = makeReport([0.1], {
     metrics: {
@@ -526,6 +537,11 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
   assert.doesNotMatch(source, /\bgetExtremeMlSnapshotGraceMs\b/);
   assert.doesNotMatch(source, /Render snapshot accepted|snapshot-timeout/i);
   assert.doesNotMatch(source, /maxPolls:\s*30\b/);
+  assert.match(
+    source,
+    /activeExtremeMlSourceBatchRef\.current\s*===\s*extremeMlBatchId[\s\S]*?activeExtremeMlSourceBatchRef\.current\s*=\s*null/,
+    "finished or failed runs must reject stale source-ML callbacks",
+  );
   assert.match(
     source,
     /maxPolls:\s*getExtremeMlMaxPollsForSourceBytes\(input\.source\.size\)/,

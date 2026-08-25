@@ -481,7 +481,7 @@ def _render_adaptive_rnnoise_candidate(
     if (
         source_info.sample_rate != rnnoise_info.sample_rate
         or source_info.channels != rnnoise_info.channels
-        or source_info.frames != rnnoise_info.frames
+        or rnnoise_info.frames < source_info.frames
     ):
         raise RuntimeError("candidate-integrity-mismatch")
     samples_per_mix_frame = max(1, round(source_info.sample_rate * 0.01))
