@@ -25,7 +25,8 @@ const REVISION = "b".repeat(40);
 
 type ProgressiveEnhancementBatch = Readonly<{
   waitForOutcome: (key: string, timeoutMs: number) => Promise<ExtremeEnhancementOutcome>;
-  completion: Promise<ReadonlyMap<string, ExtremeEnhancementOutcome>>;
+  completion: Promise<void>;
+  dispose: () => void;
 }>;
 
 type ProgressiveEnhancementPolicy = typeof extremeMlVoPolicy & Readonly<{
@@ -329,6 +330,7 @@ test("six-file enhancement keeps draining two lanes after a synthetic global sna
   const firstTwoRelease = new Promise<void>((resolve) => {
     releaseFirstTwo = resolve;
   });
+  const outcomesByKey = new Map<string, ExtremeEnhancementOutcome>();
 
   const batch = start({
     jobs,
@@ -342,6 +344,7 @@ test("six-file enhancement keeps draining two lanes after a synthetic global sna
       active -= 1;
       return { status: "unavailable", reason: "poll-timeout" };
     },
+    onOutcome: ({ key, outcome }) => outcomesByKey.set(key, outcome),
   });
 
   await firstTwoStarted;
@@ -354,7 +357,10 @@ test("six-file enhancement keeps draining two lanes after a synthetic global sna
   assert.equal(maximumActive, EXTREME_ML_MAX_CONCURRENT_ANALYSES);
 
   releaseFirstTwo();
-  const outcomesByKey = await batch.completion;
+  for (const job of jobs) {
+    await batch.waitForOutcome(job.key, 1_000);
+  }
+  await batch.completion;
 
   assert.deepEqual(
     [...launched].sort(),
@@ -367,6 +373,53 @@ test("six-file enhancement keeps draining two lanes after a synthetic global sna
   }
 });
 
+test("six-file enhancement backpressures completed candidates until the render consumes them", async () => {
+  const { start } = requireProgressiveEnhancementPolicy();
+  const jobs = Array.from({ length: 6 }, (_, index) => ({
+    key: `bounded-candidate-${index}`,
+    source: new Blob([String(index)], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: `enhance:bounded-candidate:${index}`,
+  }));
+  const report = makeReport([0.9, 0.8]);
+  let launched = 0;
+  let completed = 0;
+  let markFirstPairComplete: () => void = () => undefined;
+  const firstPairComplete = new Promise<void>((resolve) => {
+    markFirstPairComplete = resolve;
+  });
+
+  const batch = start({
+    jobs,
+    enhance: async (): Promise<ExtremeEnhancementOutcome> => {
+      launched += 1;
+      return {
+        status: "succeeded",
+        report,
+        candidate: new Blob([new Uint8Array(4 * 1024 * 1024)], { type: "audio/wav" }),
+      };
+    },
+    onOutcome: () => {
+      completed += 1;
+      if (completed === EXTREME_ML_MAX_CONCURRENT_ANALYSES) markFirstPairComplete();
+    },
+  });
+
+  await firstPairComplete;
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    launched,
+    EXTREME_ML_MAX_CONCURRENT_ANALYSES,
+    "background lanes must not retain candidates for the entire long batch while the browser renders earlier files",
+  );
+
+  for (const job of jobs) {
+    assert.equal((await batch.waitForOutcome(job.key, 1_000)).status, "succeeded");
+  }
+  await batch.completion;
+  assert.equal(completed, jobs.length);
+});
+
 test("six-file enhancement preserves every advisory ML report when RNNoise has no candidate", async () => {
   const { start } = requireProgressiveEnhancementPolicy();
   const jobs = Array.from({ length: 6 }, (_, index) => ({
@@ -375,6 +428,7 @@ test("six-file enhancement preserves every advisory ML report when RNNoise has n
     contentType: "audio/wav",
     idempotencyKey: `enhance:report-only:${index}`,
   }));
+  const outcomesByKey = new Map<string, ExtremeEnhancementOutcome>();
 
   const batch = start({
     jobs,
@@ -389,9 +443,13 @@ test("six-file enhancement preserves every advisory ML report when RNNoise has n
       });
       return { status: "report-only", report, reason: "rnnoise-model-unavailable" };
     },
+    onOutcome: ({ key, outcome }) => outcomesByKey.set(key, outcome),
   });
 
-  const outcomesByKey = await batch.completion;
+  for (const job of jobs) {
+    await batch.waitForOutcome(job.key, 1_000);
+  }
+  await batch.completion;
   assert.equal(outcomesByKey.size, jobs.length);
   for (const [index, job] of jobs.entries()) {
     const outcome = outcomesByKey.get(job.key);
@@ -443,8 +501,7 @@ test("a per-file timeout keeps the original render path while a late report rema
   });
 
   finishEnhancement();
-  const completedOutcome = (await batch.completion).get(job.key);
-  assert.equal(completedOutcome?.status, "report-only");
+  await batch.completion;
   assert.equal(reportsByKey.get(job.key), lateReport);
 });
 
@@ -530,6 +587,8 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
   assert.match(source, /const enhancementJobs = jobs\.map/);
   assert.match(source, /onOutcome:\s*\(\{ key, outcome \}\) =>/);
   assert.match(source, /retainLateExtremeMlReport/);
+  assert.match(source, /extremeMlEnhancementBatch\?\.dispose\(\)/);
+  assert.doesNotMatch(source, /extremeMlOutcomesByInputName/);
   assert.doesNotMatch(source, /\banalyzeExtremeSourcesBounded\b/);
   assert.doesNotMatch(source, /\banalyzeSourceWithExtremeWorker\b/);
   assert.doesNotMatch(source, /\bacceptingExtremeMl(?:Evidence|Enhancements)\b/);

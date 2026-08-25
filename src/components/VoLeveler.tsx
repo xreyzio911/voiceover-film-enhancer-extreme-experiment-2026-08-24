@@ -8120,7 +8120,6 @@ const summarizeFailureReason = (error: unknown) => {
     let finalConsonantPassStarted = false;
     let extremeMlEnhancementBatch: ExtremeMlProgressiveEnhancementBatch | null = null;
     let extremeMlBatchId: string | null = null;
-    let extremeMlOutcomesByInputName: ReadonlyMap<string, ExtremeEnhancementOutcome> = new Map();
     let completedExtremeMlRenderInputs: ReadonlySet<string> = new Set();
     const retainLateExtremeMlReport = (
       batchId: string,
@@ -8169,12 +8168,15 @@ const summarizeFailureReason = (error: unknown) => {
           }),
           onOutcome: ({ key, outcome }) => {
             if (activeExtremeMlSourceBatchRef.current !== batchId) return;
-            extremeMlOutcomesByInputName = new Map([
-              ...extremeMlOutcomesByInputName,
-              [key, outcome],
-            ]);
             if (completedExtremeMlRenderInputs.has(key)) {
               retainLateExtremeMlReport(batchId, key, outcome);
+              return;
+            }
+            if ("report" in outcome) {
+              extremeSourceReportsByInputNameRef.current = new Map([
+                ...extremeSourceReportsByInputNameRef.current,
+                [key, outcome.report],
+              ]);
             }
           },
         });
@@ -10023,14 +10025,6 @@ const summarizeFailureReason = (error: unknown) => {
           ...completedExtremeMlRenderInputs,
           job.inputName,
         ]);
-        const completedExtremeMlOutcome = extremeMlOutcomesByInputName.get(job.inputName);
-        if (extremeMlBatchId && completedExtremeMlOutcome) {
-          retainLateExtremeMlReport(
-            extremeMlBatchId,
-            job.inputName,
-            completedExtremeMlOutcome,
-          );
-        }
         workerCumulativeAudioSec += estDurationSec;
         i += 1;
 
@@ -10220,6 +10214,7 @@ const summarizeFailureReason = (error: unknown) => {
       if (activeExtremeMlSourceBatchRef.current === extremeMlBatchId) {
         activeExtremeMlSourceBatchRef.current = null;
       }
+      extremeMlEnhancementBatch?.dispose();
       extremeMlBatchId = null;
       extremeMlEnhancementBatch = null;
       processingControlsOverrideRef.current = null;

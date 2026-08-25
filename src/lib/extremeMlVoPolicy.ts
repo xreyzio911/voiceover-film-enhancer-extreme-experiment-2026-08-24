@@ -129,23 +129,23 @@ export const analyzeExtremeSourcesBounded = async ({
 }>): Promise<void> => {
   const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
 
-  const runLane = async (index: number): Promise<void> => {
-    if (index >= jobs.length) return;
-    const job = jobs[index];
-    let outcome: ExtremeAnalysisOutcome;
-    try {
-      outcome = await analyze({
-        source: job.source,
-        contentType: job.contentType,
-        idempotencyKey: job.idempotencyKey,
-      });
-    } catch {
-      // Never expose thrown provider details because they can contain access
-      // tokens or infrastructure metadata.
-      outcome = unavailableOutcome();
+  const runLane = async (lane: number): Promise<void> => {
+    for (let index = lane; index < jobs.length; index += laneCount) {
+      const job = jobs[index];
+      let outcome: ExtremeAnalysisOutcome;
+      try {
+        outcome = await analyze({
+          source: job.source,
+          contentType: job.contentType,
+          idempotencyKey: job.idempotencyKey,
+        });
+      } catch {
+        // Never expose thrown provider details because they can contain access
+        // tokens or infrastructure metadata.
+        outcome = unavailableOutcome();
+      }
+      onOutcome(Object.freeze({ key: job.key, outcome }));
     }
-    onOutcome(Object.freeze({ key: job.key, outcome }));
-    await runLane(index + laneCount);
   };
 
   await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
@@ -167,21 +167,21 @@ export const enhanceExtremeSourcesBounded = async ({
 }>): Promise<void> => {
   const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
 
-  const runLane = async (index: number): Promise<void> => {
-    if (index >= jobs.length) return;
-    const job = jobs[index];
-    let outcome: ExtremeEnhancementOutcome;
-    try {
-      outcome = await enhance({
-        source: job.source,
-        contentType: job.contentType,
-        idempotencyKey: job.idempotencyKey,
-      });
-    } catch {
-      outcome = unavailableEnhancementOutcome();
+  const runLane = async (lane: number): Promise<void> => {
+    for (let index = lane; index < jobs.length; index += laneCount) {
+      const job = jobs[index];
+      let outcome: ExtremeEnhancementOutcome;
+      try {
+        outcome = await enhance({
+          source: job.source,
+          contentType: job.contentType,
+          idempotencyKey: job.idempotencyKey,
+        });
+      } catch {
+        outcome = unavailableEnhancementOutcome();
+      }
+      onOutcome(Object.freeze({ key: job.key, outcome }));
     }
-    onOutcome(Object.freeze({ key: job.key, outcome }));
-    await runLane(index + laneCount);
   };
 
   await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
@@ -189,12 +189,15 @@ export const enhanceExtremeSourcesBounded = async ({
 
 export type ExtremeMlProgressiveEnhancementBatch = Readonly<{
   waitForOutcome: (key: string, timeoutMs: number) => Promise<ExtremeEnhancementOutcome>;
-  completion: Promise<ReadonlyMap<string, ExtremeEnhancementOutcome>>;
+  completion: Promise<void>;
+  dispose: () => void;
 }>;
 
 type ProgressiveEnhancementDeferred = Readonly<{
   promise: Promise<ExtremeEnhancementOutcome>;
   resolve: (outcome: ExtremeEnhancementOutcome) => void;
+  consumed: Promise<void>;
+  consume: () => void;
 }>;
 
 const createProgressiveEnhancementDeferred = (): ProgressiveEnhancementDeferred => {
@@ -202,14 +205,23 @@ const createProgressiveEnhancementDeferred = (): ProgressiveEnhancementDeferred 
   const promise = new Promise<ExtremeEnhancementOutcome>((resolve) => {
     resolveOutcome = resolve;
   });
-  return Object.freeze({ promise, resolve: resolveOutcome });
+  let markConsumed: () => void = () => undefined;
+  const consumed = new Promise<void>((resolve) => {
+    markConsumed = resolve;
+  });
+  return Object.freeze({
+    promise,
+    resolve: resolveOutcome,
+    consumed,
+    consume: markConsumed,
+  });
 };
 
 /**
- * Starts every enhancement job immediately through the shared two-lane queue.
- * Callers may wait for only the file they are about to render; timing out that
- * wait returns an explicit fail-open outcome without cancelling the background
- * upload, the later queue entries, or the browser delivery.
+ * Starts enhancement through a shared two-lane queue. A completed lane waits
+ * until its candidate is consumed or timed out before advancing, so six large
+ * files cannot accumulate six candidate Blobs while the browser is rendering
+ * the first file. Timing out remains fail-open and does not cancel later jobs.
  */
 export const startExtremeMlProgressiveEnhancementBatch = ({
   jobs,
@@ -223,30 +235,39 @@ export const startExtremeMlProgressiveEnhancementBatch = ({
   const deferredByKey = new Map<string, ProgressiveEnhancementDeferred>(
     jobs.map((job) => [job.key, createProgressiveEnhancementDeferred()]),
   );
-  let outcomesByKey: ReadonlyMap<string, ExtremeEnhancementOutcome> = new Map();
-
-  const completion = enhanceExtremeSourcesBounded({
-    jobs,
-    enhance,
-    onOutcome: (result) => {
-      outcomesByKey = new Map([...outcomesByKey, [result.key, result.outcome]]);
-      deferredByKey.get(result.key)?.resolve(result.outcome);
+  const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
+  const runLane = async (lane: number): Promise<void> => {
+    for (let index = lane; index < jobs.length; index += laneCount) {
+      const job = jobs[index];
+      const deferred = deferredByKey.get(job.key);
+      if (!deferred) continue;
+      let outcome: ExtremeEnhancementOutcome;
       try {
-        onOutcome?.(result);
+        outcome = await enhance({
+          source: job.source,
+          contentType: job.contentType,
+          idempotencyKey: job.idempotencyKey,
+        });
+      } catch {
+        outcome = unavailableEnhancementOutcome();
+      }
+      deferred.resolve(outcome);
+      try {
+        onOutcome?.(Object.freeze({ key: job.key, outcome }));
       } catch {
         // UI telemetry must never stop a worker lane or later batch entries.
       }
-    },
-  }).then(() => new Map(
-    jobs.map((job) => [
-      job.key,
-      outcomesByKey.get(job.key) ?? unavailableEnhancementOutcome(),
-    ]),
-  ));
+      await deferred.consumed;
+      deferredByKey.delete(job.key);
+    }
+  };
+  const completion = Promise.all(
+    Array.from({ length: laneCount }, (_, lane) => runLane(lane)),
+  ).then(() => undefined);
 
   const waitForOutcome = async (key: string, timeoutMs: number) => {
-    const outcomePromise = deferredByKey.get(key)?.promise;
-    if (!outcomePromise) return unavailableEnhancementOutcome("per-file-timeout");
+    const outcomeDeferred = deferredByKey.get(key);
+    if (!outcomeDeferred) return unavailableEnhancementOutcome("per-file-timeout");
     const boundedTimeoutMs = Number.isFinite(timeoutMs)
       ? Math.max(0, Math.floor(timeoutMs))
       : 0;
@@ -257,16 +278,21 @@ export const startExtremeMlProgressiveEnhancementBatch = ({
         settled = true;
         resolve(unavailableEnhancementOutcome("per-file-timeout"));
       }, boundedTimeoutMs);
-      void outcomePromise.then((outcome) => {
+      void outcomeDeferred.promise.then((outcome) => {
         if (settled) return;
         settled = true;
         globalThis.clearTimeout(timer);
         resolve(outcome);
       });
-    });
+    }).finally(() => outcomeDeferred.consume());
   };
 
-  return Object.freeze({ waitForOutcome, completion });
+  const dispose = () => {
+    for (const deferred of deferredByKey.values()) deferred.consume();
+    deferredByKey.clear();
+  };
+
+  return Object.freeze({ waitForOutcome, completion, dispose });
 };
 
 /**
@@ -285,21 +311,21 @@ export const analyzeExtremeRenderedOutputsBounded = async ({
 }>): Promise<void> => {
   const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
 
-  const runLane = async (index: number): Promise<void> => {
-    if (index >= jobs.length) return;
-    const job = jobs[index];
-    let outcome: ExtremeRenderedAnalysisOutcome;
-    try {
-      outcome = await analyze({
-        source: job.source,
-        contentType: job.contentType,
-        idempotencyKey: job.idempotencyKey,
-      });
-    } catch {
-      outcome = unavailableRenderedOutcome();
+  const runLane = async (lane: number): Promise<void> => {
+    for (let index = lane; index < jobs.length; index += laneCount) {
+      const job = jobs[index];
+      let outcome: ExtremeRenderedAnalysisOutcome;
+      try {
+        outcome = await analyze({
+          source: job.source,
+          contentType: job.contentType,
+          idempotencyKey: job.idempotencyKey,
+        });
+      } catch {
+        outcome = unavailableRenderedOutcome();
+      }
+      onOutcome(Object.freeze({ key: job.key, outcome }));
     }
-    onOutcome(Object.freeze({ key: job.key, outcome }));
-    await runLane(index + laneCount);
   };
 
   await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));

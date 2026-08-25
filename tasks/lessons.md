@@ -125,3 +125,21 @@
 - What went wrong: `.env` pointed `AUDIO_SPLITTER_AUDIO_SEPARATOR_MODEL_DIR` to `.audio-separator-models`, but that directory did not exist, so `audio-separator` failed before loading the cached model.
 - Rule to prevent it: Create configured model/cache directories in setup scripts and again at runtime before initializing ML libraries.
 - How to verify next time: Smoke test with the same model directory configured in `.env`, not only the library's default user cache.
+
+## 2026-08-25 - Long-Batch ML Needs Backpressure At Both Ends
+
+- What went wrong: The worker could materialize full long-file PCM and resampled arrays, while the browser's progressive queue retained every completed candidate Blob. A six-file batch could therefore exceed the Render worker's memory limit or accumulate enough browser memory that later files appeared to lose ML.
+- Rule to prevent it: Stream the full VAD timeline with recurrent state, score bounded speech-aware metric windows, serialize worker inference, and let each browser lane advance only after its current per-file outcome is consumed or timed out. Never retain a batch-wide map of full candidate Blobs.
+- How to verify next time: Start from a fresh worker store, run six current long WAVs in one browser batch, prove three two-file enhancement waves all complete, inspect every report for the full pinned model set, capture the exact outputs, and sample worker memory observationally without turning it into a delivery gate.
+
+## 2026-08-25 - Health Checks Do Not Prove Ticket Authentication
+
+- What went wrong: The app and worker both returned HTTP 200 health responses, but their local internal secrets differed; the first ticket requests returned 401 and the UI correctly continued fail-open without ML.
+- Rule to prevent it: A local or production ML preflight must exercise the app-to-worker ticket path with harmless bounded metadata, not merely call independent health endpoints. Never print or persist the shared secret while doing so.
+- How to verify next time: Require a 200 ticket response with the expected worker origin before starting the expensive corpus batch, then confirm the fresh worker database receives the expected job scopes.
+
+## 2026-08-25 - Server HTML Is Not Browser Hydration Proof
+
+- What went wrong: Next dev served a visually complete page while its HMR/origin path was blocked, leaving React unhydrated; DOM-level file injection looked successful even though the real app state had not changed.
+- Rule to prevent it: Bind local browser QA explicitly to the intended loopback host and verify a stateful React behavior before trusting file selection or screenshots.
+- How to verify next time: Toggle the Extreme ML control and confirm its reactive copy changes, set six files through the native input, and require the real Run button to enable before starting the batch.

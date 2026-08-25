@@ -549,3 +549,29 @@ Create a fully separate `Extreme Experiment` edition that adds learned perceptio
 - GitHub `main` reached code-bearing commit `e7c8a298a5139056005271371d093434826869c7`. Vercel production deployment `dpl_CQySug3NYzVWTqhNZYsMhKx6acKP` was `READY`, `Current`, and attached to `https://voiceover-film-enhancer-experiment.vercel.app/`; the X-profile production smoke returned the signed-in Experiment workspace and the deployment-filtered runtime log showed the primary-domain request at HTTP 200 with zero warning, error, or fatal entries.
 - Audible-quality status remains conditional until an exact current delivered WAV is completed through the browser path and level-matched auditioned; code metrics and synthetic tests are not presented as listening proof.
 - Kimi K3 consultation was requested, but the plugin failed inside its CLI/model lookup before returning advice.
+
+# 2026-08-25 Long-Batch Extreme ML And Adaptive RNNoise
+
+## Checklist
+
+- [x] Reproduce the six-file/two-lane global-snapshot starvation before changing orchestration.
+- [x] Replace full-duration worker PCM/resample allocations with bounded reads, exact streaming 16 kHz VAD, recurrent Silero state, and bounded speech-aware metric windows.
+- [x] Keep Silero VAD, DNSMOS, DNSMOS P808, SIGMOS, and RNNoise active on long enhancement jobs instead of treating long duration as an unavailable path.
+- [x] Attempt pinned RNNoise for every technically valid enhancement source and continuously withdraw its subtle dry/wet authority around weak speech, breaths, transient and aperiodic vocal events, plosives, consonants, and expressive crests.
+- [x] Keep `gainPlanner` as the sole broadband/time-varying gain authority; make all learned scores advisory and retain integrity-only candidate fail-open.
+- [x] Bound browser candidate retention to the two consumer lanes and release each completed candidate when its matching render consumes or times out.
+- [x] Complete one clean six-file browser batch, capture all exact browser-delivered WAVs, and rerun all four analysis models on those exact bytes.
+- [x] Run the explicit six-pair current-corpus stability ledger, full browser/TypeScript and worker suites, TypeScript, lint, production build, dependency audit, and diff checks.
+- [x] Keep all work local: no push, deployment, secret rotation, or external-service mutation.
+
+## Evidence And Boundaries
+
+- The clean browser run is `tasks/render-evidence/current-goal/extreme-ml-long-batch-20260825/browser-six-file/run-2026-08-25T06-27-12-661Z/final-summary.json`: six 596.8-1,158.0 second inputs completed in 332 seconds, `6/6` outputs were exposed and captured from the page-generated Blobs, `0` files failed, and every downloaded WAV retained exact duration, mono 48 kHz float32 geometry, and a distinct SHA-256 identity.
+- All six source reports list the pinned `silero-vad`, `dnsmos`, `dnsmos_p808`, `sigmos`, and `rnnoise-bd` models. Every component was available, all six RNNoise candidates passed technical integrity and were adopted, `gainDbChanged` stayed false, and `levelAuthority` stayed `gainPlanner`.
+- Source-relative RNNoise base mixes were 2.03-3.69%; protected-frame fractions were 77.4-97.6%, and the 10 ms adaptive median mix withdrew to 0.061-0.111%. These values establish subtle, continuously protected execution, not audible superiority.
+- Exact-output reports under `run-2026-08-25T06-27-12-661Z/exact-output-ml/` prove that Silero, DNSMOS, DNSMOS P808, and SIGMOS all returned `ready/ok` on each of the six browser-delivered WAVs with `audioMutation=false` and `gainDbChanged=false`.
+- The explicit six-pair current-corpus ledger is `run-2026-08-25T06-27-12-661Z/six-file-browser-voice-stability.json`: `6/6` pairs measured with zero errors, unmatched files, or missing roots. Its measurements remain diagnostic and do not gate delivery.
+- Observational memory sampling recorded worker peak working set `701,669,376` bytes (about 669 MiB) while the full six-file batch drained. This supports the Render memory-exhaustion diagnosis and the bounded-worker fix, but it is not a hard delivery threshold and does not exclude unrelated traffic or instance-size contributors.
+- Verification: `npm run test:audio-qc` passed `634` tests with `1` intentional optional skip; the worker `unittest` suite passed `162` tests with `1` Windows symlink-permission skip; TypeScript passed; ESLint passed with zero errors and four warnings confined to `.venv` coverage assets; the production build passed with the existing Audio Splitter NFT trace warning; and `npm audit --omit=dev` reported zero vulnerabilities.
+- Independent final review found no correctness or security issue in the worker streaming path, browser backpressure/disposal, stale-callback guards, fail-open policy, or gain-authority boundary.
+- No subjective naturalness or audible-quality improvement is claimed without a separate level-matched human audition of the exact downloaded WAVs. The proven result is long-batch execution, bounded resource use, model/report availability, candidate integrity, and source-relative protection.
