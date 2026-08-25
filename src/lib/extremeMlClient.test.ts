@@ -55,6 +55,85 @@ const validReport = (sourceSha256 = "a".repeat(64)): unknown => ({
   },
 });
 
+type ReportOnlyEnhancementOutcome = Readonly<{
+  status: "report-only";
+  report: ExtremeSourceReport;
+  reason: string;
+}>;
+
+const assertReportOnlyEnhancement = (
+  outcome: unknown,
+  expectedReason: string,
+  expectedSourceSha256: string,
+): ReportOnlyEnhancementOutcome => {
+  const reportOnly = outcome as Partial<ReportOnlyEnhancementOutcome> & Record<string, unknown>;
+  assert.equal(reportOnly.status, "report-only");
+  assert.equal(reportOnly.reason, expectedReason);
+  assert.equal("candidate" in reportOnly, false, "report-only outcomes must not expose candidate bytes");
+  assert.ok(reportOnly.report);
+  assert.equal(reportOnly.report.source.sha256, expectedSourceSha256);
+  assert.equal(reportOnly.report.levelAuthority, "gainPlanner");
+  assert.equal(reportOnly.report.canChangeGainDb, false);
+  assert.equal(reportOnly.report.metrics["dnsmos.ovrl"]?.available, true);
+  assert.equal(reportOnly.report.vad.frames.length, 3);
+  return reportOnly as ReportOnlyEnhancementOutcome;
+};
+
+const runEnhancementFixture = async ({
+  idempotencyKey,
+  reportFactory,
+  candidateResponse,
+  sourceBytes = new Uint8Array([1, 2, 3, 4]),
+}: Readonly<{
+  idempotencyKey: string;
+  reportFactory: (sourceSha256: string) => unknown;
+  candidateResponse?: () => Response | Promise<Response>;
+  sourceBytes?: Uint8Array;
+}>) => {
+  const source = new Blob([sourceBytes], { type: "audio/wav" });
+  const sourceSha256 = sha256Hex(sourceBytes);
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const jobId = `job_${idempotencyKey.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+  const accessToken = `token_${idempotencyKey.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+  const fetchImpl: typeof fetch = async (input, init = {}) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    calls.push({ url, init });
+    if (url === "/api/extreme-ml/ticket") {
+      return Response.json({
+        workerBaseUrl: "https://worker.example",
+        ticket: "ticket_opaque",
+        expiresAt: "2026-08-25T01:00:00.000Z",
+      });
+    }
+    if (url.endsWith("/v1/jobs")) {
+      return Response.json({ jobId, accessToken, uploadOffset: 0, maxChunkBytes: 16 });
+    }
+    if (url.endsWith("/input") && init.method === "PATCH") {
+      return new Response(null, {
+        status: 204,
+        headers: { "Upload-Offset": String(source.size) },
+      });
+    }
+    if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
+    if (url.endsWith(`/v1/jobs/${jobId}`)) return Response.json({ state: "succeeded" });
+    if (url.endsWith("/report")) return Response.json(reportFactory(sourceSha256));
+    if (url.endsWith("/candidate") && candidateResponse) return candidateResponse();
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  const outcome = await enhanceSourceWithExtremeWorker({
+    source,
+    contentType: "audio/wav",
+    idempotencyKey,
+    fetchImpl,
+    sleep: async () => undefined,
+    maxPolls: 2,
+    allowedWorkerOrigins: ["https://worker.example"],
+  });
+
+  return { outcome, source, sourceBytes, sourceSha256, calls, jobId, accessToken };
+};
+
 test("worker URL accepts only an exact configured HTTPS origin or explicit local development", () => {
   const trustedOrigins = ["https://extreme-worker.onrender.com"];
   assert.equal(
@@ -426,60 +505,157 @@ test("enhancement candidate downloads optional WAV bytes without granting gain a
   assert.ok(calls.some((call) => call.url.endsWith("/candidate")));
 });
 
-test("enhancement candidate hash mismatch fails open before returning candidate bytes", async () => {
-  const candidateBytes = new Uint8Array([82, 73, 70, 70, 9, 8, 7]);
-  const sourceBytes = new Uint8Array([7, 8, 9]);
-  const sourceSha256 = sha256Hex(sourceBytes);
-  let statusPolls = 0;
-  const outcome = await enhanceSourceWithExtremeWorker({
-    source: new Blob([sourceBytes], { type: "audio/wav" }),
-    contentType: "audio/wav",
-    idempotencyKey: "enhance-hash-mismatch",
-    fetchImpl: async (input, init = {}) => {
-      const url = String(input);
-      if (url === "/api/extreme-ml/ticket") {
-        return Response.json({
-          workerBaseUrl: "https://worker.example",
-          ticket: "ticket_opaque",
-          expiresAt: "2026-08-24T01:00:00.000Z",
-        });
-      }
-      if (url.endsWith("/v1/jobs")) {
-        return Response.json({ jobId: "candidate_hash_job", accessToken: "candidate_hash_secret", uploadOffset: 0, maxChunkBytes: 16 });
-      }
-      if (url.endsWith("/input") && init.method === "PATCH") {
-        return new Response(null, { status: 204, headers: { "Upload-Offset": String(sourceBytes.byteLength) } });
-      }
-      if (url.endsWith("/input/complete")) return Response.json({ state: "queued" });
-      if (url.endsWith("/v1/jobs/candidate_hash_job")) {
-        statusPolls += 1;
-        return Response.json({ state: statusPolls < 2 ? "running" : "succeeded" });
-      }
-      if (url.endsWith("/report")) {
-        return Response.json({
-          ...(validReport(sourceSha256) as Record<string, unknown>),
+for (const reason of [
+  "rnnoise-model-unavailable",
+  "arnndn-enhancement-unavailable",
+  "candidate-integrity-mismatch",
+] as const) {
+  test(`valid advisory evidence survives ${reason} as a report-only enhancement outcome`, async () => {
+    const fixture = await runEnhancementFixture({
+      idempotencyKey: `report-only-${reason}`,
+      reportFactory: (sourceSha256) => {
+        const report = validReport(sourceSha256) as {
+          telemetry: Record<string, unknown>;
+        } & Record<string, unknown>;
+        return {
+          ...report,
+          telemetry: {
+            ...report.telemetry,
+            runtimeStatus: "degraded",
+            reason,
+            candidateSelected: false,
+          },
+        };
+      },
+    });
+
+    const reportOnly = assertReportOnlyEnhancement(
+      fixture.outcome,
+      reason,
+      fixture.sourceSha256,
+    );
+    assert.equal(reportOnly.report.telemetry.reason, reason);
+    assert.equal(reportOnly.report.telemetry.candidateSelected, false);
+    assert.equal(fixture.calls.some((call) => call.url.endsWith("/candidate")), false);
+    assert.deepEqual(new Uint8Array(await fixture.source.arrayBuffer()), fixture.sourceBytes);
+
+    const ticketCall = fixture.calls.find((call) => call.url === "/api/extreme-ml/ticket");
+    assert.ok(ticketCall);
+    const ticketBody = JSON.parse(ticketCall.init.body as string);
+    assert.equal(ticketBody.scope, "enhancement_candidate");
+    assert.equal(ticketBody.sha256, fixture.sourceSha256);
+    assert.doesNotMatch(ticketCall.init.body as string, /token_|ticket_opaque/);
+    assert.equal(
+      fixture.calls
+        .filter((call) => call.url.startsWith("https://worker.example/"))
+        .every((call) => call.init.redirect === "error"),
+      true,
+    );
+  });
+}
+
+const validCandidateBytes = new Uint8Array([82, 73, 70, 70, 9, 8, 7]);
+const candidateFailureCases = [
+  {
+    name: "download failure",
+    response: () => new Response("unavailable", { status: 503 }),
+  },
+  {
+    name: "content-type failure",
+    response: () => new Response(validCandidateBytes, {
+      headers: { "Content-Type": "application/octet-stream" },
+    }),
+  },
+  {
+    name: "hash failure",
+    response: () => new Response(new Uint8Array([82, 73, 70, 70, 0, 0, 0]), {
+      headers: { "Content-Type": "audio/wav" },
+    }),
+  },
+] as const;
+
+for (const candidateFailure of candidateFailureCases) {
+  test(`candidate ${candidateFailure.name} preserves the source report and original-audio fallback`, async () => {
+    const candidateSha256 = sha256Hex(validCandidateBytes);
+    const fixture = await runEnhancementFixture({
+      idempotencyKey: `candidate-${candidateFailure.name}`,
+      reportFactory: (sourceSha256) => {
+        const report = validReport(sourceSha256) as {
+          telemetry: Record<string, unknown>;
+        } & Record<string, unknown>;
+        return {
+          ...report,
           candidate: {
             role: "enhancement_candidate",
-            sha256: "e".repeat(64),
+            sha256: candidateSha256,
             durationMs: 120,
             sampleRate: 48_000,
             channels: 1,
           },
           telemetry: {
-            ...(validReport(sourceSha256) as { telemetry: Record<string, unknown> }).telemetry,
+            ...report.telemetry,
             candidateSelected: true,
           },
-        });
-      }
-      if (url.endsWith("/candidate")) return new Response(candidateBytes, { headers: { "Content-Type": "audio/wav" } });
-      throw new Error(`Unexpected request: ${url}`);
+        };
+      },
+      candidateResponse: candidateFailure.response,
+    });
+
+    const reportOnly = assertReportOnlyEnhancement(
+      fixture.outcome,
+      "candidate-unavailable",
+      fixture.sourceSha256,
+    );
+    assert.equal(reportOnly.report.candidate?.sha256, candidateSha256);
+    assert.deepEqual(new Uint8Array(await fixture.source.arrayBuffer()), fixture.sourceBytes);
+
+    const candidateCall = fixture.calls.find((call) => call.url.endsWith("/candidate"));
+    assert.ok(candidateCall);
+    assert.equal(
+      candidateCall.url,
+      `https://worker.example/v1/jobs/${encodeURIComponent(fixture.jobId)}/candidate`,
+    );
+    assert.equal(new Headers(candidateCall.init.headers).get("Authorization"), `Bearer ${fixture.accessToken}`);
+    assert.equal(candidateCall.init.redirect, "error");
+  });
+}
+
+test("candidate report geometry mismatch is rejected before candidate adoption", async () => {
+  const candidateSha256 = sha256Hex(validCandidateBytes);
+  const fixture = await runEnhancementFixture({
+    idempotencyKey: "candidate-geometry-mismatch",
+    reportFactory: (sourceSha256) => {
+      const report = validReport(sourceSha256) as {
+        telemetry: Record<string, unknown>;
+      } & Record<string, unknown>;
+      return {
+        ...report,
+        candidate: {
+          role: "enhancement_candidate",
+          sha256: candidateSha256,
+          durationMs: 121,
+          sampleRate: 48_000,
+          channels: 1,
+        },
+        telemetry: {
+          ...report.telemetry,
+          candidateSelected: true,
+        },
+      };
     },
-    sleep: async () => undefined,
-    allowedWorkerOrigins: ["https://worker.example"],
-    maxPolls: 4,
+    candidateResponse: () => new Response(validCandidateBytes, {
+      headers: { "Content-Type": "audio/wav" },
+    }),
   });
 
-  assert.deepEqual(outcome, { status: "unavailable", reason: "candidate-unavailable" });
+  const reportOnly = assertReportOnlyEnhancement(
+    fixture.outcome,
+    "report-invalid",
+    fixture.sourceSha256,
+  );
+  assert.equal(reportOnly.report.source.durationMs, 120);
+  assert.equal(fixture.calls.some((call) => call.url.endsWith("/candidate")), false);
+  assert.deepEqual(new Uint8Array(await fixture.source.arrayBuffer()), fixture.sourceBytes);
 });
 
 test("worker failures and exhausted polling fail open without throwing", async () => {

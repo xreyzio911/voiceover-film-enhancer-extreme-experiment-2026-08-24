@@ -9,21 +9,66 @@ import type {
   ExtremeRenderedReport,
   ExtremeSourceReport,
 } from "./extremeMlClient.ts";
+import * as extremeMlVoPolicy from "./extremeMlVoPolicy.ts";
 import {
-  EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
-  EXTREME_ML_MIN_SNAPSHOT_GRACE_MS,
   EXTREME_ML_MAX_CONCURRENT_ANALYSES,
   analyzeExtremeRenderedOutputsBounded,
   analyzeExtremeSourcesBounded,
   enhanceExtremeSourcesBounded,
   buildPlannerMlProtection,
   compareExtremeQualityMetrics,
-  getExtremeMlSnapshotGraceMs,
   resolvePlannerVadFrames,
 } from "./extremeMlVoPolicy.ts";
 
 const SHA256 = "a".repeat(64);
 const REVISION = "b".repeat(40);
+
+type ProgressiveEnhancementBatch = Readonly<{
+  waitForOutcome: (key: string, timeoutMs: number) => Promise<ExtremeEnhancementOutcome>;
+  completion: Promise<ReadonlyMap<string, ExtremeEnhancementOutcome>>;
+}>;
+
+type ProgressiveEnhancementPolicy = typeof extremeMlVoPolicy & Readonly<{
+  startExtremeMlProgressiveEnhancementBatch?: (input: Readonly<{
+    jobs: readonly Readonly<{
+      key: string;
+      source: Blob;
+      contentType: string;
+      idempotencyKey: string;
+    }>[];
+    enhance: (input: Readonly<{
+      source: Blob;
+      contentType: string;
+      idempotencyKey: string;
+    }>) => Promise<ExtremeEnhancementOutcome>;
+  }>) => ProgressiveEnhancementBatch;
+  getExtremeMlPerFileWaitMs?: (sourceSizeBytes: number) => number;
+  getExtremeMlMaxPollsForSourceBytes?: (sourceSizeBytes: number) => number;
+}>;
+
+const requireProgressiveEnhancementPolicy = () => {
+  const policy = extremeMlVoPolicy as ProgressiveEnhancementPolicy;
+  assert.equal(
+    typeof policy.startExtremeMlProgressiveEnhancementBatch,
+    "function",
+    "long batches need a progressive two-lane controller instead of a global snapshot cutoff",
+  );
+  assert.equal(
+    typeof policy.getExtremeMlPerFileWaitMs,
+    "function",
+    "each file needs its own source-size-aware render wait",
+  );
+  assert.equal(
+    typeof policy.getExtremeMlMaxPollsForSourceBytes,
+    "function",
+    "long files need more worker polls than short files",
+  );
+  return {
+    start: policy.startExtremeMlProgressiveEnhancementBatch!,
+    getPerFileWaitMs: policy.getExtremeMlPerFileWaitMs!,
+    getMaxPolls: policy.getExtremeMlMaxPollsForSourceBytes!,
+  };
+};
 
 const makeReport = (
   probabilities: readonly number[],
@@ -261,44 +306,110 @@ test("source enhancement uses the same bounded fail-open lane instead of serial 
   assert.equal(JSON.stringify(outcomes).includes("private-enhancer-detail"), false);
 });
 
-test("enhancement cutoff prevents bounded lanes from launching later queued uploads", async () => {
-  const jobs = Array.from({ length: 7 }, (_, index) => ({
-    key: `enhance-cutoff-${index}`,
+test("six-file enhancement keeps draining two lanes after a synthetic global snapshot", async () => {
+  const { start } = requireProgressiveEnhancementPolicy();
+  const jobs = Array.from({ length: 6 }, (_, index) => ({
+    key: `long-batch-${index}`,
     source: new Blob([String(index)], { type: "audio/wav" }),
     contentType: "audio/wav",
-    idempotencyKey: `enhance:cutoff:${index}`,
+    idempotencyKey: `enhance:long-batch:${index}`,
   }));
-  let accepting = true;
   const launched: string[] = [];
-
-  await enhanceExtremeSourcesBounded({
-    jobs,
-    shouldContinue: () => accepting,
-    enhance: async ({ idempotencyKey }): Promise<ExtremeEnhancementOutcome> => {
-      launched.push(idempotencyKey);
-      await new Promise<void>((resolve) => setTimeout(resolve, 2));
-      accepting = false;
-      return { status: "unavailable", reason: "poll-timeout" };
-    },
-    onOutcome: () => undefined,
+  let active = 0;
+  let maximumActive = 0;
+  let markFirstTwoStarted = () => undefined;
+  const firstTwoStarted = new Promise<void>((resolve) => {
+    markFirstTwoStarted = resolve;
+  });
+  let releaseFirstTwo = () => undefined;
+  const firstTwoRelease = new Promise<void>((resolve) => {
+    releaseFirstTwo = resolve;
   });
 
+  const batch = start({
+    jobs,
+    enhance: async ({ idempotencyKey }): Promise<ExtremeEnhancementOutcome> => {
+      launched.push(idempotencyKey);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      if (launched.length === EXTREME_ML_MAX_CONCURRENT_ANALYSES) markFirstTwoStarted();
+      const index = Number(idempotencyKey.split(":").at(-1));
+      if (index < EXTREME_ML_MAX_CONCURRENT_ANALYSES) await firstTwoRelease;
+      active -= 1;
+      return { status: "unavailable", reason: "poll-timeout" };
+    },
+  });
+
+  await firstTwoStarted;
+  const syntheticSnapshot = await Promise.race([
+    batch.completion.then(() => "batch-completed" as const),
+    Promise.resolve("global-snapshot-elapsed" as const),
+  ]);
+  assert.equal(syntheticSnapshot, "global-snapshot-elapsed");
   assert.equal(launched.length, EXTREME_ML_MAX_CONCURRENT_ANALYSES);
+  assert.equal(maximumActive, EXTREME_ML_MAX_CONCURRENT_ANALYSES);
+
+  releaseFirstTwo();
+  const outcomesByKey = await batch.completion;
+
+  assert.deepEqual(
+    [...launched].sort(),
+    jobs.map(({ idempotencyKey }) => idempotencyKey).sort(),
+    "a synthetic global snapshot must not starve the four later files",
+  );
+  assert.deepEqual([...outcomesByKey.keys()].sort(), jobs.map(({ key }) => key).sort());
+  for (const { key } of jobs) {
+    assert.deepEqual(outcomesByKey.get(key), { status: "unavailable", reason: "poll-timeout" });
+  }
 });
 
-test("ML snapshot grace scales for real WAV uploads but remains a bounded fail-open wait", () => {
-  assert.equal(getExtremeMlSnapshotGraceMs([]), EXTREME_ML_MIN_SNAPSHOT_GRACE_MS);
-  assert.equal(getExtremeMlSnapshotGraceMs([384_044]), 12_046);
-  assert.equal(getExtremeMlSnapshotGraceMs([1 * 1024 * 1024]), 12_125);
-  assert.equal(getExtremeMlSnapshotGraceMs([64 * 1024 * 1024]), 20_000);
-  assert.equal(
-    getExtremeMlSnapshotGraceMs([161_332_990]),
-    EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
-  );
-  assert.equal(
-    getExtremeMlSnapshotGraceMs([Number.NaN, -1, 10 * 1024 * 1024 * 1024]),
-    EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
-  );
+test("a per-file wait returns an explicit timeout while the background batch keeps draining", async () => {
+  const { start } = requireProgressiveEnhancementPolicy();
+  const job = {
+    key: "long-file-wait",
+    source: new Blob(["long"], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: "enhance:long-file-wait",
+  };
+  let markStarted = () => undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let finishEnhancement = () => undefined;
+  const enhancementFinished = new Promise<void>((resolve) => {
+    finishEnhancement = resolve;
+  });
+  const batch = start({
+    jobs: [job],
+    enhance: async (): Promise<ExtremeEnhancementOutcome> => {
+      markStarted();
+      await enhancementFinished;
+      return { status: "unavailable", reason: "poll-timeout" };
+    },
+  });
+
+  await started;
+  assert.deepEqual(await batch.waitForOutcome(job.key, 1), {
+    status: "unavailable",
+    reason: "per-file-timeout",
+  });
+
+  finishEnhancement();
+  assert.deepEqual((await batch.completion).get(job.key), {
+    status: "unavailable",
+    reason: "poll-timeout",
+  });
+});
+
+test("per-file render waits and worker polls expand for long sources", () => {
+  const { getPerFileWaitMs, getMaxPolls } = requireProgressiveEnhancementPolicy();
+  const shortSourceBytes = 1 * 1024 * 1024;
+  const longSourceBytes = 512 * 1024 * 1024;
+
+  assert.ok(getPerFileWaitMs(longSourceBytes) > getPerFileWaitMs(shortSourceBytes));
+  assert.ok(getMaxPolls(longSourceBytes) > getMaxPolls(shortSourceBytes));
+  assert.ok(Number.isFinite(getPerFileWaitMs(longSourceBytes)));
+  assert.ok(Number.isInteger(getMaxPolls(longSourceBytes)));
 });
 
 test("render/source quality comparison exposes only finite paired advisory deltas", () => {
@@ -355,11 +466,33 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
     /Source, RNNoise candidate, and one final clean rendered WAV are uploaded directly to the isolated\s+Extreme worker/i,
   );
   assert.match(source, /enhanceSourceWithExtremeWorker/);
-  assert.match(source, /enhanceExtremeSourcesBounded/);
+  assert.match(source, /startExtremeMlProgressiveEnhancementBatch/);
+  assert.match(source, /getExtremeMlPerFileWaitMs/);
+  assert.match(source, /getExtremeMlMaxPollsForSourceBytes/);
   assert.match(source, /const enhancementJobs = jobs\.map/);
-  assert.match(source, /const renderJobs = extremeMlEnhancedJobs \?\? jobs/);
-  assert.doesNotMatch(source, /for\s*\(\s*const enhancementJob of enhancementJobs\s*\)[\s\S]{0,400}await enhanceSourceWithExtremeWorker/);
-  assert.match(source, /Promise\.race\(\[[\s\S]{0,600}extremeMlEnhancementPromise/);
+  assert.doesNotMatch(source, /\banalyzeExtremeSourcesBounded\b/);
+  assert.doesNotMatch(source, /\banalyzeSourceWithExtremeWorker\b/);
+  assert.doesNotMatch(source, /\bacceptingExtremeMl(?:Evidence|Enhancements)\b/);
+  assert.doesNotMatch(source, /\bextremeMl(?:Analysis|Enhancement)Promise\b/);
+  assert.doesNotMatch(source, /\bgetExtremeMlSnapshotGraceMs\b/);
+  assert.doesNotMatch(source, /Render snapshot accepted|snapshot-timeout/i);
+  assert.doesNotMatch(source, /maxPolls:\s*30\b/);
+  assert.match(
+    source,
+    /maxPolls:\s*getExtremeMlMaxPollsForSourceBytes\(input\.source\.size\)/,
+  );
+
+  const renderLoopIndex = source.indexOf("while (i < jobs.length)");
+  const writeJobInputIndex = source.indexOf("await writeJobInput(ffmpeg", renderLoopIndex);
+  assert.ok(renderLoopIndex >= 0);
+  assert.ok(writeJobInputIndex > renderLoopIndex);
+  const perFileAdoptionSource = source.slice(renderLoopIndex, writeJobInputIndex);
+  assert.match(
+    perFileAdoptionSource,
+    /await\s+\w+\.waitForOutcome\(\s*job\.inputName,\s*getExtremeMlPerFileWaitMs\(job\.file\.size\)\s*\)/,
+  );
+  assert.match(perFileAdoptionSource, /\[job\.inputName,\s*outcome\.report\]/);
+  assert.match(perFileAdoptionSource, /new File\(\s*\[outcome\.candidate\]/);
   assert.match(source, /RNNoise candidate/i);
   assert.match(source, /analyzeRenderedWithExtremeWorker/);
   assert.match(source, /If the worker is unavailable\s+or late, the browser pipeline runs unchanged/i);
@@ -374,11 +507,6 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
   assert.match(source, /\+\s+mlSpeechSpikeTamingBoost/);
   assert.match(source, /perceptualStabilityRisk,/);
   assert.doesNotMatch(source, /profile\?\.speechSpikeTamingBoost[\s\S]{0,160}\+\s+mlSourceQualityPolicy\.speechSpikeTamingBoost/);
-  assert.match(
-    source,
-    /acceptingExtremeMlEvidence = false;[\s\S]{0,500}let hadErrors = false/,
-  );
-  assert.match(source, /getExtremeMlSnapshotGraceMs\(jobs\.map\(\(job\) => job\.file\.size\)\)/);
   const exposeOutputsIndex = source.indexOf("setOutputs([...finalOutputEntries])");
   const postRenderAnalysisIndex = source.indexOf(
     "analyzeExtremeRenderedOutputsBounded",
