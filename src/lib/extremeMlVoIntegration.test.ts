@@ -41,6 +41,10 @@ type ProgressiveEnhancementPolicy = typeof extremeMlVoPolicy & Readonly<{
       contentType: string;
       idempotencyKey: string;
     }>) => Promise<ExtremeEnhancementOutcome>;
+    onOutcome?: (result: Readonly<{
+      key: string;
+      outcome: ExtremeEnhancementOutcome;
+    }>) => void;
   }>) => ProgressiveEnhancementBatch;
   getExtremeMlPerFileWaitMs?: (sourceSizeBytes: number) => number;
   getExtremeMlMaxPollsForSourceBytes?: (sourceSizeBytes: number) => number;
@@ -317,11 +321,11 @@ test("six-file enhancement keeps draining two lanes after a synthetic global sna
   const launched: string[] = [];
   let active = 0;
   let maximumActive = 0;
-  let markFirstTwoStarted = () => undefined;
+  let markFirstTwoStarted: () => void = () => undefined;
   const firstTwoStarted = new Promise<void>((resolve) => {
     markFirstTwoStarted = resolve;
   });
-  let releaseFirstTwo = () => undefined;
+  let releaseFirstTwo: () => void = () => undefined;
   const firstTwoRelease = new Promise<void>((resolve) => {
     releaseFirstTwo = resolve;
   });
@@ -363,7 +367,43 @@ test("six-file enhancement keeps draining two lanes after a synthetic global sna
   }
 });
 
-test("a per-file wait returns an explicit timeout while the background batch keeps draining", async () => {
+test("six-file enhancement preserves every advisory ML report when RNNoise has no candidate", async () => {
+  const { start } = requireProgressiveEnhancementPolicy();
+  const jobs = Array.from({ length: 6 }, (_, index) => ({
+    key: `report-only-${index}`,
+    source: new Blob([String(index)], { type: "audio/wav" }),
+    contentType: "audio/wav",
+    idempotencyKey: `enhance:report-only:${index}`,
+  }));
+
+  const batch = start({
+    jobs,
+    enhance: async ({ idempotencyKey }): Promise<ExtremeEnhancementOutcome> => {
+      const index = Number(idempotencyKey.split(":").at(-1));
+      const report = makeReport([0.91, 0.87], {
+        modelSetId: `silero-dnsmos-sigmos-${index}`,
+        metrics: {
+          "dnsmos.ovrl": { value: 3.1 + index / 100, available: true, higherIsBetter: true },
+          "sigmos.ovrl": { value: 3.0 + index / 100, available: true, higherIsBetter: true },
+        },
+      });
+      return { status: "report-only", report, reason: "rnnoise-model-unavailable" };
+    },
+  });
+
+  const outcomesByKey = await batch.completion;
+  assert.equal(outcomesByKey.size, jobs.length);
+  for (const [index, job] of jobs.entries()) {
+    const outcome = outcomesByKey.get(job.key);
+    assert.equal(outcome?.status, "report-only");
+    if (outcome?.status !== "report-only") continue;
+    assert.equal(outcome.report.modelSetId, `silero-dnsmos-sigmos-${index}`);
+    assert.equal(outcome.report.metrics["dnsmos.ovrl"]?.available, true);
+    assert.equal(outcome.report.metrics["sigmos.ovrl"]?.available, true);
+  }
+});
+
+test("a per-file timeout keeps the original render path while a late report remains observable", async () => {
   const { start } = requireProgressiveEnhancementPolicy();
   const job = {
     key: "long-file-wait",
@@ -371,20 +411,28 @@ test("a per-file wait returns an explicit timeout while the background batch kee
     contentType: "audio/wav",
     idempotencyKey: "enhance:long-file-wait",
   };
-  let markStarted = () => undefined;
+  let markStarted: () => void = () => undefined;
   const started = new Promise<void>((resolve) => {
     markStarted = resolve;
   });
-  let finishEnhancement = () => undefined;
+  let finishEnhancement: () => void = () => undefined;
   const enhancementFinished = new Promise<void>((resolve) => {
     finishEnhancement = resolve;
   });
+  const lateReport = makeReport([0.1, 0.9], {
+    modelSetId: "late-silero-dnsmos-sigmos",
+  });
+  let reportsByKey: ReadonlyMap<string, ExtremeSourceReport> = new Map();
   const batch = start({
     jobs: [job],
     enhance: async (): Promise<ExtremeEnhancementOutcome> => {
       markStarted();
       await enhancementFinished;
-      return { status: "unavailable", reason: "poll-timeout" };
+      return { status: "report-only", report: lateReport, reason: "candidate-unavailable" };
+    },
+    onOutcome: ({ key, outcome }) => {
+      if (!("report" in outcome)) return;
+      reportsByKey = new Map([...reportsByKey, [key, outcome.report]]);
     },
   });
 
@@ -395,10 +443,9 @@ test("a per-file wait returns an explicit timeout while the background batch kee
   });
 
   finishEnhancement();
-  assert.deepEqual((await batch.completion).get(job.key), {
-    status: "unavailable",
-    reason: "poll-timeout",
-  });
+  const completedOutcome = (await batch.completion).get(job.key);
+  assert.equal(completedOutcome?.status, "report-only");
+  assert.equal(reportsByKey.get(job.key), lateReport);
 });
 
 test("per-file render waits and worker polls expand for long sources", () => {
@@ -470,6 +517,8 @@ test("VoLeveler exposes opt-in upload disclosure and keeps energy speech authori
   assert.match(source, /getExtremeMlPerFileWaitMs/);
   assert.match(source, /getExtremeMlMaxPollsForSourceBytes/);
   assert.match(source, /const enhancementJobs = jobs\.map/);
+  assert.match(source, /onOutcome:\s*\(\{ key, outcome \}\) =>/);
+  assert.match(source, /retainLateExtremeMlReport/);
   assert.doesNotMatch(source, /\banalyzeExtremeSourcesBounded\b/);
   assert.doesNotMatch(source, /\banalyzeSourceWithExtremeWorker\b/);
   assert.doesNotMatch(source, /\bacceptingExtremeMl(?:Evidence|Enhancements)\b/);

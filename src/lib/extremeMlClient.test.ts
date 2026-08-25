@@ -90,7 +90,7 @@ const runEnhancementFixture = async ({
   candidateResponse?: () => Response | Promise<Response>;
   sourceBytes?: Uint8Array;
 }>) => {
-  const source = new Blob([sourceBytes], { type: "audio/wav" });
+  const source = new Blob([Uint8Array.from(sourceBytes).buffer], { type: "audio/wav" });
   const sourceSha256 = sha256Hex(sourceBytes);
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const jobId = `job_${idempotencyKey.replace(/[^A-Za-z0-9_-]/g, "_")}`;
@@ -553,6 +553,33 @@ for (const reason of [
     );
   });
 }
+
+test("report-only fallback sanitizes a selected-without-candidate worker contradiction", async () => {
+  const fixture = await runEnhancementFixture({
+    idempotencyKey: "selected-without-candidate",
+    reportFactory: (sourceSha256) => {
+      const report = validReport(sourceSha256) as {
+        telemetry: Record<string, unknown>;
+      } & Record<string, unknown>;
+      return {
+        ...report,
+        telemetry: {
+          ...report.telemetry,
+          candidateSelected: true,
+        },
+      };
+    },
+  });
+
+  const reportOnly = assertReportOnlyEnhancement(
+    fixture.outcome,
+    "report-invalid",
+    fixture.sourceSha256,
+  );
+  assert.equal(reportOnly.report.telemetry.candidateSelected, false);
+  assert.equal(reportOnly.report.telemetry.reason, "report-invalid");
+  assert.equal(fixture.calls.some((call) => call.url.endsWith("/candidate")), false);
+});
 
 const validCandidateBytes = new Uint8Array([82, 73, 70, 70, 9, 8, 7]);
 const candidateFailureCases = [

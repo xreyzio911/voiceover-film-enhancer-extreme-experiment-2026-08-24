@@ -95,7 +95,11 @@ def validate_source_report(payload: object, *, expected_source_sha256: str | Non
             raise ReportValidationError("invalid candidate identity")
         if not _finite_number(candidate.get("durationMs")) or float(candidate["durationMs"]) < 0:
             raise ReportValidationError("invalid candidate duration")
-        if candidate.get("sampleRate") != source["sampleRate"] or candidate.get("channels") != source["channels"]:
+        if (
+            candidate.get("sampleRate") != source["sampleRate"]
+            or candidate.get("channels") != source["channels"]
+            or abs(float(candidate["durationMs"]) - float(source["durationMs"])) > 1.0
+        ):
             raise ReportValidationError("candidate facts disagree with source contract")
 
     vad = payload.get("vad")

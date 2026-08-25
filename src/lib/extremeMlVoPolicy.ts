@@ -8,37 +8,53 @@ import type {
 import { buildMlSpeechProtectionMask, type MlVadFrame } from "./mlSpeechProtection.ts";
 
 export const EXTREME_ML_MAX_CONCURRENT_ANALYSES = 2;
-export const EXTREME_ML_MIN_SNAPSHOT_GRACE_MS = 1_500;
-export const EXTREME_ML_MAX_SNAPSHOT_GRACE_MS = 30_000;
-
-// A production source job reached its report about eight seconds after the
-// ticket request. Keep four seconds of bounded headroom so the final one-second
-// status poll and report normalization cannot race the snapshot cutoff.
-const EXTREME_ML_SNAPSHOT_BASE_MS = 12_000;
+const EXTREME_ML_PER_FILE_WAIT_BASE_MS = 4_000;
+const EXTREME_ML_PER_FILE_WAIT_MAX_MS = 45_000;
 const EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND = 8 * 1024 * 1024;
+const EXTREME_ML_POLL_BASE_SECONDS = 120;
+const EXTREME_ML_MAX_POLL_COUNT = 2_400;
+// Assume the compact 48 kHz mono PCM16 layout so float, 24-bit, and stereo WAVs
+// receive an equal or longer background inference window rather than being
+// mistaken for a shorter recording from byte size alone.
+const EXTREME_ML_ESTIMATED_AUDIO_BYTES_PER_SECOND = 48_000 * 2;
+const EXTREME_ML_LONG_FILE_RUNTIME_FACTOR = 1.25;
+
+const normalizeSourceSizeBytes = (sourceSizeBytes: number) =>
+  Number.isFinite(sourceSizeBytes) && sourceSizeBytes > 0
+    ? Math.floor(sourceSizeBytes)
+    : 0;
 
 /**
- * Gives an explicitly enabled ML upload enough time to finish without turning
- * it into a delivery gate. The largest source sets the estimate because two
- * upload lanes run concurrently; malformed sizes are ignored and every wait
- * remains capped at 30 seconds before the exact browser path resumes.
+ * Bounds only the wait immediately before one file enters the browser render.
+ * Enhancement keeps running in the background after this wait, so a slow or
+ * unavailable worker can never cancel delivery or hold the entire batch.
  */
-export const getExtremeMlSnapshotGraceMs = (sourceSizesBytes: readonly number[]) => {
-  const largestSourceBytes = sourceSizesBytes.reduce(
-    (largest, sizeBytes) =>
-      Number.isFinite(sizeBytes) && sizeBytes >= 0
-        ? Math.max(largest, sizeBytes)
-        : largest,
-    -1,
-  );
-  if (largestSourceBytes < 0) return EXTREME_ML_MIN_SNAPSHOT_GRACE_MS;
-  const estimatedMs = Math.ceil(
-    EXTREME_ML_SNAPSHOT_BASE_MS +
-      (largestSourceBytes / EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND) * 1_000,
-  );
+export const getExtremeMlPerFileWaitMs = (sourceSizeBytes: number) => {
+  const normalizedBytes = normalizeSourceSizeBytes(sourceSizeBytes);
+  const estimatedUploadMs =
+    (normalizedBytes / EXTREME_ML_ESTIMATED_UPLOAD_BYTES_PER_SECOND) * 1_000;
   return Math.min(
-    EXTREME_ML_MAX_SNAPSHOT_GRACE_MS,
-    Math.max(EXTREME_ML_MIN_SNAPSHOT_GRACE_MS, estimatedMs),
+    EXTREME_ML_PER_FILE_WAIT_MAX_MS,
+    Math.ceil(EXTREME_ML_PER_FILE_WAIT_BASE_MS + estimatedUploadMs),
+  );
+};
+
+/**
+ * Keeps polling alive for long-file inference instead of applying the old
+ * short-file fixed count. At one poll per second this gives roughly 11 minutes
+ * to a seven-minute mono PCM16 WAV and about 35 minutes to a 26-minute WAV;
+ * larger lossless layouts receive more time up to the 40-minute cap.
+ */
+export const getExtremeMlMaxPollsForSourceBytes = (sourceSizeBytes: number) => {
+  const normalizedBytes = normalizeSourceSizeBytes(sourceSizeBytes);
+  const estimatedAudioSeconds =
+    normalizedBytes / EXTREME_ML_ESTIMATED_AUDIO_BYTES_PER_SECOND;
+  return Math.min(
+    EXTREME_ML_MAX_POLL_COUNT,
+    Math.ceil(
+      EXTREME_ML_POLL_BASE_SECONDS +
+        estimatedAudioSeconds * EXTREME_ML_LONG_FILE_RUNTIME_FACTOR,
+    ),
   );
 };
 
@@ -95,8 +111,8 @@ const unavailableOutcome = (): ExtremeAnalysisOutcome =>
 const unavailableRenderedOutcome = (): ExtremeRenderedAnalysisOutcome =>
   Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
 
-const unavailableEnhancementOutcome = (): ExtremeEnhancementOutcome =>
-  Object.freeze({ status: "unavailable", reason: "worker-unavailable" });
+const unavailableEnhancementOutcome = (reason = "worker-unavailable"): ExtremeEnhancementOutcome =>
+  Object.freeze({ status: "unavailable", reason });
 
 /**
  * Starts at most two source uploads at once. Each lane is independent, so a
@@ -144,17 +160,15 @@ export const enhanceExtremeSourcesBounded = async ({
   jobs,
   enhance,
   onOutcome,
-  shouldContinue = () => true,
 }: Readonly<{
   jobs: readonly ExtremeMlSourceJob[];
   enhance: EnhanceExtremeSource;
   onOutcome: (result: ExtremeMlEnhancementOutcome) => void;
-  shouldContinue?: () => boolean;
 }>): Promise<void> => {
   const laneCount = Math.min(EXTREME_ML_MAX_CONCURRENT_ANALYSES, jobs.length);
 
   const runLane = async (index: number): Promise<void> => {
-    if (index >= jobs.length || !shouldContinue()) return;
+    if (index >= jobs.length) return;
     const job = jobs[index];
     let outcome: ExtremeEnhancementOutcome;
     try {
@@ -167,11 +181,92 @@ export const enhanceExtremeSourcesBounded = async ({
       outcome = unavailableEnhancementOutcome();
     }
     onOutcome(Object.freeze({ key: job.key, outcome }));
-    if (!shouldContinue()) return;
     await runLane(index + laneCount);
   };
 
   await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
+};
+
+export type ExtremeMlProgressiveEnhancementBatch = Readonly<{
+  waitForOutcome: (key: string, timeoutMs: number) => Promise<ExtremeEnhancementOutcome>;
+  completion: Promise<ReadonlyMap<string, ExtremeEnhancementOutcome>>;
+}>;
+
+type ProgressiveEnhancementDeferred = Readonly<{
+  promise: Promise<ExtremeEnhancementOutcome>;
+  resolve: (outcome: ExtremeEnhancementOutcome) => void;
+}>;
+
+const createProgressiveEnhancementDeferred = (): ProgressiveEnhancementDeferred => {
+  let resolveOutcome: (outcome: ExtremeEnhancementOutcome) => void = () => undefined;
+  const promise = new Promise<ExtremeEnhancementOutcome>((resolve) => {
+    resolveOutcome = resolve;
+  });
+  return Object.freeze({ promise, resolve: resolveOutcome });
+};
+
+/**
+ * Starts every enhancement job immediately through the shared two-lane queue.
+ * Callers may wait for only the file they are about to render; timing out that
+ * wait returns an explicit fail-open outcome without cancelling the background
+ * upload, the later queue entries, or the browser delivery.
+ */
+export const startExtremeMlProgressiveEnhancementBatch = ({
+  jobs,
+  enhance,
+  onOutcome,
+}: Readonly<{
+  jobs: readonly ExtremeMlSourceJob[];
+  enhance: EnhanceExtremeSource;
+  onOutcome?: (result: ExtremeMlEnhancementOutcome) => void;
+}>): ExtremeMlProgressiveEnhancementBatch => {
+  const deferredByKey = new Map<string, ProgressiveEnhancementDeferred>(
+    jobs.map((job) => [job.key, createProgressiveEnhancementDeferred()]),
+  );
+  let outcomesByKey: ReadonlyMap<string, ExtremeEnhancementOutcome> = new Map();
+
+  const completion = enhanceExtremeSourcesBounded({
+    jobs,
+    enhance,
+    onOutcome: (result) => {
+      outcomesByKey = new Map([...outcomesByKey, [result.key, result.outcome]]);
+      deferredByKey.get(result.key)?.resolve(result.outcome);
+      try {
+        onOutcome?.(result);
+      } catch {
+        // UI telemetry must never stop a worker lane or later batch entries.
+      }
+    },
+  }).then(() => new Map(
+    jobs.map((job) => [
+      job.key,
+      outcomesByKey.get(job.key) ?? unavailableEnhancementOutcome(),
+    ]),
+  ));
+
+  const waitForOutcome = async (key: string, timeoutMs: number) => {
+    const outcomePromise = deferredByKey.get(key)?.promise;
+    if (!outcomePromise) return unavailableEnhancementOutcome("per-file-timeout");
+    const boundedTimeoutMs = Number.isFinite(timeoutMs)
+      ? Math.max(0, Math.floor(timeoutMs))
+      : 0;
+    return new Promise<ExtremeEnhancementOutcome>((resolve) => {
+      let settled = false;
+      const timer = globalThis.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve(unavailableEnhancementOutcome("per-file-timeout"));
+      }, boundedTimeoutMs);
+      void outcomePromise.then((outcome) => {
+        if (settled) return;
+        settled = true;
+        globalThis.clearTimeout(timer);
+        resolve(outcome);
+      });
+    });
+  };
+
+  return Object.freeze({ waitForOutcome, completion });
 };
 
 /**

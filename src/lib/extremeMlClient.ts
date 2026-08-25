@@ -63,6 +63,7 @@ export type ExtremeRenderedAnalysisOutcome =
 
 export type ExtremeEnhancementOutcome =
   | Readonly<{ status: "succeeded"; report: ExtremeSourceReport; candidate: Blob }>
+  | Readonly<{ status: "report-only"; report: ExtremeSourceReport; reason: string }>
   | Readonly<{ status: "unavailable"; reason: string }>;
 
 type AnalyzeAudioInput = Readonly<{
@@ -231,8 +232,8 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
       !Number.isInteger(candidate.sampleRate) ||
       !Number.isInteger(candidate.channels) ||
       candidate.durationMs < 0 ||
-      candidate.sampleRate !== sampleRate ||
-      candidate.channels !== channels
+      candidate.sampleRate <= 0 ||
+      candidate.channels <= 0
     ) {
       return null;
     }
@@ -328,7 +329,6 @@ export const normalizeExtremeSourceReport = (value: unknown): ExtremeSourceRepor
   ) {
     return null;
   }
-  if (telemetry.candidateSelected && !normalizedCandidate) return null;
   return Object.freeze({
     schemaVersion: 1,
     advisoryOnly: true,
@@ -369,6 +369,34 @@ const unavailable = (reason: string): Readonly<{ status: "unavailable"; reason: 
 
 const unavailableEnhancement = (reason: string): ExtremeEnhancementOutcome =>
   Object.freeze({ status: "unavailable", reason });
+
+const reportOnlyEnhancement = (
+  report: ExtremeSourceReport,
+  reason: string,
+): ExtremeEnhancementOutcome => Object.freeze({ status: "report-only", report, reason });
+
+const sanitizeEnhancementReport = (
+  report: ExtremeSourceReport,
+  reason: string,
+): ExtremeSourceReport => Object.freeze({
+  schemaVersion: report.schemaVersion,
+  advisoryOnly: report.advisoryOnly,
+  canBlockDelivery: report.canBlockDelivery,
+  canChangeGainDb: report.canChangeGainDb,
+  levelAuthority: report.levelAuthority,
+  modelSetId: report.modelSetId,
+  source: report.source,
+  vad: report.vad,
+  metrics: report.metrics,
+  models: report.models,
+  telemetry: Object.freeze({
+    runtimeStatus: "degraded",
+    reason,
+    audioMutation: false,
+    candidateSelected: false,
+    gainDbChanged: false,
+  }),
+});
 
 type ExtremeWorkerJobSuccess = Readonly<{
   status: "succeeded";
@@ -548,16 +576,29 @@ export const enhanceSourceWithExtremeWorker = async (
 ): Promise<ExtremeEnhancementOutcome> => {
   const outcome = await analyzeAudioWithExtremeWorker(input, "enhancement_candidate");
   if (outcome.status === "unavailable") return outcome;
+  if (outcome.report.canChangeGainDb || outcome.report.levelAuthority !== "gainPlanner") {
+    return unavailableEnhancement("report-invalid");
+  }
+  const candidateDescriptor = outcome.report.candidate;
+  if (outcome.report.telemetry.candidateSelected !== true || !candidateDescriptor) {
+    const reason = outcome.report.telemetry.candidateSelected === false
+      ? outcome.report.telemetry.reason
+      : "report-invalid";
+    return reportOnlyEnhancement(
+      outcome.report.telemetry.candidateSelected === false && !candidateDescriptor
+        ? outcome.report
+        : sanitizeEnhancementReport(outcome.report, reason),
+      reason,
+    );
+  }
   if (
-    outcome.report.canChangeGainDb ||
-    outcome.report.levelAuthority !== "gainPlanner" ||
-    !outcome.report.candidate ||
-    outcome.report.telemetry.candidateSelected !== true
+    candidateDescriptor.durationMs !== outcome.report.source.durationMs ||
+    candidateDescriptor.sampleRate !== outcome.report.source.sampleRate ||
+    candidateDescriptor.channels !== outcome.report.source.channels
   ) {
-    return unavailableEnhancement(
-      outcome.report.telemetry.candidateSelected === false
-        ? outcome.report.telemetry.reason
-        : "report-invalid",
+    return reportOnlyEnhancement(
+      sanitizeEnhancementReport(outcome.report, "report-invalid"),
+      "report-invalid",
     );
   }
   try {
@@ -568,23 +609,27 @@ export const enhanceSourceWithExtremeWorker = async (
         headers: { Authorization: `Bearer ${outcome.accessToken}` },
       },
     );
-    if (!candidateResponse.ok) return unavailableEnhancement("candidate-unavailable");
+    if (!candidateResponse.ok) {
+      return reportOnlyEnhancement(outcome.report, "candidate-unavailable");
+    }
     const responseType = candidateResponse.headers
       .get("Content-Type")
       ?.split(";", 1)[0]
       ?.trim()
       .toLowerCase();
     if (responseType !== "audio/wav" && responseType !== "audio/x-wav") {
-      return unavailableEnhancement("candidate-unavailable");
+      return reportOnlyEnhancement(outcome.report, "candidate-unavailable");
     }
     const candidate = await candidateResponse.blob();
-    if (candidate.size <= 0) return unavailableEnhancement("candidate-unavailable");
+    if (candidate.size <= 0) {
+      return reportOnlyEnhancement(outcome.report, "candidate-unavailable");
+    }
     const candidateSha256 = await sha256Blob(candidate);
-    if (!candidateSha256 || candidateSha256 !== outcome.report.candidate.sha256) {
-      return unavailableEnhancement("candidate-unavailable");
+    if (!candidateSha256 || candidateSha256 !== candidateDescriptor.sha256) {
+      return reportOnlyEnhancement(outcome.report, "candidate-unavailable");
     }
     return Object.freeze({ status: "succeeded", report: outcome.report, candidate });
   } catch {
-    return unavailableEnhancement("candidate-unavailable");
+    return reportOnlyEnhancement(outcome.report, "candidate-unavailable");
   }
 };

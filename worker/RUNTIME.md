@@ -56,17 +56,30 @@ its 48 kHz float32 final deliverables, and decodes long payloads in fixed
 65,536-frame chunks to bound temporary allocation before the mono analysis buffer is
 populated.
 
-For `enhancement_candidate` jobs, the worker first validates and analyzes the exact
-uploaded source, then runs FFmpeg `arnndn` with a checksum-pinned RNNoise `bd.rnnn`
-model only when the source is noise-limited and speech-supported. The mix is bounded
-to 0.28-0.32 because corpus measurement showed the lower band reduces spread/arc
-regression risk compared with 0.36 while retaining similar expressive contrast. The
-filter graph resamples internally to 48 kHz for the recurrent model and then restores
-the original WAV sample rate and channel count before exposing the candidate. The
-worker rejects candidates whose sample rate, channel count, duration, or SHA-256 do
-not match the report, re-analyzes the candidate, and only exposes it when noise
-metrics improve without speech/overall regression. It also rechecks the source
-SHA-256 after enhancement so the uploaded source remains immutable.
+For every `enhancement_candidate` job, the worker first validates and analyzes the
+exact uploaded source with Silero VAD plus the available DNSMOS and SIGMOS models.
+That one report is returned even when cleanup cannot produce a usable candidate, so
+long-batch orchestration does not need a second source upload and learned evidence is
+not lost with the RNNoise result. The browser drains every queued file through two
+bounded background lanes and gives each source its own size-aware poll budget; a
+late, unavailable, or corrupt result still fails open to the original source.
+
+When the pinned model is available, FFmpeg `arnndn` is attempted for every valid
+enhancement source instead of being switched on by a binary noise or speech-quality
+threshold. The worker derives a source-relative 10 ms dry/wet curve bounded to
+0.012-0.18. Local attacks, high-band consonant energy, aperiodic and short vocal
+events, weak-speech breaths, near-silence context, and unusually loud or quiet
+moments withdraw the cleanup with an 80 ms protection halo and bounded mix slew.
+This is a unity dry/wet blend: it never changes target level or gains authority over
+`gainPlanner`.
+
+The filter graph resamples internally to 48 kHz for RNNoise, restores the source
+sample rate and channel count, and blends back into the original WAV sample format.
+Only technical integrity can reject the result: unreadable or non-finite samples,
+sample-rate/channel/frame/sample-format mismatch, introduced clipping, or gross
+speech erasure. DNSMOS and SIGMOS candidate deltas are advisory and never select or
+reject audio. The worker also rechecks the source SHA-256 after enhancement so the
+uploaded source remains immutable.
 
 ## Immutable model set
 

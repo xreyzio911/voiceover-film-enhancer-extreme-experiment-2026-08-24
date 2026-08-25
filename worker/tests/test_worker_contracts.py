@@ -132,6 +132,55 @@ class WorkerContractTests(unittest.TestCase):
         self.assertFalse(report["canBlockDelivery"])
         self.assertEqual(report["deliveryGate"], "never")
 
+    def test_source_report_rejects_candidate_duration_mismatch(self) -> None:
+        validate_source_report, ReportValidationError = require_symbols(
+            self,
+            "extreme_worker.report_schema",
+            "validate_source_report",
+            "ReportValidationError",
+        )
+        report = {
+            "schemaVersion": 1,
+            "advisoryOnly": True,
+            "canBlockDelivery": False,
+            "canChangeGainDb": False,
+            "levelAuthority": "gainPlanner",
+            "modelSetId": "extreme-core-test",
+            "source": {
+                "sha256": "a" * 64,
+                "durationMs": 100.0,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+            "candidate": {
+                "role": "enhancement_candidate",
+                "sha256": "b" * 64,
+                "durationMs": 112.0,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+            "vad": {"frameMs": 10.0, "frames": []},
+            "metrics": {},
+            "models": [
+                {
+                    "id": "rnnoise-bd",
+                    "version": "bd.rnnn",
+                    "revision": "c" * 40,
+                    "sha256": "d" * 64,
+                }
+            ],
+            "telemetry": {
+                "runtimeStatus": "ready",
+                "reason": "ok",
+                "audioMutation": False,
+                "candidateSelected": True,
+                "gainDbChanged": False,
+            },
+        }
+
+        with self.assertRaises(ReportValidationError):
+            validate_source_report(report, expected_source_sha256="a" * 64)
+
     def test_fastapi_health_and_capabilities(self) -> None:
         (create_app,) = require_symbols(self, "extreme_worker.app", "create_app")
         with tempfile.TemporaryDirectory() as temp_dir:

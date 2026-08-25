@@ -180,17 +180,18 @@ import {
 import { resolveAdaptiveVoicingPolicy } from "../lib/adaptiveVoicingPolicy";
 import {
   analyzeRenderedWithExtremeWorker,
-  analyzeSourceWithExtremeWorker,
   enhanceSourceWithExtremeWorker,
+  type ExtremeEnhancementOutcome,
   type ExtremeSourceReport,
 } from "../lib/extremeMlClient";
 import {
   analyzeExtremeRenderedOutputsBounded,
-  analyzeExtremeSourcesBounded,
   buildPlannerMlProtection,
   compareExtremeQualityMetrics,
-  enhanceExtremeSourcesBounded,
-  getExtremeMlSnapshotGraceMs,
+  getExtremeMlMaxPollsForSourceBytes,
+  getExtremeMlPerFileWaitMs,
+  startExtremeMlProgressiveEnhancementBatch,
+  type ExtremeMlProgressiveEnhancementBatch,
 } from "../lib/extremeMlVoPolicy";
 import {
   buildExtremeMlSourceQualityPolicy,
@@ -940,6 +941,7 @@ export default function VoLeveler({ aiAutoPilotEnabled }: { aiAutoPilotEnabled: 
   const extremeSourceReportsByInputNameRef = useRef<ReadonlyMap<string, ExtremeSourceReport>>(
     new Map(),
   );
+  const activeExtremeMlSourceBatchRef = useRef<string | null>(null);
   const activeExtremeMlPostRenderBatchRef = useRef<string | null>(null);
   const failureDismissButtonRef = useRef<HTMLButtonElement | null>(null);
   const runBatchButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -8101,6 +8103,7 @@ const summarizeFailureReason = (error: unknown) => {
     aiAdaptiveDirectivesOverrideRef.current = null;
     sourceFirstCandidateVariantRef.current = null;
     sourceFirstPlansByBaseRef.current = new Map();
+    activeExtremeMlSourceBatchRef.current = null;
     extremeSourceReportsByInputNameRef.current = new Map();
     activeExtremeMlPostRenderBatchRef.current = null;
     setLoading(true);
@@ -8115,19 +8118,39 @@ const summarizeFailureReason = (error: unknown) => {
     const consonantReferencesByOutputKey = new Map<string, RenderedConsonantReference>();
     const nextReviewBundles: PendingReviewBundleEntry[] = [];
     let finalConsonantPassStarted = false;
-    let acceptingExtremeMlEvidence = false;
-    let acceptingExtremeMlEnhancements = false;
-    let extremeMlAnalysisPromise: Promise<void> | null = null;
+    let extremeMlEnhancementBatch: ExtremeMlProgressiveEnhancementBatch | null = null;
     let extremeMlBatchId: string | null = null;
+    let extremeMlOutcomesByInputName: ReadonlyMap<string, ExtremeEnhancementOutcome> = new Map();
+    let completedExtremeMlRenderInputs: ReadonlySet<string> = new Set();
+    const retainLateExtremeMlReport = (
+      batchId: string,
+      key: string,
+      outcome: ExtremeEnhancementOutcome,
+    ) => {
+      if (
+        activeExtremeMlSourceBatchRef.current !== batchId ||
+        !("report" in outcome) ||
+        extremeSourceReportsByInputNameRef.current.has(key)
+      ) {
+        return;
+      }
+      extremeSourceReportsByInputNameRef.current = new Map([
+        ...extremeSourceReportsByInputNameRef.current,
+        [key, outcome.report],
+      ]);
+      appendLog(
+        outcome.status === "succeeded"
+          ? `[ExtremeML] ${sanitizeBase(key)}: RNNoise candidate completed after its render boundary; original delivered audio remains unchanged and the source report is retained as advisory evidence only.`
+          : `[ExtremeML] ${sanitizeBase(key)}: report-only source ML completed after its render boundary (${outcome.reason}); the report is retained as advisory evidence and original delivered audio remains unchanged.`,
+      );
+    };
     try {
       let ffmpeg = await ensureFfmpeg();
-      let jobs = buildJobs(files);
-      let extremeMlEnhancedJobs: JobEntry[] | null = null;
+      const jobs = buildJobs(files);
       if (extremeMlEnabled) {
-        acceptingExtremeMlEvidence = true;
-        acceptingExtremeMlEnhancements = true;
         const batchId = globalThis.crypto?.randomUUID?.() ?? `batch-${Date.now().toString(36)}`;
         extremeMlBatchId = batchId;
+        activeExtremeMlSourceBatchRef.current = batchId;
         const enhancementJobs = jobs.map((job, index) => ({
           key: job.inputName,
           job,
@@ -8136,107 +8159,25 @@ const summarizeFailureReason = (error: unknown) => {
           idempotencyKey: `enhance:${batchId}:${index + 1}`,
         }));
         appendLog(
-          `[ExtremeML] RNNoise candidate enhancement started for ${enhancementJobs.length} file(s). Successful candidates feed the normal browser pipeline; unavailable candidates keep the original source.`,
+          `[ExtremeML] Progressive source ML started for ${enhancementJobs.length} file(s) in two background lanes. Silero VAD, DNSMOS, SIGMOS, and subtle RNNoise cleanup keep draining across long batches; each file remains fail-open to its original source.`,
         );
-        const enhancedFilesByInputName = new Map<string, File>();
-        const jobsBeforeEnhancement = jobs;
-        const extremeMlEnhancementPromise = enhanceExtremeSourcesBounded({
+        extremeMlEnhancementBatch = startExtremeMlProgressiveEnhancementBatch({
           jobs: enhancementJobs,
-          enhance: (input) => enhanceSourceWithExtremeWorker({ ...input, maxPolls: 30 }),
-          shouldContinue: () => acceptingExtremeMlEnhancements,
+          enhance: (input) => enhanceSourceWithExtremeWorker({
+            ...input,
+            maxPolls: getExtremeMlMaxPollsForSourceBytes(input.source.size),
+          }),
           onOutcome: ({ key, outcome }) => {
-            if (!acceptingExtremeMlEnhancements) return;
-            const enhancementJob = enhancementJobs.find((candidate) => candidate.key === key);
-            if (!enhancementJob) return;
-            if (outcome.status === "succeeded") {
-              const enhancedFile = new File(
-                [outcome.candidate],
-                enhancementJob.job.file.name,
-                {
-                  type: "audio/wav",
-                  lastModified: enhancementJob.job.file.lastModified,
-                },
-              );
-              enhancedFilesByInputName.set(enhancementJob.key, enhancedFile);
-              appendLog(
-                `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate accepted as source cleanup candidate (${(outcome.candidate.size / 1024 / 1024).toFixed(2)} MB). gainPlanner still owns all volume moves.`,
-              );
-            } else {
-              appendLog(
-                `[ExtremeML] ${sanitizeBase(enhancementJob.job.base)}: RNNoise candidate unavailable (${outcome.reason}); original source stays active.`,
-              );
+            if (activeExtremeMlSourceBatchRef.current !== batchId) return;
+            extremeMlOutcomesByInputName = new Map([
+              ...extremeMlOutcomesByInputName,
+              [key, outcome],
+            ]);
+            if (completedExtremeMlRenderInputs.has(key)) {
+              retainLateExtremeMlReport(batchId, key, outcome);
             }
           },
         });
-        await Promise.race([
-          extremeMlEnhancementPromise,
-          new Promise<void>((resolve) =>
-            window.setTimeout(
-              resolve,
-              getExtremeMlSnapshotGraceMs(jobsBeforeEnhancement.map((job) => job.file.size)),
-            ),
-          ),
-        ]);
-        acceptingExtremeMlEnhancements = false;
-        if (enhancedFilesByInputName.size > 0) {
-          extremeMlEnhancedJobs = jobsBeforeEnhancement.map((job) => {
-            const enhancedFile = enhancedFilesByInputName.get(job.inputName);
-            return enhancedFile ? { ...job, file: enhancedFile } : job;
-          });
-        }
-        const renderJobs = extremeMlEnhancedJobs ?? jobsBeforeEnhancement;
-        jobs = renderJobs;
-        appendLog(
-          `[ExtremeML] Opt-in source analysis started for ${jobs.length} file(s), with at most two direct uploads at once. Evidence is advisory and cannot block delivery.`,
-        );
-        extremeMlAnalysisPromise = analyzeExtremeSourcesBounded({
-          jobs: jobs.map((job, index) => ({
-            key: job.inputName,
-            source: job.file,
-            contentType: "audio/wav",
-            idempotencyKey: `source:${batchId}:${index + 1}`,
-          })),
-          analyze: analyzeSourceWithExtremeWorker,
-          onOutcome: ({ key, outcome }) => {
-            if (!acceptingExtremeMlEvidence) return;
-            if (outcome.status === "succeeded") {
-              extremeSourceReportsByInputNameRef.current = new Map([
-                ...extremeSourceReportsByInputNameRef.current,
-                [key, outcome.report],
-              ]);
-              if (outcome.report.telemetry.runtimeStatus === "degraded") {
-                appendLog(
-                  `[ExtremeML] ${sanitizeBase(key)}: model evidence degraded (${outcome.report.telemetry.reason}); browser processing remains unchanged where evidence is missing.`,
-                );
-              }
-              const sourceQualityMetrics: ReadonlyArray<
-                readonly [string, ExtremeSourceReport["metrics"][string] | undefined]
-              > = [
-                ["DNSMOS overall", outcome.report.metrics["dnsmos.ovrl"]],
-                ["DNSMOS speech", outcome.report.metrics["dnsmos.sig"]],
-                ["DNSMOS background", outcome.report.metrics["dnsmos.bak"]],
-                ["P.808", outcome.report.metrics.dnsmos_p808],
-                ["SIGMOS overall", outcome.report.metrics["sigmos.ovrl"]],
-              ];
-              const sourceQualityEvidence = sourceQualityMetrics.flatMap(([label, metric]) =>
-                metric?.available === true && typeof metric.value === "number"
-                  ? [`${label} ${metric.value.toFixed(2)}`]
-                  : [],
-              );
-              if (sourceQualityEvidence.length > 0) {
-                appendLog(
-                  `[ExtremeML] ${sanitizeBase(key)} source quality evidence: ${sourceQualityEvidence.join(
-                    ", ",
-                  )}. Advisory source measurements only; they do not select or reject audio.`,
-                );
-              }
-              return;
-            }
-            appendLog(
-              `[ExtremeML] ${sanitizeBase(key)}: evidence unavailable; browser processing remains unchanged.`,
-            );
-          },
-        }).catch(() => undefined);
       }
       const reviewBundleFinalOutputBlocker = (() => {
         if (loudnessConfig !== null) return "loudness-target deliverables are rendered after the per-file review point";
@@ -8364,27 +8305,6 @@ const summarizeFailureReason = (error: unknown) => {
         }
       }
 
-      if (extremeMlEnabled) {
-        if (
-          extremeMlAnalysisPromise &&
-          extremeSourceReportsByInputNameRef.current.size < jobs.length
-        ) {
-          await Promise.race([
-            extremeMlAnalysisPromise,
-            new Promise<void>((resolve) =>
-              window.setTimeout(
-                resolve,
-                getExtremeMlSnapshotGraceMs(jobs.map((job) => job.file.size)),
-              ),
-            ),
-          ]);
-        }
-        acceptingExtremeMlEvidence = false;
-        appendLog(
-          `[ExtremeML] Render snapshot accepted ${extremeSourceReportsByInputNameRef.current.size}/${jobs.length} advisory report(s). Unavailable or late reports use the exact browser path.`,
-        );
-      }
-
       let hadErrors = false;
       const failedRuns: FailedOptimization[] = [];
       // Retry tracking: each file gets PER_FILE_MAX_RETRIES attempts on a
@@ -8400,7 +8320,7 @@ const summarizeFailureReason = (error: unknown) => {
       );
       let i = 0;
       while (i < jobs.length) {
-        const job = jobs[i];
+        let job = jobs[i];
         const retryAttempt = retryCounts.get(job.base) ?? 0;
         const attemptOutputCount = outputEntries.length;
         const attemptReviewBundleCount = nextReviewBundles.length;
@@ -8449,6 +8369,68 @@ const summarizeFailureReason = (error: unknown) => {
               progress: 0,
               detail: "Fresh worker, re-running pipeline",
             });
+          }
+          if (extremeMlEnhancementBatch) {
+            const outcome = await extremeMlEnhancementBatch.waitForOutcome(
+              job.inputName,
+              getExtremeMlPerFileWaitMs(job.file.size)
+            );
+            if ("report" in outcome) {
+              extremeSourceReportsByInputNameRef.current = new Map([
+                ...extremeSourceReportsByInputNameRef.current,
+                [job.inputName, outcome.report],
+              ]);
+              if (outcome.report.telemetry.runtimeStatus === "degraded") {
+                appendLog(
+                  `[ExtremeML] ${sanitizeBase(job.base)}: source ML report is degraded (${outcome.report.telemetry.reason}); available evidence remains advisory and delivery stays fail-open.`,
+                );
+              }
+              const sourceQualityMetrics: ReadonlyArray<
+                readonly [string, ExtremeSourceReport["metrics"][string] | undefined]
+              > = [
+                ["DNSMOS overall", outcome.report.metrics["dnsmos.ovrl"]],
+                ["DNSMOS speech", outcome.report.metrics["dnsmos.sig"]],
+                ["DNSMOS background", outcome.report.metrics["dnsmos.bak"]],
+                ["P.808", outcome.report.metrics.dnsmos_p808],
+                ["SIGMOS overall", outcome.report.metrics["sigmos.ovrl"]],
+              ];
+              const sourceQualityEvidence = sourceQualityMetrics.flatMap(([label, metric]) =>
+                metric?.available === true && typeof metric.value === "number"
+                  ? [`${label} ${metric.value.toFixed(2)}`]
+                  : [],
+              );
+              if (sourceQualityEvidence.length > 0) {
+                appendLog(
+                  `[ExtremeML] ${sanitizeBase(job.base)} source quality evidence: ${sourceQualityEvidence.join(
+                    ", ",
+                  )}. Advisory source measurements only; they do not select, reject, or change gain.`,
+                );
+              }
+            }
+            if (outcome.status === "succeeded") {
+              job = {
+                ...job,
+                file: new File([outcome.candidate], job.file.name, {
+                  type: "audio/wav",
+                  lastModified: job.file.lastModified,
+                }),
+              };
+              appendLog(
+                `[ExtremeML] ${sanitizeBase(job.base)}: source report reused and subtle RNNoise candidate adopted before render (${(outcome.candidate.size / 1024 / 1024).toFixed(2)} MB). gainPlanner remains the sole broadband and time-varying gain authority.`,
+              );
+            } else if (outcome.status === "report-only") {
+              appendLog(
+                `[ExtremeML] ${sanitizeBase(job.base)}: source report reused; RNNoise candidate unavailable (${outcome.reason}), so the original source stays active.`,
+              );
+            } else if (outcome.reason === "per-file-timeout") {
+              appendLog(
+                `[ExtremeML] ${sanitizeBase(job.base)}: per-file ML wait timed out; original source render starts while later long-batch ML work keeps draining in the background.`,
+              );
+            } else {
+              appendLog(
+                `[ExtremeML] ${sanitizeBase(job.base)}: source ML unavailable (${outcome.reason}); original source stays active.`,
+              );
+            }
           }
           const sourceFirstPlan = activateSourceFirstPlanForJob(job);
           if (sourceFirstPlan) {
@@ -10037,6 +10019,18 @@ const summarizeFailureReason = (error: unknown) => {
 
         // File is fully done (success or permanent failure). Track its
         // audio for the duration-aware memory guard, advance the cursor.
+        completedExtremeMlRenderInputs = new Set([
+          ...completedExtremeMlRenderInputs,
+          job.inputName,
+        ]);
+        const completedExtremeMlOutcome = extremeMlOutcomesByInputName.get(job.inputName);
+        if (extremeMlBatchId && completedExtremeMlOutcome) {
+          retainLateExtremeMlReport(
+            extremeMlBatchId,
+            job.inputName,
+            completedExtremeMlOutcome,
+          );
+        }
         workerCumulativeAudioSec += estDurationSec;
         i += 1;
 
@@ -10223,8 +10217,8 @@ const summarizeFailureReason = (error: unknown) => {
         setStatus("Failed");
       }
     } finally {
-      acceptingExtremeMlEvidence = false;
-      acceptingExtremeMlEnhancements = false;
+      extremeMlBatchId = null;
+      extremeMlEnhancementBatch = null;
       processingControlsOverrideRef.current = null;
       aiAdaptiveDirectivesOverrideRef.current = null;
       sourceFirstCandidateVariantRef.current = null;
